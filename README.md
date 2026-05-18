@@ -298,7 +298,7 @@ See [`docs/comparison/OMNIROUTE_VS_ALTERNATIVES.md`](docs/comparison/OMNIROUTE_V
 - **Issues**: [github.com/diegosouzapw/OmniRoute/issues](https://github.com/diegosouzapw/OmniRoute/issues)
 - **WhatsApp**: [Community Group](https://chat.whatsapp.com/JI7cDQ1GyaiDHhVBpLxf8b?mode=gi_t)
 - **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md), open a PR, or pick a `good first issue`
-
+- **🇧🇷 Official Brazilian Community (Mundo Automatik)**: [Join the Brazilian WhatsApp Group](https://chat.whatsapp.com/CeGCxdFzqBe5Uki288wOvf)
 ### 🐛 Reporting a Bug?
 
 When opening an issue, please run the system-info command and attach the generated file:
