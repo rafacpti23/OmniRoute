@@ -713,7 +713,7 @@ Compression: aggressive (~50%) → double your free quota · Cost: $0/mo
 # 📧 Support & Community
 
 > 💬 **Join our WhatsApp groups** — get help, share tips, stay updated:
-> · [**🌍 International**](https://chat.whatsapp.com/JI7cDQ1GyaiDHhVBpLxf8b?mode=gi_t) · [**🇧🇷 Português**](https://chat.whatsapp.com/CeGCxdFzqBe5Uki288wOvf)
+> · [**🌍 International**](https://chat.whatsapp.com/JI7cDQ1GyaiDHhVBpLxf8b?mode=gi_t) · [**🇧🇷 Português**](https://chat.whatsapp.com/BTGJXIyjeNIIgExvTMGGhI?s=cl&p=a&mlu=4)
 
 - 🌍 **Website**: [omniroute.online](https://omniroute.online)
 - 🐙 **GitHub**: [github.com/diegosouzapw/OmniRoute](https://github.com/diegosouzapw/OmniRoute)
