@@ -67,6 +67,8 @@ jobs:
             push)
               if [ "$REF_TYPE" = "tag" ]; then
                 VERSION="${REF_NAME#v}"
+              elif [ "$REF_NAME" = "prod" ]; then
+                VERSION="prod"
               else
                 # Push to main → build & tag as `main` only. Never touch :latest.
                 VERSION="main"
