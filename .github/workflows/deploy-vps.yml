@@ -4,6 +4,8 @@ on:
   workflow_run:
     workflows: ["Publish to Docker Hub"]
     types: [completed]
+    branches:
+      - prod
   workflow_dispatch:
 
 permissions:
@@ -12,8 +14,7 @@ permissions:
 jobs:
   deploy:
     if: >-
-      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
-      && vars.DEPLOY_ENABLED == 'true'
+      github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     name: Deploy OmniRoute to VPS
     runs-on: ubuntu-latest
     steps:
