@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - prod
     tags:
       - "v*"
     paths-ignore:
@@ -38,7 +39,7 @@ jobs:
       promote_latest: ${{ steps.version.outputs.promote_latest }}
       skip: ${{ steps.version.outputs.skip }}
     env:
-      IMAGE_NAME: diegosouzapw/omniroute
+      IMAGE_NAME: ${{ github.repository_owner }}/omniroute
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -109,14 +110,14 @@ jobs:
           #    `main` is always rebuilt (mutable floating tag).
           SKIP="false"
           if [ "$VERSION" != "main" ]; then
-            if docker manifest inspect "diegosouzapw/omniroute:${VERSION}" >/dev/null 2>&1; then
-              echo "Image diegosouzapw/omniroute:${VERSION} already exists on Docker Hub — skipping rebuild."
+            if docker manifest inspect "${IMAGE_NAME}:${VERSION}" >/dev/null 2>&1; then
+              echo "Image ${IMAGE_NAME}:${VERSION} already exists on Docker Hub — skipping rebuild."
               SKIP="true"
             fi
           fi
           echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
 
-          echo "Publishing diegosouzapw/omniroute:$VERSION (promote_latest=$PROMOTE, skip=$SKIP)"
+          echo "Publishing ${IMAGE_NAME}:$VERSION (promote_latest=$PROMOTE, skip=$SKIP)"
 
   build:
     name: Build Docker (${{ matrix.platform }})
@@ -134,8 +135,8 @@ jobs:
             runner: ubuntu-24.04-arm
             arch: arm64
     env:
-      IMAGE_NAME: diegosouzapw/omniroute
-      GHCR_IMAGE_NAME: ghcr.io/diegosouzapw/omniroute
+      IMAGE_NAME: ${{ github.repository_owner }}/omniroute
+      GHCR_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/omniroute
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -227,8 +228,8 @@ jobs:
     if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-latest
     env:
-      IMAGE_NAME: diegosouzapw/omniroute
-      GHCR_IMAGE_NAME: ghcr.io/diegosouzapw/omniroute
+      IMAGE_NAME: ${{ github.repository_owner }}/omniroute
+      GHCR_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/omniroute
       VERSION: ${{ needs.prepare.outputs.version }}
       PROMOTE_LATEST: ${{ needs.prepare.outputs.promote_latest }}
     steps:
@@ -329,6 +330,6 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: diegosouzapw/omniroute
+          repository: ${{ github.repository_owner }}/omniroute
           short-description: "OmniRoute — Unified AI proxy. Route any LLM through one endpoint."
           readme-filepath: ./README.md
