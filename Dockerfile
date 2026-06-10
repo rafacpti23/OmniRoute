@@ -38,8 +38,11 @@ RUN --mount=type=cache,target=/root/.npm \
   && npm rebuild better-sqlite3 \
   && node -e "require('better-sqlite3')(':memory:').close()"
 
-# Use Turbopack for significant build speedup
-ENV OMNIROUTE_USE_TURBOPACK=1
+# Docker builds run under tighter memory limits than local dev, and Turbopack
+# was panicking with out-of-memory during `next build` in Actions. Keep the
+# container build on webpack for a stable production artifact; local dev can
+# still opt into Turbopack via the environment.
+ENV OMNIROUTE_USE_TURBOPACK=0
 
 COPY . ./
 RUN --mount=type=cache,target=/app/.build/next/cache \
