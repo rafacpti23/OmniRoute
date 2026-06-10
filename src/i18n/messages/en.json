@@ -1330,7 +1330,7 @@
       "settings.update_failed": "Settings Update Failed",
       "sync.token.created": "Sync Token Created",
       "sync.token.revoked": "Sync Token Revoked"
-  }
+    }
   },
   "themesPage": {
     "title": "Themes",
