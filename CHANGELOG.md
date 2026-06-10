@@ -2,20 +2,9 @@
 
 ## [Unreleased]
 
-### ✨ New Features
-
-- **feat(providers):** add Claude Fable 5 (`claude-fable-5`) — wires the new flagship model across the full pipeline: `cc` and `kiro` provider registries (1M context, 128k output), pricing constants, model spec (adaptive thinking, vision, tool use), fast mode, 1M-context beta header, fallback chain (`claude-fable-5 → claude-opus-4-8 → claude-opus-4-7 → claude-sonnet-4-6`), and cost data.
-
-### 🔧 Bug Fixes
-
-- **fix(translator):** scope the Gemini `thoughtSignature` bypass to the Antigravity/CLI path and unwrap array-shaped Gemini error bodies — signature-less historical tool calls on Antigravity/CLI are emitted as native parts carrying the `skip_thought_signature_validator` sentinel (preventing upstream 400s). (The standard Gemini direct path was kept on text/context representation here, then switched to native by #3569 below.) ([#3560](https://github.com/diegosouzapw/OmniRoute/pull/3560) — thanks @oyi77 and @Six7Day via [#3414](https://github.com/diegosouzapw/OmniRoute/pull/3414))
-- **fix(translator):** the standard Gemini direct path now maps historical tool calls to **native** `functionCall`/`functionResponse` parts instead of inert text. The previous text serialization (`[tool_history_call: …]` / "Historical tool-call record only …") leaked into the model's visible output (the model echoed the annotation text). A live test against the real Gemini API confirmed thinking models accept signature-less native `functionCall` parts (`gemini-2.5-flash` returns 200 even with `tools` + `thinkingConfig`), so the text mode is no longer needed as the default and the leak is gone. The Antigravity/CLI sentinel path (#3560) is untouched. ([#3569](https://github.com/diegosouzapw/OmniRoute/pull/3569) — thanks @hartmark)
-- **fix(auto-update):** the self-update flow now resolves a stable project root instead of the launch directory — `resolveProjectRoot` walks up from the module's own location (`__dirname`) to the nearest `package.json`/`.git` rather than trusting `process.cwd()` (which could point anywhere the process was started from), and every `git`/`npm`/`pm2` step in `version/route.ts` runs against that `PROJECT_ROOT`. The original resolver fell through to `return cwd` on every branch, making `PROJECT_ROOT` a no-op; the walker (with TDD coverage) fixes that. ([#3561](https://github.com/diegosouzapw/OmniRoute/pull/3561) — thanks @oyi77; `PROJECT_ROOT` originally introduced + `version/route.ts` call sites wired in [#3423](https://github.com/diegosouzapw/OmniRoute/pull/3423) — thanks @ViFigueiredo)
-- **fix(plugins):** wire plugin lifecycle hooks (`onInstall`/`onActivate`/`onDeactivate`/`onUninstall`) in the loader so `manager.ts` can register them with `emitHook` — they were declared in the manifest schema and dispatched by the manager, but the loader never built the `plugin.onX` methods, leaving the lifecycle hooks declared-but-dead. Also addresses #3518 review comments (redundant `RegExp(/.../)` → literals, `logs/[id]` route awaits the Next route `params`, indentation). ([#3562](https://github.com/diegosouzapw/OmniRoute/pull/3562) — thanks @oyi77)
-
 ---
 
-## [3.8.20] — Unreleased
+## [3.8.20] — 2026-06-10
 
 ### ✨ New Features
 
