@@ -39,7 +39,7 @@ jobs:
       promote_latest: ${{ steps.version.outputs.promote_latest }}
       skip: ${{ steps.version.outputs.skip }}
     env:
-      IMAGE_NAME: ${{ github.repository_owner }}/omniroute
+      IMAGE_NAME: rafacpti23/omniroute
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -122,7 +122,7 @@ jobs:
   build:
     name: Build Docker (${{ matrix.platform }})
     needs: prepare
-    if: needs.prepare.outputs.skip != 'true'
+    if: github.repository_owner == 'rafacpti23' && needs.prepare.outputs.skip != 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -135,8 +135,8 @@ jobs:
             runner: ubuntu-24.04-arm
             arch: arm64
     env:
-      IMAGE_NAME: ${{ github.repository_owner }}/omniroute
-      GHCR_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/omniroute
+      IMAGE_NAME: rafacpti23/omniroute
+      GHCR_IMAGE_NAME: ghcr.io/rafacpti23/omniroute
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -225,11 +225,11 @@ jobs:
     needs:
       - prepare
       - build
-    if: needs.prepare.outputs.skip != 'true'
+    if: github.repository_owner == 'rafacpti23' && needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-latest
     env:
-      IMAGE_NAME: ${{ github.repository_owner }}/omniroute
-      GHCR_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/omniroute
+      IMAGE_NAME: rafacpti23/omniroute
+      GHCR_IMAGE_NAME: ghcr.io/rafacpti23/omniroute
       VERSION: ${{ needs.prepare.outputs.version }}
       PROMOTE_LATEST: ${{ needs.prepare.outputs.promote_latest }}
     steps:
@@ -330,6 +330,6 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: ${{ github.repository_owner }}/omniroute
+          repository: rafacpti23/omniroute
           short-description: "OmniRoute — Unified AI proxy. Route any LLM through one endpoint."
           readme-filepath: ./README.md
