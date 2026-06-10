@@ -146,12 +146,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -167,9 +161,7 @@ jobs:
           target: runner-base
           platforms: ${{ matrix.platform }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
-          tags: |
-            ${{ env.IMAGE_NAME }}
-            ${{ env.GHCR_IMAGE_NAME }}
+          tags: ${{ env.GHCR_IMAGE_NAME }}
           cache-from: type=gha,scope=docker-${{ matrix.arch }}
           cache-to: type=gha,scope=docker-${{ matrix.arch }},mode=max
           no-cache: false
@@ -184,9 +176,7 @@ jobs:
           target: runner-web
           platforms: ${{ matrix.platform }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
-          tags: |
-            ${{ env.IMAGE_NAME }}
-            ${{ env.GHCR_IMAGE_NAME }}
+          tags: ${{ env.GHCR_IMAGE_NAME }}
           cache-from: type=gha,scope=docker-web-${{ matrix.arch }}
           cache-to: type=gha,scope=docker-web-${{ matrix.arch }},mode=max
           no-cache: false
@@ -241,12 +231,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
         with:
@@ -267,30 +251,6 @@ jobs:
           pattern: digests-web-*
           path: /tmp/digests/web
           merge-multiple: true
-
-      - name: Create Docker Hub manifest
-        run: |
-          set -euo pipefail
-
-          create_manifest() {
-            local image="$1" suffix="$2" dir="$3"
-            local tags=(-t "${image}:${VERSION}${suffix}")
-            if [ "$PROMOTE_LATEST" = "true" ]; then
-              tags+=(-t "${image}:latest${suffix}")
-            fi
-            local refs=()
-            while IFS= read -r digest_file; do
-              refs+=("${image}@sha256:$(basename "$digest_file")")
-            done < <(find "$dir" -type f | sort)
-            if [ "${#refs[@]}" -eq 0 ]; then
-              echo "No image digests in $dir" >&2
-              exit 1
-            fi
-            docker buildx imagetools create "${tags[@]}" "${refs[@]}"
-          }
-
-          create_manifest "${IMAGE_NAME}" "" /tmp/digests/base
-          create_manifest "${IMAGE_NAME}" "-web" /tmp/digests/web
 
       - name: Create GHCR manifest
         run: |
@@ -319,16 +279,4 @@ jobs:
       - name: Inspect image
         if: needs.prepare.outputs.version != 'main'
         run: |
-          docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}"
-
-      - name: Update Docker Hub description
-        # Only refresh README/description when we actually promote :latest
-        # (avoids overwriting from main pushes or back-fill builds).
-        if: needs.prepare.outputs.promote_latest == 'true'
-        uses: peter-evans/dockerhub-description@v5
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-          repository: rafacpti23/omniroute
-          short-description: "OmniRoute — Unified AI proxy. Route any LLM through one endpoint."
-          readme-filepath: ./README.md
+          docker buildx imagetools inspect "${GHCR_IMAGE_NAME}:${VERSION}"
