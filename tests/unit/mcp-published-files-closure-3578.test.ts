@@ -30,7 +30,7 @@ function resolveImport(fromFile: string, spec: string): string | null {
     base + ".js",
     base + ".mjs",
   ];
-  for (const c of cands) if (fs.existsSync(path.join(ROOT, c))) return c;
+  for (const c of cands) if (fs.existsSync(path.join(ROOT, c))) return c.replace(/\\/g, "/");
   return null;
 }
 
@@ -59,6 +59,7 @@ function computeMcpClosure(): string[] {
     } catch {
       continue;
     }
+    importRe.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = importRe.exec(src))) {
       const spec = m[1] || m[2];
