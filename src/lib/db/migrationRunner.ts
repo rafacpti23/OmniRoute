@@ -124,12 +124,6 @@ const RENAMED_MIGRATION_COMPATIBILITY = [
     toName: "skill_mode_and_metadata",
   },
   {
-    fromVersion: "092",
-    fromName: "api_key_context_sources",
-    toVersion: "093",
-    toName: "api_key_context_sources",
-  },
-  {
     fromVersion: "028",
     fromName: "provider_connection_max_concurrent",
     toVersion: "029",
@@ -528,8 +522,11 @@ function isSchemaAlreadyApplied(
         hasColumn(db, "skills", "install_count")
       );
     case "093":
-      // Retroactive guard for API-key context sources renumbered from 092 after
-      // upstream claimed that slot for skill-mode metadata.
+      // Retroactive guard for proxy enable toggles after upstream claimed 093.
+      return hasColumn(db, "provider_connections", "proxy_enabled");
+    case "097":
+      // Retroactive guard for API-key context sources moved out of the 092/093
+      // collision zone when the upstream release claimed those slots.
       return hasTable(db, "api_key_context_sources");
     default:
       return false;
