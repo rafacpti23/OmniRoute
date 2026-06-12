@@ -182,6 +182,8 @@ There is **no dedicated `POST /api/combos/auto` endpoint** — Auto-Combo is con
 
 2. **Persisted combo with `strategy: "auto"`:** Create a regular combo via `POST /api/combos` and set `strategy: "auto"` plus `config.auto.weights` / `config.auto.candidatePool`. The same scoring engine is used; the combo is stored in `combos` and reusable by ID.
 
+For discovery, `GET /api/combos/auto` lists every variant with its resolved candidate pool plus `context_length` / `max_output_tokens` — the MAX across the candidate pool's windows. Clients (e.g. the opencode plugin) must advertise these values instead of `0`: a zero context disables opencode's auto-compaction entirely, letting sessions grow until the gateway's history purge destroys context. MAX is safe to advertise because the auto-combo context pre-filter routes oversized requests to large-window candidates.
+
 ```bash
 # Zero-config usage (no combo creation)
 curl -X POST http://localhost:20128/v1/chat/completions \
@@ -229,8 +231,13 @@ class RulesStrategyImpl implements RouterStrategy {
 
   select(pool, context) {
     const eligible = pool.filter((c) => c.circuitBreakerState !== "OPEN");
-    const ranked = scorePool(eligible.length > 0 ? eligible : pool, context.taskType, undefined, getTaskFitness);
-    return { provider: ranked[0].provider, /* ... */ };
+    const ranked = scorePool(
+      eligible.length > 0 ? eligible : pool,
+      context.taskType,
+      undefined,
+      getTaskFitness
+    );
+    return { provider: ranked[0].provider /* ... */ };
   }
 }
 ```
@@ -254,7 +261,7 @@ class CostStrategyImpl implements RouterStrategy {
   select(pool, context) {
     const healthy = pool.filter((c) => c.circuitBreakerState !== "OPEN");
     const sorted = [...healthy].sort((a, b) => a.costPer1MTokens - b.costPer1MTokens);
-    return { provider: sorted[0].provider, /* ... */ };
+    return { provider: sorted[0].provider /* ... */ };
   }
 }
 ```
@@ -277,10 +284,10 @@ class LatencyStrategyImpl implements RouterStrategy {
 
   select(pool, context) {
     const healthy = pool.filter((c) => c.circuitBreakerState !== "OPEN");
-    const sorted = [...healthy].sort((a, b) =>
-      (a.p95LatencyMs + a.errorRate * 1000) - (b.p95LatencyMs + b.errorRate * 1000)
+    const sorted = [...healthy].sort(
+      (a, b) => a.p95LatencyMs + a.errorRate * 1000 - (b.p95LatencyMs + b.errorRate * 1000)
     );
-    return { provider: sorted[0].provider, /* ... */ };
+    return { provider: sorted[0].provider /* ... */ };
   }
 }
 ```
@@ -296,13 +303,13 @@ interactive coding assistants.
 
 Scores each candidate by how well it satisfies the configured SLO policy:
 
-| Factor | Weight | Formula |
-|--------|--------|---------|
-| Latency score | 35% | `threshold / max(value, ε)` |
-| Error score | 35% | `threshold / max(value, ε)` |
-| Health score | 15% | `1.0` (CLOSED) / `0.5` (HALF_OPEN) / `0.0` (OPEN) |
-| Cost score | 10% | `threshold / max(value, ε)` or inverse normalized |
-| Stability score | 5% | inverse normalized latency stddev |
+| Factor          | Weight | Formula                                           |
+| --------------- | ------ | ------------------------------------------------- |
+| Latency score   | 35%    | `threshold / max(value, ε)`                       |
+| Error score     | 35%    | `threshold / max(value, ε)`                       |
+| Health score    | 15%    | `1.0` (CLOSED) / `0.5` (HALF_OPEN) / `0.0` (OPEN) |
+| Cost score      | 10%    | `threshold / max(value, ε)` or inverse normalized |
+| Stability score | 5%     | inverse normalized latency stddev                 |
 
 When `hardConstraints: true`, candidates are sorted primarily by **violation score**
 (how far they exceed any SLO), then by composite score. Otherwise it's just
@@ -311,7 +318,8 @@ the composite score.
 ```ts
 class SLAStrategyImpl implements RouterStrategy {
   readonly name = "sla-aware";
-  readonly description = "Selects the provider most likely to satisfy latency, error-rate, and cost SLOs";
+  readonly description =
+    "Selects the provider most likely to satisfy latency, error-rate, and cost SLOs";
 
   select(pool, context) {
     // ... scores each candidate against policy: { targetP95Ms, maxErrorRate, maxCostPer1MTokens, hardConstraints }
@@ -361,7 +369,7 @@ class LKGPStrategyImpl implements RouterStrategy {
         (c) => c.provider === context.lastKnownGoodProvider && c.circuitBreakerState !== "OPEN"
       );
       if (candidates.length > 0) {
-        return { provider: candidates[0].provider, /* ... */ };
+        return { provider: candidates[0].provider /* ... */ };
       }
     }
 
@@ -383,7 +391,10 @@ follow-up requests (e.g., for caching, context continuity, or pricing consistenc
 You can register your own `RouterStrategy` implementation via the public API:
 
 ```ts
-import { registerStrategy, type RouterStrategy } from "@omniroute/open-sse/services/autoCombo/routerStrategy";
+import {
+  registerStrategy,
+  type RouterStrategy,
+} from "@omniroute/open-sse/services/autoCombo/routerStrategy";
 
 class MyCustomStrategy implements RouterStrategy {
   readonly name = "my-custom";
@@ -420,13 +431,13 @@ Then use it:
 
 ### Router strategy selection guide
 
-| Use case | Strategy | Reason |
-|---------|----------|--------|
-| Balanced workload | `rules` | Default — considers all factors |
-| Minimize cost | `cost` | Always picks cheapest |
-| Minimize latency | `latency` | Picks fastest reliable provider |
-| Strict SLOs | `sla-aware` | Filters by p95/error/cost thresholds |
-| Multi-turn chat | `lkgp` | Session stickiness |
+| Use case          | Strategy    | Reason                               |
+| ----------------- | ----------- | ------------------------------------ |
+| Balanced workload | `rules`     | Default — considers all factors      |
+| Minimize cost     | `cost`      | Always picks cheapest                |
+| Minimize latency  | `latency`   | Picks fastest reliable provider      |
+| Strict SLOs       | `sla-aware` | Filters by p95/error/cost thresholds |
+| Multi-turn chat   | `lkgp`      | Session stickiness                   |
 
 SLA-aware fields:
 

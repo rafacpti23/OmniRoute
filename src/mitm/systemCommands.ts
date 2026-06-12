@@ -20,7 +20,12 @@ export function execFileText(command: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(command, args, { encoding: "utf8" }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(`Command failed: ${getErrorMessage(error)}\n${stderr}`));
+        // Node's execFile already sets error.message to "Command failed: <cmd>"
+        // (for non-zero exit) or "spawn <cmd> ENOENT" (for missing binary).
+        // Re-prefixing with "Command failed: " would double the prefix for the
+        // non-zero exit case. Surface Node's message directly and only append
+        // stderr when it contains additional context. (#3641)
+        reject(new Error(getErrorMessage(error) + (stderr ? `\n${stderr}` : "")));
         return;
       }
       resolve(stdout);
@@ -56,7 +61,8 @@ export function execFileWithPassword(
     // `spawn` is used (not `exec`) so each arg is a separate argv entry and
     // shell metacharacters do not expand. See docs/security/SOCKET_DEV_FINDINGS.md §3.
     // nosemgrep
-    const child = spawn(finalCommand, finalArgs, { // nosemgrep
+    const child = spawn(finalCommand, finalArgs, {
+      // nosemgrep
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";

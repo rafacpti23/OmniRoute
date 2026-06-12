@@ -4,9 +4,15 @@
 
 ---
 
-## [3.8.21] — Unreleased
+## [3.8.22] — TBD
 
-_Development cycle in progress._
+_See English CHANGELOG for v3.8.22 details._
+
+---
+
+## [3.8.21] — 2026-06-11
+
+_See [English CHANGELOG](/CHANGELOG.md) for v3.8.21 details._
 
 ---
 

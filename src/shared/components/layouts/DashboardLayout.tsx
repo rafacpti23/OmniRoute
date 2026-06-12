@@ -82,7 +82,7 @@ export default function DashboardLayout({ children }) {
 
       {/* Sidebar - Mobile: full viewport height with proper scroll containment */}
       <div
-        className={`fixed inset-y-0 left-0 z-50 transform lg:hidden transition-transform duration-300 ease-in-out h-dvh overflow-y-auto ${
+        className={`fixed inset-y-0 start-0 z-50 transform lg:hidden transition-transform duration-300 ease-in-out h-dvh overflow-y-auto ${
           sidebarOpen ? "translate-x-0" : "-translate-x-full"
         }`}
       >
@@ -102,9 +102,7 @@ export default function DashboardLayout({ children }) {
         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden custom-scrollbar p-4 sm:p-6 lg:p-10">
           <div className="max-w-7xl mx-auto w-full h-full min-h-0 flex flex-col">
             <Breadcrumbs />
-            <div className="flex-1 min-h-0">
-              {children}
-            </div>
+            <div className="flex-1 min-h-0">{children}</div>
           </div>
         </div>
       </main>

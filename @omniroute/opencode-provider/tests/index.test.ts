@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { Server } from "node:http";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 import {
   buildOmniRouteOpenCodeConfig,
@@ -442,7 +445,10 @@ test("createOmniRouteProvider reads contextLength from a live model entry for id
     models: [{ id: "completely-unknown-model", contextLength: 262_144 }],
   });
   const entry = provider.models["completely-unknown-model"];
-  assert.ok(entry.limit, "a live contextLength should produce a limit field even for ids absent from the static map");
+  assert.ok(
+    entry.limit,
+    "a live contextLength should produce a limit field even for ids absent from the static map"
+  );
   assert.equal(entry.limit!.context, 262_144);
 });
 
@@ -666,4 +672,18 @@ test("createOmniRouteModesBlock honours numeric overrides limited to OC schema",
   });
   assert.equal(block.build.temperature, 0.7);
   assert.equal(block.build.top_p, 0.9);
+});
+
+// #3419 — soft-deprecation in favour of @omniroute/opencode-plugin. Guard the
+// deprecation notice so it can't be silently dropped while the package is kept
+// publishing (it still works; it is just no longer the recommended path).
+test("package is marked deprecated in favour of @omniroute/opencode-plugin (#3419)", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf8"));
+  assert.match(pkg.description, /DEPRECATED/);
+  assert.match(pkg.description, /@omniroute\/opencode-plugin/);
+
+  const readme = readFileSync(join(here, "..", "README.md"), "utf8");
+  assert.match(readme, /Deprecated/i);
+  assert.match(readme, /@omniroute\/opencode-plugin/);
 });

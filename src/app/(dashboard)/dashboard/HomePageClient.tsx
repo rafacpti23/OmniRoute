@@ -13,6 +13,8 @@ import { useNotificationStore } from "@/store/notificationStore";
 import { copyToClipboard } from "@/shared/utils/clipboard";
 import { getProviderDisplayLabel } from "@/shared/utils/providerDisplayLabel";
 import { useIsElectron, useOpenExternal } from "@/shared/hooks/useElectron";
+import { useLiveRequests } from "@/hooks/useLiveDashboard";
+import { selectActiveRequests } from "../home/topologyUtils";
 
 const ProviderTopology = dynamic(() => import("../home/ProviderTopology"), { ssr: false });
 const ProviderQuotaWidget = dynamic(() => import("../home/ProviderQuotaWidget"), { ssr: false });
@@ -114,11 +116,15 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
     Array<{ id?: string; prefix?: string; name?: string }>
   >([]);
 
+  // Live in-flight requests for Provider Topology pulse animation (#3507)
+  const { activeRequests: liveActiveRequests } = useLiveRequests();
+
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [updating, setUpdating] = useState(false);
 
   // Platform detection and download links for Electron
-  const platform = typeof globalThis.window === "undefined" ? undefined : globalThis.window.electronAPI?.platform;
+  const platform =
+    typeof globalThis.window === "undefined" ? undefined : globalThis.window.electronAPI?.platform;
   const electronDownload = useMemo(() => {
     const latest = versionInfo?.latest || "";
     const cleanLatest = latest.replace(/^v/, "");
@@ -166,7 +172,8 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   }>({ status: "idle" });
 
   useEffect(() => {
-    if (!isElectron || typeof globalThis.window === "undefined" || !globalThis.window.electronAPI) return;
+    if (!isElectron || typeof globalThis.window === "undefined" || !globalThis.window.electronAPI)
+      return;
 
     // Trigger initial check silently on mount
     globalThis.window.electronAPI.checkForUpdates().catch((err: any) => {
@@ -1056,9 +1063,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
       {pinProviderQuotaToHome && (
         <Suspense fallback={<CardSkeleton />}>
           <ProviderQuotaWidget
-            autoRefreshInterval={
-              autoRefreshProviderQuota ? autoRefreshProviderQuotaInterval : 0
-            }
+            autoRefreshInterval={autoRefreshProviderQuota ? autoRefreshProviderQuotaInterval : 0}
           />
         </Suspense>
       )}
@@ -1178,7 +1183,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
           </div>
           <ProviderTopology
             providers={topologyProviders}
-            activeRequests={[]}
+            activeRequests={selectActiveRequests(liveActiveRequests)}
             lastProvider={lastProvider}
             errorProvider={errorProvider}
           />

@@ -34,6 +34,7 @@ export const updateSettingsSchema = z.object({
   hideEndpointCloudflaredTunnel: z.boolean().optional(),
   hideEndpointTailscaleFunnel: z.boolean().optional(),
   hideEndpointNgrokTunnel: z.boolean().optional(),
+  preferClaudeCodeForUnprefixedClaudeModels: z.boolean().optional(),
   autoRefreshProviderQuota: z.boolean().optional(),
   autoRefreshProviderQuotaInterval: z.number().int().min(10).max(3600).optional(),
   pinProviderQuotaToHome: z.boolean().optional(),
@@ -309,8 +310,8 @@ export const updateSettingsSchema = z.object({
   cliproxyapi_model_mapping: z.record(z.string(), z.string()).optional(),
 });
 
-export const databaseSettingsSchema = z.object(
-  {
+export const databaseSettingsSchema = z
+  .object({
     // Logs settings
     logs: z.object({
       detailedLogsEnabled: z.boolean(),
@@ -374,7 +375,8 @@ export const databaseSettingsSchema = z.object(
     }),
 
     // Skip location and stats as they're read-only
-}).strict();
+  })
+  .strict();
 
 export type DatabaseSettingsSchema = z.infer<typeof databaseSettingsSchema>;
 
