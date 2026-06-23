@@ -49,6 +49,7 @@ const ACTIVE_TTL_MS = 5 * 60 * 1000; // 5 minutes for active accounts
 const EXHAUSTED_TTL_MS = 5 * 60 * 1000; // 5 minutes for 429-sourced entries (no resetAt)
 const EXHAUSTED_REFRESH_MS = 5 * 60 * 1000; // 5 minutes: recheck exhausted accounts (aligned with TTL)
 const REFRESH_INTERVAL_MS = 60 * 1000; // Background tick every 1 minute
+export const DEFAULT_QUOTA_THRESHOLD_PERCENT = 99;
 
 // ─── State ──────────────────────────────────────────────────────────────────
 
@@ -155,6 +156,34 @@ function earliestResetAt(quotas: Record<string, QuotaInfo>): string | null {
   return earliest;
 }
 
+/**
+ * #4438 — Decide whether a quota snapshot row is worth persisting.
+ *
+ * The background refresh ticks every 60s for ALL connections, so idle accounts
+ * (whose quota never changes) were generating 400K+ identical snapshot rows/day.
+ * Returns true only when this window has no prior cached observation, or when its
+ * `remaining_percentage` / `is_exhausted` differs from the last cached entry — so
+ * the first observation and every real change persist, but idle no-op refreshes
+ * stop writing. Pure (no I/O) for trivial unit testing.
+ */
+export function quotaSnapshotChanged(
+  prior:
+    | { quotas?: Record<string, { remainingPercentage: number }>; exhausted?: boolean }
+    | null
+    | undefined,
+  windowKey: string,
+  remainingPercentage: number,
+  exhausted: boolean
+): boolean {
+  if (!prior) return true;
+  const priorWindow = prior.quotas?.[windowKey];
+  if (!priorWindow) return true;
+  return (
+    priorWindow.remainingPercentage !== remainingPercentage ||
+    (prior.exhausted ?? false) !== exhausted
+  );
+}
+
 function normalizeQuotas(rawQuotas: Record<string, any>): Record<string, QuotaInfo> {
   const result: Record<string, QuotaInfo> = {};
   for (const [key, q] of Object.entries(rawQuotas)) {
@@ -182,6 +211,9 @@ export function setQuotaCache(
 ) {
   const quotas = normalizeQuotas(rawQuotas);
   const exhausted = isExhausted(quotas);
+  // #4438 — capture the prior entry BEFORE overwriting the cache so we can skip
+  // redundant snapshot writes for idle connections whose quota didn't change.
+  const prior = cache.get(connectionId);
   const entry: QuotaCacheEntry = {
     connectionId,
     provider,
@@ -200,6 +232,8 @@ export function setQuotaCache(
         (quotaInfo.total > 0
           ? Math.round(((quotaInfo.total - (quotaInfo.used || 0)) / quotaInfo.total) * 100)
           : 0);
+      // #4438 — only persist on the first observation or a real change.
+      if (!quotaSnapshotChanged(prior, windowKey, remainingPercentage, entry.exhausted)) continue;
       try {
         saveQuotaSnapshot({
           provider,
@@ -260,7 +294,7 @@ export function isAccountQuotaExhausted(connectionId: string): boolean {
 export function getQuotaWindowStatus(
   connectionId: string,
   windowName: string,
-  thresholdPercent = 90
+  thresholdPercent = DEFAULT_QUOTA_THRESHOLD_PERCENT
 ): QuotaWindowStatus | null {
   const entry = cache.get(connectionId);
   if (!entry) return null;

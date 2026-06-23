@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { buildTelemetryPayload } from "@/lib/monitoring/observability";
 import { getTelemetrySummary } from "@/shared/utils/requestTelemetry";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 export async function GET(request) {
   try {
@@ -9,13 +10,23 @@ export async function GET(request) {
     const summary = getTelemetrySummary(windowMs);
     const { getQuotaMonitorSummary } = await import("@omniroute/open-sse/services/quotaMonitor.ts");
     const { getActiveSessions } = await import("@omniroute/open-sse/services/sessionManager.ts");
+    const quotaMonitorSummary = getQuotaMonitorSummary();
+    const activeSessions = getActiveSessions();
     const payload = buildTelemetryPayload({
       summary,
-      quotaMonitorSummary: getQuotaMonitorSummary(),
-      activeSessions: getActiveSessions(),
+      quotaMonitorSummary,
+      activeSessions,
     });
-    return NextResponse.json(payload);
+    const totalRequests = payload.totalRequests || 0;
+    return NextResponse.json({
+      ...payload,
+      uptime: process.uptime(),
+      memoryUsage: process.memoryUsage(),
+      activeConnections: activeSessions.length,
+      errorRate:
+        totalRequests > 0 ? (quotaMonitorSummary.errors / Math.max(totalRequests, 1)) * 100 : 0,
+    });
   } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
 }

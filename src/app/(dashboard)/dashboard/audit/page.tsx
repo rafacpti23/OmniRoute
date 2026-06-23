@@ -1,5 +1,7 @@
-import { redirect } from "next/navigation";
+"use client";
 
-export default function ConfigAuditPage() {
-  redirect("/dashboard/logs?tab=audit-logs");
+import ComplianceTab from "./ComplianceTab";
+
+export default function AuditPage() {
+  return <ComplianceTab />;
 }

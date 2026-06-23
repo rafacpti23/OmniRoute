@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 const { OpencodeExecutor } = await import("../../open-sse/executors/opencode.ts");
+const { DefaultExecutor } = await import("../../open-sse/executors/default.ts");
 const { PROVIDER_MODELS } = await import("../../open-sse/config/providerModels.ts");
 
 function createMockResponse() {
@@ -43,10 +44,10 @@ describe("OpencodeExecutor", () => {
     originalFetch = globalThis.fetch;
     originalZenModels = [...(PROVIDER_MODELS["opencode-zen"] || [])];
     originalGoModels = [...(PROVIDER_MODELS["opencode-go"] || [])];
-    globalThis.fetch = async (url, options) => {
+    globalThis.fetch = (async (url, options) => {
       fetchCalls.push({ url, options });
       return createMockResponse();
-    };
+    }) as any;
   });
 
   afterEach(() => {
@@ -56,6 +57,43 @@ describe("OpencodeExecutor", () => {
   });
 
   describe("execute", () => {
+    it('resolves "opencode" executor alias to opencode-zen config', async () => {
+      const aliasExecutor = new OpencodeExecutor("opencode-zen");
+      const result = await aliasExecutor.execute(createInput("deepseek-v4-flash-free"));
+      assert.equal(result.url, "https://opencode.ai/zen/v1/chat/completions");
+      assert.equal(fetchCalls[0].url, "https://opencode.ai/zen/v1/chat/completions");
+    });
+
+    it("routes deepseek-v4-flash-free to chat completions", async () => {
+      const result = await zenExecutor.execute(createInput("deepseek-v4-flash-free"));
+      assert.equal(result.url, "https://opencode.ai/zen/v1/chat/completions");
+      assert.equal(fetchCalls[0].url, "https://opencode.ai/zen/v1/chat/completions");
+    });
+
+    it("includes deepseek-v4-flash-free in opencode-zen PROVIDER_MODELS", () => {
+      const models = PROVIDER_MODELS["opencode-zen"];
+      const model = models?.find((m) => m.id === "deepseek-v4-flash-free");
+      assert.ok(model, "deepseek-v4-flash-free should be in opencode-zen model list");
+      assert.equal(model.name, "DeepSeek V4 Flash Free");
+      assert.equal(model.supportsReasoning, true);
+    });
+
+    it("exposes DeepSeek V4 Pro effort variants on opencode-go only", () => {
+      const goModels = PROVIDER_MODELS["opencode-go"] || [];
+      const zenModels = PROVIDER_MODELS["opencode-zen"] || [];
+      const variants = ["low", "medium", "high", "max"].map((level) => `deepseek-v4-pro-${level}`);
+      for (const variant of variants) {
+        const model = goModels.find((m) => m.id === variant);
+        assert.ok(model, `${variant} should be in opencode-go model list`);
+        assert.equal(model?.supportsReasoning, true);
+        assert.equal(
+          zenModels.some((m) => m.id === variant),
+          false,
+          `${variant} should not be exposed on opencode-zen`
+        );
+      }
+    });
+
     it("routes opencode zen default models to chat completions", async () => {
       const minimaxResult = await zenExecutor.execute(createInput("minimax-m2.5-free"));
       assert.equal(minimaxResult.url, "https://opencode.ai/zen/v1/chat/completions");
@@ -192,8 +230,6 @@ describe("OpencodeExecutor", () => {
       registerModel("opencode-go", { id: "kimi-k2.6", name: "Kimi K2.6" });
       registerModel("opencode-go", { id: "mimo-v2-pro", name: "MiMo V2 Pro" });
       registerModel("opencode-go", { id: "mimo-v2-omni", name: "MiMo V2 Omni" });
-      registerModel("opencode-go", { id: "qwen3.6-plus", name: "Qwen 3.6 Plus" });
-      registerModel("opencode-go", { id: "qwen3.5-plus", name: "Qwen 3.5 Plus" });
 
       // glm-5.1
       const glm51 = await goExecutor.execute(createInput("glm-5.1"));
@@ -210,14 +246,20 @@ describe("OpencodeExecutor", () => {
       // mimo-v2-omni
       const mimoOmni = await goExecutor.execute(createInput("mimo-v2-omni"));
       assert.equal(mimoOmni.url, "https://opencode.ai/zen/go/v1/chat/completions");
+    });
 
-      // qwen3.6-plus
-      const qwen36 = await goExecutor.execute(createInput("qwen3.6-plus"));
-      assert.equal(qwen36.url, "https://opencode.ai/zen/go/v1/chat/completions");
+    it("routes opencode-go qwen models to claude messages endpoint", async () => {
+      const qwen36 = await goExecutor.execute(
+        createInput("qwen3.6-plus", true, { apiKey: "claude-key" })
+      );
+      assert.equal(qwen36.url, "https://opencode.ai/zen/go/v1/messages");
+      assert.equal(qwen36.headers["anthropic-version"], "2023-06-01");
 
-      // qwen3.5-plus
-      const qwen35 = await goExecutor.execute(createInput("qwen3.5-plus"));
-      assert.equal(qwen35.url, "https://opencode.ai/zen/go/v1/chat/completions");
+      const qwen35 = await goExecutor.execute(
+        createInput("qwen3.5-plus", true, { apiKey: "claude-key" })
+      );
+      assert.equal(qwen35.url, "https://opencode.ai/zen/go/v1/messages");
+      assert.equal(qwen35.headers["anthropic-version"], "2023-06-01");
     });
 
     it("builds bearer auth headers for opencode-go openai models", async () => {
@@ -231,6 +273,361 @@ describe("OpencodeExecutor", () => {
         Accept: "text/event-stream",
       });
       assert.deepEqual(fetchCalls[0].options.headers, result.headers);
+    });
+
+    it("routes opencode-go catalog-only models to chat completions", async () => {
+      // Register new models
+      registerModel("opencode-go", { id: "glm-6-max", name: "GLM-6 Max" });
+      registerModel("opencode-go", { id: "mimo-v2-pro", name: "MiMo-V2-Pro" });
+      registerModel("opencode-go", { id: "mimo-v2-omni", name: "MiMo-V2-Omni" });
+      registerModel("opencode-go", { id: "hy3-preview", name: "Hunyuan3 Preview" });
+
+      // glm-6-max
+      const glm6 = await goExecutor.execute(createInput("glm-6-max"));
+      assert.equal(glm6.url, "https://opencode.ai/zen/go/v1/chat/completions");
+
+      // mimo-v2-pro
+      const mimoPro = await goExecutor.execute(createInput("mimo-v2-pro"));
+      assert.equal(mimoPro.url, "https://opencode.ai/zen/go/v1/chat/completions");
+
+      // mimo-v2-omni
+      const mimoOmni = await goExecutor.execute(createInput("mimo-v2-omni"));
+      assert.equal(mimoOmni.url, "https://opencode.ai/zen/go/v1/chat/completions");
+
+      // hy3-preview
+      const hy3 = await goExecutor.execute(createInput("hy3-preview"));
+      assert.equal(hy3.url, "https://opencode.ai/zen/go/v1/chat/completions");
+    });
+  });
+
+  describe("user-agent forwarding", () => {
+    it("forwards User-Agent from clientHeaders", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "User-Agent": "opencode/1.15.4",
+      });
+      assert.equal(headers["User-Agent"], "opencode/1.15.4");
+    });
+
+    it("omits User-Agent when clientHeaders is null", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, null);
+      assert.equal(headers["User-Agent"], undefined);
+    });
+
+    it("omits User-Agent when clientHeaders has no User-Agent key", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {});
+      assert.equal(headers["User-Agent"], undefined);
+    });
+
+    it("forwards User-Agent with claude format headers", () => {
+      goExecutor._requestFormat = "claude";
+      const headers = goExecutor.buildHeaders(
+        { apiKey: "claude-key" },
+        true,
+        { "User-Agent": "opencode/1.0" },
+        "minimax-m2.7"
+      );
+      assert.equal(headers["User-Agent"], "opencode/1.0");
+      assert.equal(headers["x-api-key"], "claude-key");
+      assert.equal(headers["anthropic-version"], "2023-06-01");
+      assert.equal(headers["Content-Type"], "application/json");
+      assert.equal(headers["Accept"], "text/event-stream");
+    });
+
+    it("forwards User-Agent without credentials", () => {
+      const headers = zenExecutor.buildHeaders(null, true, { "User-Agent": "opencode/1.0" });
+      assert.equal(headers["User-Agent"], "opencode/1.0");
+      assert.equal(headers["Authorization"], undefined);
+    });
+  });
+
+  describe("opencode request metadata headers", () => {
+    it("forwards x-opencode-session from clientHeaders", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-opencode-session": "sess-123",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-123");
+    });
+
+    it("forwards all four x-opencode-* headers from clientHeaders", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-opencode-session": "sess-abc",
+        "x-opencode-request": "req-xyz",
+        "x-opencode-project": "proj-5",
+        "x-opencode-client": "tui",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-abc");
+      assert.equal(headers["x-opencode-request"], "req-xyz");
+      assert.equal(headers["x-opencode-project"], "proj-5");
+      assert.equal(headers["x-opencode-client"], "tui");
+    });
+
+    it("does not add x-opencode-* when clientHeaders is null", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, null);
+      assert.equal(headers["x-opencode-session"], undefined);
+      assert.equal(headers["x-opencode-request"], undefined);
+      assert.equal(headers["x-opencode-project"], undefined);
+      assert.equal(headers["x-opencode-client"], undefined);
+    });
+
+    it("does not add x-opencode-* when clientHeaders has no matching keys", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "some-other-header": "val",
+      });
+      assert.equal(headers["x-opencode-session"], undefined);
+      assert.equal(headers["x-opencode-request"], undefined);
+    });
+
+    it("skips empty string x-opencode-* values", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-opencode-session": "",
+        "x-opencode-request": "req-xyz",
+      });
+      assert.equal(headers["x-opencode-session"], undefined);
+      assert.equal(headers["x-opencode-request"], "req-xyz");
+    });
+
+    it("handles case-insensitive x-opencode-* key matching", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "X-OpenCode-Session": "sess-456",
+        "X-OPENCODE-REQUEST": "req-789",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-456");
+      assert.equal(headers["x-opencode-request"], "req-789");
+    });
+
+    it("opencode-go executor also forwards x-opencode-* headers", () => {
+      const headers = goExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-opencode-session": "sess-go",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-go");
+    });
+
+    it("forwards x-opencode-* headers with claude format", () => {
+      goExecutor._requestFormat = "claude";
+      const headers = goExecutor.buildHeaders(
+        { apiKey: "claude-key" },
+        true,
+        {
+          "x-opencode-session": "sess-claude",
+          "User-Agent": "opencode/1.0",
+        },
+        "minimax-m2.7"
+      );
+      assert.equal(headers["x-opencode-session"], "sess-claude");
+      assert.equal(headers["x-api-key"], "claude-key");
+      assert.equal(headers["anthropic-version"], "2023-06-01");
+      assert.equal(headers["User-Agent"], "opencode/1.0");
+    });
+
+    it("forwards x-opencode-* headers without credentials", () => {
+      const headers = zenExecutor.buildHeaders(null, true, {
+        "x-opencode-session": "sess-noauth",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-noauth");
+      assert.equal(headers["Authorization"], undefined);
+    });
+  });
+
+  // #4022: OpenCode CLI only emits x-opencode-* when the provider id starts with
+  // "opencode". For a custom-named provider (e.g. "omniroute") it instead sends
+  // x-session-affinity / X-Session-Id (both carry the same OpenCode sessionID).
+  // The executor must map that session id onto x-opencode-session so session
+  // continuity to the opencode.ai upstream works regardless of provider name.
+  describe("opencode session-affinity fallback (#4022)", () => {
+    it("maps x-session-affinity to x-opencode-session when no direct x-opencode-session", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-session-affinity": "sess-aff",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-aff");
+    });
+
+    it("maps X-Session-Id to x-opencode-session when no direct x-opencode-session", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "X-Session-Id": "sess-id",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-id");
+    });
+
+    it("prefers a direct x-opencode-session over x-session-affinity (regression guard)", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-opencode-session": "direct",
+        "x-session-affinity": "affinity",
+        "X-Session-Id": "session-id",
+      });
+      assert.equal(headers["x-opencode-session"], "direct");
+    });
+
+    it("does not set x-opencode-session when neither direct nor affinity is present", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "some-other-header": "val",
+      });
+      assert.equal(headers["x-opencode-session"], undefined);
+    });
+
+    it("matches session-affinity headers case-insensitively", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "X-Session-Affinity": "sess-ci",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-ci");
+    });
+
+    it("opencode-go executor also maps session-affinity to x-opencode-session", () => {
+      const headers = goExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-session-affinity": "sess-go-aff",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-go-aff");
+    });
+  });
+
+  // #4465: custom-named providers reach the session-affinity fallback above, but the
+  // OpenCode CLI never emits x-opencode-request for them (it only emits x-opencode-*
+  // when the provider id starts with "opencode"). Synthesize a request correlation id
+  // so these users are not disadvantaged on the opencode.ai upstream. x-opencode-client
+  // / x-opencode-project are NOT fabricated: their valid values are opencode-internal
+  // and inventing them risks upstream rejection — they stay forward-only.
+  describe("opencode request-id synthesis for custom-named providers (#4465)", () => {
+    it("synthesizes x-opencode-request when only session-affinity is present", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-session-affinity": "sess-aff",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-aff");
+      assert.ok(
+        typeof headers["x-opencode-request"] === "string" &&
+          headers["x-opencode-request"].length > 0,
+        "expected a synthesized x-opencode-request id"
+      );
+    });
+
+    it("synthesizes a unique x-opencode-request per call", () => {
+      const a = zenExecutor.buildHeaders({ apiKey: "k" }, true, {
+        "x-session-affinity": "sess-aff",
+      });
+      const b = zenExecutor.buildHeaders({ apiKey: "k" }, true, {
+        "x-session-affinity": "sess-aff",
+      });
+      assert.notEqual(a["x-opencode-request"], b["x-opencode-request"]);
+    });
+
+    it("prefers a client-sent x-opencode-request over the synthesized one", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-session-affinity": "sess-aff",
+        "x-opencode-request": "req-real",
+      });
+      assert.equal(headers["x-opencode-request"], "req-real");
+    });
+
+    it("does not fabricate x-opencode-client / x-opencode-project (no client source)", () => {
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-session-affinity": "sess-aff",
+      });
+      assert.equal(headers["x-opencode-client"], undefined);
+      assert.equal(headers["x-opencode-project"], undefined);
+    });
+
+    it("does not synthesize x-opencode-request on the direct opencode-session path", () => {
+      // opencode CLI (provider id starts with "opencode") sends its own x-opencode-*
+      // set; we must not override/inject when it controls the request id itself.
+      const headers = zenExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-opencode-session": "direct",
+      });
+      assert.equal(headers["x-opencode-request"], undefined);
+    });
+
+    it("opencode-go executor also synthesizes x-opencode-request on the fallback path", () => {
+      const headers = goExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-session-affinity": "sess-go-aff",
+      });
+      assert.ok(
+        typeof headers["x-opencode-request"] === "string" &&
+          headers["x-opencode-request"].length > 0
+      );
+    });
+  });
+
+  describe("DeepSeek V4 Pro reasoning-effort variants", () => {
+    function baseBody(model) {
+      return {
+        model,
+        stream: false,
+        messages: [{ role: "user", content: "ok" }],
+        max_tokens: 16,
+      };
+    }
+
+    const levels = ["low", "medium", "high", "max"];
+    for (const level of levels) {
+      it(`maps deepseek-v4-pro-${level} to base id + reasoning_effort=${level}`, () => {
+        const variant = `deepseek-v4-pro-${level}`;
+        const out = goExecutor.transformRequest(variant, baseBody(variant), false, {
+          apiKey: "test-key",
+        });
+        assert.equal(out.model, "deepseek-v4-pro");
+        assert.equal(out.reasoning_effort, level);
+        assert.ok(!String(out.model).endsWith(`-${level}`));
+      });
+    }
+
+    it("preserves explicit reasoning_effort over the variant suffix", () => {
+      const body = baseBody("deepseek-v4-pro-high") as Record<string, unknown>;
+      body.reasoning_effort = "max";
+      const out = goExecutor.transformRequest("deepseek-v4-pro-high", body, false, {
+        apiKey: "test-key",
+      });
+      assert.equal(out.reasoning_effort, "max");
+      assert.equal(out.model, "deepseek-v4-pro");
+    });
+
+    it("leaves the base id (no suffix) untouched", () => {
+      const out = goExecutor.transformRequest(
+        "deepseek-v4-pro",
+        baseBody("deepseek-v4-pro"),
+        false,
+        { apiKey: "test-key" }
+      );
+      assert.equal(out.model, "deepseek-v4-pro");
+      assert.equal(out.reasoning_effort, undefined);
+    });
+
+    it("does not rewrite unrelated models with matching suffixes", () => {
+      const out = goExecutor.transformRequest(
+        "some-other-model-high",
+        baseBody("some-other-model-high"),
+        false,
+        { apiKey: "test-key" }
+      );
+      assert.equal(out.model, "some-other-model-high");
+      assert.equal(out.reasoning_effort, undefined);
+    });
+  });
+});
+
+describe("DefaultExecutor", () => {
+  let defaultExecutor;
+
+  beforeEach(() => {
+    defaultExecutor = new DefaultExecutor("openai-compatible-test");
+  });
+
+  describe("buildHeaders", () => {
+    it("forwards x-opencode-* headers from clientHeaders", () => {
+      const headers = defaultExecutor.buildHeaders({ apiKey: "test-key" }, true, {
+        "x-opencode-session": "sess-abc",
+        "x-opencode-request": "req-xyz",
+        "x-opencode-project": "proj-5",
+        "x-opencode-client": "tui",
+      });
+      assert.equal(headers["x-opencode-session"], "sess-abc");
+      assert.equal(headers["x-opencode-request"], "req-xyz");
+      assert.equal(headers["x-opencode-project"], "proj-5");
+      assert.equal(headers["x-opencode-client"], "tui");
+    });
+
+    it("preserves existing behavior when clientHeaders is null", () => {
+      const headers = defaultExecutor.buildHeaders({ apiKey: "test-key" }, true, null);
+      assert.equal(headers["x-opencode-session"], undefined);
+      assert.equal(headers["Content-Type"], "application/json");
+      assert.equal(headers["Accept"], "text/event-stream");
+      assert.equal(headers["Authorization"], "Bearer test-key");
     });
   });
 });

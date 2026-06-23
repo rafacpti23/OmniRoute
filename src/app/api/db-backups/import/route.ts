@@ -1,11 +1,15 @@
 import { NextResponse } from "next/server";
-import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import os from "os";
 import { getDbInstance, resetDbInstance, SQLITE_FILE } from "@/lib/db/core";
-import { backupDbFile } from "@/lib/db/backup";
+import { openDatabaseAsync } from "@/lib/db/adapters/driverFactory";
+import type { SqliteAdapter } from "@/lib/db/adapters/types";
+import { backupDbFile, getTableNamesFromAdapter, countImportedRows } from "@/lib/db/backup";
 import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
+import { getSettings } from "@/lib/db/settings";
+import { setSystemPromptConfig } from "@omniroute/open-sse/services/systemPrompt.ts";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 const MAX_UPLOAD_SIZE = 100 * 1024 * 1024; // 100 MB
 
@@ -21,7 +25,7 @@ const REQUIRED_TABLES = ["provider_connections", "provider_nodes", "combos", "ap
  * 🔒 Auth-guarded: requires JWT cookie or Bearer API key (finding #258-3).
  */
 export async function POST(request: Request) {
-  if (await isAuthRequired()) {
+  if (await isAuthRequired(request)) {
     if (!(await isAuthenticated(request))) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
@@ -83,10 +87,14 @@ export async function POST(request: Request) {
     tmpPath = path.join(os.tmpdir(), `omniroute-import-${Date.now()}.sqlite`);
     fs.writeFileSync(tmpPath, fileBuffer!);
 
-    // Validate SQLite integrity
-    let testDb: InstanceType<typeof Database> | null = null;
+    // Validate SQLite integrity.
+    // Use the resilient driver factory (better-sqlite3 → node:sqlite → sql.js) rather than
+    // a direct `better-sqlite3` import: in the packaged Electron app that native module is
+    // absent from the standalone server's node_modules, so a hard import crashes the route
+    // with "Cannot find module 'better-sqlite3'" even though node:sqlite is available (#3025).
+    let testDb: SqliteAdapter | null = null;
     try {
-      testDb = new Database(tmpPath, { readonly: true });
+      testDb = await openDatabaseAsync(tmpPath, { readonly: true });
       const result = testDb.pragma("integrity_check") as any[];
       if (result[0]?.integrity_check !== "ok") {
         return NextResponse.json(
@@ -96,10 +104,7 @@ export async function POST(request: Request) {
       }
 
       // Validate required tables exist
-      const tables = testDb
-        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
-        .all()
-        .map((row: any) => row.name);
+      const tables = getTableNamesFromAdapter(testDb);
 
       const missingTables = REQUIRED_TABLES.filter((t) => !tables.includes(t));
       if (missingTables.length > 0) {
@@ -115,7 +120,10 @@ export async function POST(request: Request) {
       testDb = null;
     } catch (e) {
       if (testDb) testDb.close();
-      return NextResponse.json({ error: `Invalid database file: ${e.message}` }, { status: 400 });
+      return NextResponse.json(
+        { error: `Invalid database file: ${sanitizeErrorMessage(e)}` },
+        { status: 400 }
+      );
     }
 
     // Create pre-import backup
@@ -142,17 +150,23 @@ export async function POST(request: Request) {
     fs.copyFileSync(tmpPath, SQLITE_FILE!);
 
     // Reopen and verify
-    const db = getDbInstance();
-    const connCount =
-      (db.prepare("SELECT COUNT(*) as cnt FROM provider_connections").get() as any)?.cnt || 0;
-    const nodeCount =
-      (db.prepare("SELECT COUNT(*) as cnt FROM provider_nodes").get() as any)?.cnt || 0;
-    const comboCount = (db.prepare("SELECT COUNT(*) as cnt FROM combos").get() as any)?.cnt || 0;
-    const keyCount = (db.prepare("SELECT COUNT(*) as cnt FROM api_keys").get() as any)?.cnt || 0;
+    getDbInstance();
+    const { connCount, nodeCount, comboCount, keyCount } = countImportedRows();
 
     console.log(
       `[DB] Imported database from upload: ${connCount} connections, ${nodeCount} nodes, ${comboCount} combos, ${keyCount} API keys`
     );
+
+    // The DB was replaced wholesale — re-hydrate the in-memory Global System Prompt so it
+    // reflects the imported settings without requiring a restart (#2470).
+    try {
+      const importedSettings = await getSettings();
+      if (importedSettings.systemPrompt) {
+        setSystemPromptConfig(importedSettings.systemPrompt);
+      }
+    } catch {
+      // non-fatal: import succeeded; system prompt will hydrate on next restart
+    }
 
     return NextResponse.json({
       imported: true,
@@ -164,7 +178,7 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     console.error("[API] Error importing database:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   } finally {
     // Cleanup temp file
     if (tmpPath && fs.existsSync(tmpPath)) {

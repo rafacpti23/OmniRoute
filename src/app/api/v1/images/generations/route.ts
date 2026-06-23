@@ -1,5 +1,5 @@
-import { CORS_ORIGIN } from "@/shared/utils/cors";
 import { handleImageGeneration } from "@omniroute/open-sse/handlers/imageGeneration.ts";
+import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 import {
   getProviderCredentials,
   clearRecoveredProviderState,
@@ -20,7 +20,12 @@ import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { v1ImageGenerationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
-import { getAllCustomModels } from "@/lib/localDb";
+import { getAllCustomModels, resolveProxyForConnection } from "@/lib/localDb";
+import { resolveImageRouteModel } from "@/lib/images/imageRouteModel";
+import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
+import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
+import { calculateModalCost } from "@/lib/usage/costCalculator";
+import { generateRequestId } from "@/shared/utils/requestId";
 
 /**
  * Handle CORS preflight
@@ -28,7 +33,6 @@ import { getAllCustomModels } from "@/lib/localDb";
 export async function OPTIONS() {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
@@ -118,7 +122,7 @@ function publicBaseUrlHeaders(headers: Headers): Record<string, string> {
   return out;
 }
 
-export async function POST(request) {
+async function postHandler(request, context) {
   let rawBody;
   try {
     rawBody = await request.json();
@@ -132,22 +136,17 @@ export async function POST(request) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, validation.error.message);
   }
   const body = validation.data;
-
-  // Optional API key validation
-  if (process.env.REQUIRE_API_KEY === "true") {
-    const apiKey = extractApiKey(request);
-    if (!apiKey) {
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Missing API key");
-    }
-    const valid = await isValidApiKey(apiKey);
-    if (!valid) {
-      return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
-    }
-  }
+  const startTime = Date.now();
 
   // Enforce API key policies (model restrictions + budget limits)
   const policy = await enforceApiKeyPolicy(request, body.model);
   if (policy.rejection) return policy.rejection;
+
+  // #3205/#3215: resolve a combo/alias name (`image`) or a user-prefixed custom image
+  // model (`myImg/gpt-image-2`) to its internal `<nodeId>/<model>` form so the
+  // custom-model lookup and handler's resolvedProvider extraction resolve correctly.
+  // Built-in and already-internal ids pass through unchanged. Shared with /images/edits.
+  body.model = await resolveImageRouteModel(body.model);
 
   // Parse model to get provider
   let { provider } = parseImageModel(body.model);
@@ -240,20 +239,53 @@ export async function POST(request) {
     }
   }
 
-  const result = await handleImageGeneration({
-    body,
-    credentials,
-    log,
-    ...(isCustomModel && { resolvedProvider: provider }),
-    signal: request.signal,
-    clientHeaders: publicBaseUrlHeaders(request.headers),
-  });
+  // Resolve proxy for the connection if credentials exist (#1904)
+  let proxyInfo = null;
+  if (credentials?.connectionId) {
+    try {
+      proxyInfo = await resolveProxyForConnection(credentials.connectionId);
+    } catch {
+      log.debug("PROXY", `Failed to resolve proxy for image provider: ${provider}`);
+    }
+  }
+
+  const generateImage = () =>
+    handleImageGeneration({
+      body,
+      credentials,
+      log,
+      ...(isCustomModel && { resolvedProvider: provider }),
+      signal: request.signal,
+      clientHeaders: publicBaseUrlHeaders(request.headers),
+    });
+
+  // Execute with proxy context when available, direct otherwise (#1904)
+  const result = await (credentials?.connectionId
+    ? runWithProxyContext(proxyInfo?.proxy || null, generateImage).catch((err: any) => ({
+        success: false,
+        status: err.statusCode || 500,
+        error: err.message,
+      }))
+    : generateImage());
 
   if (result.success) {
     await clearRecoveredProviderState(credentials);
-    return new Response(JSON.stringify((result as any).data), {
+    const n = Math.max(
+      Number(body.n) || 1,
+      (result as { data?: { data?: unknown[] } }).data?.data?.length || 0
+    );
+    const costUsd = await calculateModalCost("image", provider, body.model, { n });
+    const headers = new Headers({ "Content-Type": "application/json" });
+    attachOmniRouteMetaHeaders(headers, {
+      provider,
+      model: body.model,
+      costUsd,
+      latencyMs: Date.now() - startTime,
+      requestId: generateRequestId(),
+    });
+    return new Response(JSON.stringify((result as { data: unknown }).data), {
       status: 200,
-      headers: { "Content-Type": "application/json" },
+      headers,
     });
   }
 
@@ -263,3 +295,5 @@ export async function POST(request) {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+export const POST = withInjectionGuard(postHandler);

@@ -113,6 +113,49 @@ test("handleEmbedding supports resolved local providers without auth and preserv
   }
 });
 
+test("handleEmbedding routes Upstage embedding models through the embedding endpoint", async () => {
+  const originalFetch = globalThis.fetch;
+  let captured;
+
+  globalThis.fetch = async (url, options = {}) => {
+    captured = {
+      url: String(url),
+      headers: options.headers,
+      body: JSON.parse(String(options.body || "{}")),
+    };
+
+    return new Response(
+      JSON.stringify({
+        data: [{ object: "embedding", embedding: [0.1, 0.2], index: 0 }],
+        usage: { prompt_tokens: 2, total_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  };
+
+  try {
+    const result = await handleEmbedding({
+      body: {
+        model: "upstage/embedding-query",
+        input: "Solar embeddings are useful",
+      },
+      credentials: { apiKey: "upstage-key" },
+      log: null,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(captured.url, "https://api.upstage.ai/v1/embeddings");
+    assert.equal(captured.headers.Authorization, "Bearer upstage-key");
+    assert.deepEqual(captured.body, {
+      model: "embedding-query",
+      input: "Solar embeddings are useful",
+    });
+    assert.equal(result.data.model, "upstage/embedding-query");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("handleEmbedding rejects invalid model strings without provider prefix", async () => {
   const result = await handleEmbedding({
     body: { model: "not-a-known-embedding-model", input: "hello" },
@@ -168,6 +211,78 @@ test("handleEmbedding surfaces upstream failures", async () => {
     assert.equal(result.success, false);
     assert.equal(result.status, 503);
     assert.equal(result.error, "provider unavailable");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleEmbedding strips content-encoding header on success path", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        data: [{ object: "embedding", embedding: [0.1, 0.2], index: 0 }],
+        usage: { prompt_tokens: 5, total_tokens: 5 },
+      }),
+      {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "content-encoding": "gzip",
+          "content-length": "512",
+          "transfer-encoding": "chunked",
+          "x-request-id": "abc123",
+        },
+      }
+    );
+
+  try {
+    const result = await handleEmbedding({
+      body: { model: "openai/text-embedding-3-small", input: "test" },
+      credentials: { apiKey: "openai-key" },
+      log: null,
+    });
+
+    assert.equal(result.success, true);
+    assert.strictEqual(result.headers.get("content-encoding"), null);
+    assert.strictEqual(result.headers.get("content-length"), null);
+    assert.strictEqual(result.headers.get("transfer-encoding"), null);
+    assert.strictEqual(result.headers.get("x-request-id"), "abc123");
+    assert.strictEqual(result.headers.get("content-type"), "application/json");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleEmbedding strips content-encoding header on error path", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () =>
+    new Response("upstream error", {
+      status: 502,
+      headers: {
+        "content-type": "text/plain",
+        "content-encoding": "gzip",
+        "content-length": "42",
+        "transfer-encoding": "chunked",
+        "x-trace-id": "trace-456",
+      },
+    });
+
+  try {
+    const result = await handleEmbedding({
+      body: { model: "openai/text-embedding-3-small", input: "test" },
+      credentials: { apiKey: "openai-key" },
+      log: null,
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.status, 502);
+    assert.strictEqual(result.headers.get("content-encoding"), null);
+    assert.strictEqual(result.headers.get("content-length"), null);
+    assert.strictEqual(result.headers.get("transfer-encoding"), null);
+    assert.strictEqual(result.headers.get("x-trace-id"), "trace-456");
   } finally {
     globalThis.fetch = originalFetch;
   }

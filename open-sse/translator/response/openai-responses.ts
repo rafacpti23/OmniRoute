@@ -4,9 +4,38 @@
  */
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
+import { appendToolCallArgumentDelta } from "../../utils/toolCallArguments.ts";
 
 function normalizeToolName(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function stripEmptyOptionalToolArgs(value, toolName) {
+  if (value == null) return value;
+
+  if (typeof value === "string") {
+    // JSON-string cleanup is intentionally scoped to Claude Code's Read tool.
+    // For arbitrary tools, empty strings/arrays may be valid user payloads.
+    if (toolName !== "Read") return value;
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed) || typeof parsed !== "object" || parsed === null) return value;
+      const cleaned = stripEmptyOptionalToolArgs(parsed, toolName);
+      return JSON.stringify(cleaned ?? {});
+    } catch {
+      return value;
+    }
+  }
+
+  if (Array.isArray(value) || typeof value !== "object") return value;
+
+  const cleaned = { ...value };
+  for (const [key, entry] of Object.entries(cleaned)) {
+    if (entry === "" || (Array.isArray(entry) && entry.length === 0)) {
+      delete cleaned[key];
+    }
+  }
+  return cleaned;
 }
 
 /**
@@ -320,15 +349,19 @@ function emitToolCall(state, emit, tc) {
 
   if (tc.function?.arguments) {
     const refCallId = state.funcCallIds[tcIdx] || newCallId;
-    if (refCallId) {
+    const existingArgs = state.funcArgsBuf[tcIdx] || "";
+    const nextArgs = appendToolCallArgumentDelta(existingArgs, tc.function.arguments);
+    const emittedDelta = nextArgs.slice(existingArgs.length);
+    state.funcArgsBuf[tcIdx] = nextArgs;
+
+    if (refCallId && emittedDelta) {
       emit("response.function_call_arguments.delta", {
         type: "response.function_call_arguments.delta",
         item_id: `fc_${refCallId}`,
         output_index: tcIdx,
-        delta: tc.function.arguments,
+        delta: emittedDelta,
       });
     }
-    state.funcArgsBuf[tcIdx] += tc.function.arguments;
   }
 }
 
@@ -432,7 +465,7 @@ function flushEvents(state) {
   return events;
 }
 
-function normalizeUpstreamFailure(data, fallbackType = "server_error") {
+export function normalizeUpstreamFailure(data, fallbackType = "server_error") {
   const response = data?.response && typeof data.response === "object" ? data.response : null;
   const error =
     response?.error && typeof response.error === "object"
@@ -449,12 +482,52 @@ function normalizeUpstreamFailure(data, fallbackType = "server_error") {
         ? data.message
         : "Upstream failure";
 
+  // Preserve upstream error semantics:
+  // - context_length_exceeded → 400 (client can retry with smaller context)
+  // - rate_limit_exceeded → 429 (client should back off)
+  // - Everything else → 502 (upstream failure)
+  const isContextOverflow = code === "context_length_exceeded";
+  const isRateLimit = code === "rate_limit_exceeded" || code === "rate_limited";
+  let status: number;
+  let type: string;
+  if (isRateLimit) {
+    status = 429;
+    type = "rate_limit_error";
+  } else if (isContextOverflow) {
+    status = 400;
+    type = "invalid_request_error";
+  } else {
+    status = 502;
+    type = fallbackType;
+  }
+
   return {
-    status: code === "rate_limit_exceeded" ? 429 : 502,
-    type: code === "rate_limit_exceeded" ? "rate_limit_error" : fallbackType,
-    code: code || (fallbackType === "rate_limit_error" ? "rate_limit_exceeded" : "bad_gateway"),
+    status,
+    type,
+    code: code || (isRateLimit ? "rate_limit_exceeded" : "bad_gateway"),
     message,
   };
+}
+
+/**
+ * OpenAI Chat Completions streams announce the assistant role on the FIRST delta
+ * (e.g. `{ "role": "assistant", "content": "" }` or `{ "role": "assistant",
+ * "tool_calls": [...] }`). The Responses API has no role-announcement event, so when
+ * translating Responses → Chat we must synthesize it on the first emitted chunk.
+ *
+ * Strict streaming clients — notably @langchain/openai's `_convertDeltaToMessageChunk`
+ * (used by n8n's AI Agent) — key off the first chunk's role to build an AIMessageChunk.
+ * Without it, streamed tool_call deltas are dropped and the agent returns an empty
+ * response, even though the underlying tool call is well-formed.
+ */
+function withAssistantRoleOnFirstDelta(state, result) {
+  if (!result || state.roleEmitted) return result;
+  const delta = result.choices?.[0]?.delta;
+  if (delta && typeof delta === "object" && !Array.isArray(delta)) {
+    delta.role = "assistant";
+    state.roleEmitted = true;
+  }
+  return result;
 }
 
 /**
@@ -462,6 +535,10 @@ function normalizeUpstreamFailure(data, fallbackType = "server_error") {
  * This is for when Codex returns data and we need to send it to an OpenAI-compatible client
  */
 export function openaiResponsesToOpenAIResponse(chunk, state) {
+  return withAssistantRoleOnFirstDelta(state, openaiResponsesToOpenAIResponseStream(chunk, state));
+}
+
+function openaiResponsesToOpenAIResponseStream(chunk, state) {
   if (!chunk) {
     // Flush: send final chunk with finish_reason
     if (!state.finishReasonSent && state.started) {
@@ -631,11 +708,13 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
 
       state.toolCallIndex++;
 
+      const argsToEmit = stripEmptyOptionalToolArgs(item.arguments, toolName);
+
       const argsStr =
-        item.arguments != null
-          ? typeof item.arguments === "string"
-            ? item.arguments
-            : JSON.stringify(item.arguments)
+        argsToEmit != null
+          ? typeof argsToEmit === "string"
+            ? argsToEmit
+            : JSON.stringify(argsToEmit)
           : buffered;
 
       return {
@@ -671,8 +750,9 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
 
     // Only emit if arguments exist in the done event AND they weren't already streamed via deltas
     if (item.arguments != null && !buffered) {
-      const argsStr =
-        typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments);
+      const argsToEmit = stripEmptyOptionalToolArgs(item.arguments, toolName);
+
+      const argsStr = typeof argsToEmit === "string" ? argsToEmit : JSON.stringify(argsToEmit);
       if (argsStr) {
         return {
           id: state.chatId,
@@ -805,10 +885,18 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     };
   }
 
-  // Handle true reasoning summary ("Thought for 15s")
+  // Handle true reasoning summary ("Thought for 15s").
+  // Emit as `delta.reasoning_content` — matches the shape used by the
+  // `reasoning_content_text.delta` branch above and is what Chat clients
+  // (OpenCode, Claude Code, Cursor, etc.) actually render in their thinking
+  // panel. A nested `delta.reasoning.summary` object is swallowed by most
+  // stream mergers and never reaches the user.
   if (eventType === "response.reasoning_summary_text.delta") {
     const reasoningDelta = data.delta || "";
     if (!reasoningDelta) return null;
+    const reasoningDeltaShape = state.copilotCompatibleReasoning
+      ? { reasoning_text: reasoningDelta }
+      : { reasoning_content: reasoningDelta };
     return {
       id: state.chatId,
       object: "chat.completion.chunk",
@@ -817,7 +905,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
       choices: [
         {
           index: 0,
-          delta: { reasoning: { summary: reasoningDelta } },
+          delta: reasoningDeltaShape,
           finish_reason: null,
         },
       ],

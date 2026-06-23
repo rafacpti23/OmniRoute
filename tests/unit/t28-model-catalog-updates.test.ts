@@ -3,13 +3,20 @@ import assert from "node:assert/strict";
 
 import { getModelInfoCore } from "../../open-sse/services/model.ts";
 import { REGISTRY } from "../../open-sse/config/providerRegistry.ts";
-import { getStaticModelsForProvider } from "../../src/app/api/providers/[id]/models/route.ts";
+import { getStaticModelsForProvider } from "../../src/lib/providers/staticModels.ts";
 
-test("T28: gemini-cli catalog includes preview models, gemini uses API sync", () => {
-  // Gemini (AI Studio) no longer has a hardcoded registry — models come from
-  // API sync via /api/providers/:id/models with pageSize=1000.
+test("T28: gemini AI Studio catalog includes current preview models", () => {
+  // Gemini (AI Studio) carries a small hardcoded fallback for first-run UX when no
+  // API key has been added yet; the full catalog is populated by API sync via
+  // /api/providers/:id/models with pageSize=1000 once a key exists.
   const geminiIds = REGISTRY.gemini.models.map((m) => m.id);
-  assert.equal(geminiIds.length, 0, "gemini models should be empty (populated by API sync)");
+  assert.ok(geminiIds.includes("gemini-3.1-pro-preview"));
+  assert.ok(geminiIds.includes("gemini-3-flash-preview"));
+  assert.ok(geminiIds.includes("gemini-3.1-flash-lite-preview"));
+  assert.ok(geminiIds.includes("gemini-3.5-flash"));
+  assert.ok(geminiIds.includes("gemini-2.5-flash"));
+  assert.ok(geminiIds.includes("gemini-2.5-pro"));
+  assert.equal(geminiIds[0], "gemini-2.0-flash", "preserve the existing Gemini default");
 
   // gemini-cli still has hardcoded models (Cloud Code doesn't have a models API)
   const geminiCliIds = REGISTRY["gemini-cli"].models.map((m) => m.id);
@@ -17,14 +24,22 @@ test("T28: gemini-cli catalog includes preview models, gemini uses API sync", ()
   assert.ok(geminiCliIds.includes("gemini-3-flash-preview"));
 });
 
-test("T28: antigravity static catalog exposes client-visible Gemini preview IDs", () => {
+test("T28: antigravity static catalog exposes client-visible Gemini tier IDs", () => {
   const staticIds = (getStaticModelsForProvider("antigravity") || []).map((m) => m.id);
 
   assert.ok(staticIds.includes("gemini-3-pro-preview"));
+  assert.ok(staticIds.includes("gemini-3.5-flash-low"));
+  assert.ok(staticIds.includes("gemini-3.5-flash-medium"));
+  assert.ok(staticIds.includes("gemini-3.5-flash-high"));
   assert.ok(staticIds.includes("gemini-3.1-pro-low"));
-  assert.ok(staticIds.includes("gemini-3-flash-preview"));
+  assert.ok(staticIds.includes("gemini-3.1-pro-high"));
+  // Legacy aliases that were never client-visible stay absent.
   assert.ok(!staticIds.includes("gemini-3-pro-high"));
-  assert.ok(!staticIds.includes("gemini-3.1-pro-high"));
+  assert.ok(!staticIds.includes("gemini-3-flash-preview"));
+  assert.ok(!staticIds.includes("gemini-3-flash-agent"));
+  assert.ok(!staticIds.includes("gemini-claude-sonnet-4-5"));
+  assert.ok(!staticIds.includes("gemini-claude-sonnet-4-5-thinking"));
+  assert.ok(!staticIds.includes("gemini-claude-opus-4-5-thinking"));
 });
 
 test("T28: github registry exposes Gemini 3.1 Pro Preview and keeps legacy alias compatibility", async () => {
@@ -51,9 +66,10 @@ test("T28: qwen registry uses native chat.qwen.ai base URL", () => {
 test("T28: vertex catalog includes partner models when vertex executor is available", () => {
   const vertexIds = REGISTRY.vertex.models.map((m) => m.id);
 
-  assert.ok(vertexIds.includes("deepseek-v3.2"));
-  assert.ok(vertexIds.includes("qwen3-next-80b"));
-  assert.ok(vertexIds.includes("glm-5"));
+  assert.ok(vertexIds.includes("DeepSeek-V4-Flash"));
+  assert.ok(vertexIds.includes("DeepSeek-V4-Pro"));
+  assert.ok(vertexIds.includes("Qwen3.6-35B-A3B"));
+  assert.ok(vertexIds.includes("GLM-5.1-FP8"));
 });
 
 test("T28: new catalog models resolve through getModelInfoCore", async () => {
@@ -69,7 +85,7 @@ test("T28: new catalog models resolve through getModelInfoCore", async () => {
   assert.equal(flashPreview.provider, "gemini");
   assert.equal(flashPreview.model, "gemini-3-flash-preview");
 
-  const vertexPartner = await getModelInfoCore("vertex/qwen3-next-80b", {});
+  const vertexPartner = await getModelInfoCore("vertex/Qwen3.6-35B-A3B", {});
   assert.equal(vertexPartner.provider, "vertex");
-  assert.equal(vertexPartner.model, "qwen3-next-80b");
+  assert.equal(vertexPartner.model, "Qwen3.6-35B-A3B");
 });

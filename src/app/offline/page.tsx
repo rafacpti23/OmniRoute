@@ -1,27 +1,26 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import Link from "next/link";
 
+function subscribeToOnline(callback: () => void) {
+  window.addEventListener("online", callback);
+  window.addEventListener("offline", callback);
+  return () => {
+    window.removeEventListener("online", callback);
+    window.removeEventListener("offline", callback);
+  };
+}
+
 export default function OfflinePage() {
-  const [isOnline, setIsOnline] = useState<boolean>(() =>
-    typeof navigator !== "undefined" ? navigator.onLine : true
+  const isOnline = useSyncExternalStore(
+    subscribeToOnline,
+    () => navigator.onLine,
+    () => false
   );
 
-  useEffect(() => {
-    const onOnline = () => setIsOnline(true);
-    const onOffline = () => setIsOnline(false);
-
-    window.addEventListener("online", onOnline);
-    window.addEventListener("offline", onOffline);
-    return () => {
-      window.removeEventListener("online", onOnline);
-      window.removeEventListener("offline", onOffline);
-    };
-  }, []);
-
   return (
-    <main className="min-h-screen bg-bg text-text-main flex items-center justify-center p-6">
+    <main className="min-h-screen text-text-main flex items-center justify-center p-6">
       <section className="w-full max-w-xl rounded-2xl border border-border bg-surface p-8 shadow-soft text-center">
         <span className="material-symbols-outlined text-5xl text-primary mb-3" aria-hidden="true">
           wifi_off

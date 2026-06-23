@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
 import { validateClaudeCodeCompatibleProvider } from "@/lib/providers/validation";
 import {
@@ -29,6 +30,54 @@ function sanitizeClaudeCodeCompatibleBaseUrl(baseUrl: string) {
     .replace(/\/(?:v\d+\/)?messages(?:\?[^#]*)?$/i, "");
 }
 
+// Status-specific error message for /models probe failures.
+function getModelsErrorMessage(status: number) {
+  if (status === 401 || status === 403) return "API key unauthorized";
+  if (status === 404) {
+    return "/models endpoint not found - enter a Model ID to validate via chat/completions instead";
+  }
+  if (status >= 500) return "Server error - try again later";
+  return `Unexpected response (${status})`;
+}
+
+// Status-specific error message for the /chat/completions fallback probe.
+function getChatErrorMessage(status: number) {
+  if (status === 401 || status === 403) return "API key unauthorized";
+  if (status === 400) return "Invalid model or bad request";
+  if (status === 404) return "Chat endpoint not found";
+  if (status >= 500) return "Server error - try again later";
+  return `Chat request failed (${status})`;
+}
+
+async function probeChatFallback({
+  baseUrl,
+  apiKey,
+  modelId,
+  extraHeaders = {},
+}: {
+  baseUrl: string;
+  apiKey: string;
+  modelId: string;
+  extraHeaders?: Record<string, string>;
+}) {
+  const chatUrl = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+  return safeOutboundFetch(chatUrl, {
+    ...SAFE_OUTBOUND_FETCH_PRESETS.validationRead,
+    guard: getProviderOutboundGuard(),
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      ...extraHeaders,
+    },
+    body: JSON.stringify({
+      model: modelId,
+      messages: [{ role: "user", content: "ping" }],
+      max_tokens: 1,
+    }),
+  });
+}
+
 function sanitizeAuditBaseUrl(baseUrl: string) {
   if (!baseUrl) return null;
   try {
@@ -41,6 +90,9 @@ function sanitizeAuditBaseUrl(baseUrl: string) {
 
 // POST /api/provider-nodes/validate - Validate API key against base URL
 export async function POST(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   const auditContext = getAuditRequestContext(request);
   let rawBody;
   try {
@@ -62,7 +114,8 @@ export async function POST(request) {
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const { baseUrl, apiKey, type, compatMode, chatPath, modelsPath } = validation.data;
+    const { baseUrl, apiKey, type, compatMode, chatPath, modelsPath, modelId } = validation.data;
+    const trimmedModelId = typeof modelId === "string" ? modelId.trim() : "";
 
     // Anthropic Compatible Validation
     if (type === "anthropic-compatible") {
@@ -107,18 +160,57 @@ export async function POST(request) {
         },
       });
 
-      return NextResponse.json({ valid: res.ok, error: res.ok ? null : "Invalid API key" });
+      if (res.ok) return NextResponse.json({ valid: true, error: null });
+      // Auth errors: chat fallback would not recover. Skip and surface clear message.
+      if (res.status === 401 || res.status === 403) {
+        return NextResponse.json({ valid: false, error: "API key unauthorized" });
+      }
+      // Optional /chat/completions fallback when caller supplied a model ID
+      // (some Anthropic-compatible proxies expose only the chat endpoint).
+      if (trimmedModelId) {
+        const chatRes = await probeChatFallback({
+          baseUrl: normalizedBase,
+          apiKey: apiKey ?? "",
+          modelId: trimmedModelId,
+          extraHeaders: { "x-api-key": apiKey ?? "", "anthropic-version": "2023-06-01" },
+        });
+        if (chatRes.ok) return NextResponse.json({ valid: true, error: null, method: "chat" });
+        return NextResponse.json({
+          valid: false,
+          error: getChatErrorMessage(chatRes.status),
+          method: "chat",
+        });
+      }
+      return NextResponse.json({ valid: false, error: getModelsErrorMessage(res.status) });
     }
 
     // OpenAI Compatible Validation (Default)
-    const modelsUrl = `${baseUrl.replace(/\/$/, "")}${modelsPath || "/models"}`;
+    const openAiBase = baseUrl.replace(/\/$/, "");
+    const modelsUrl = `${openAiBase}${modelsPath || "/models"}`;
     const res = await safeOutboundFetch(modelsUrl, {
       ...SAFE_OUTBOUND_FETCH_PRESETS.validationRead,
       guard: getProviderOutboundGuard(),
       headers: { Authorization: `Bearer ${apiKey}` },
     });
 
-    return NextResponse.json({ valid: res.ok, error: res.ok ? null : "Invalid API key" });
+    if (res.ok) return NextResponse.json({ valid: true, error: null });
+    if (res.status === 401 || res.status === 403) {
+      return NextResponse.json({ valid: false, error: "API key unauthorized" });
+    }
+    if (trimmedModelId) {
+      const chatRes = await probeChatFallback({
+        baseUrl: openAiBase,
+        apiKey: apiKey ?? "",
+        modelId: trimmedModelId,
+      });
+      if (chatRes.ok) return NextResponse.json({ valid: true, error: null, method: "chat" });
+      return NextResponse.json({
+        valid: false,
+        error: getChatErrorMessage(chatRes.status),
+        method: "chat",
+      });
+    }
+    return NextResponse.json({ valid: false, error: getModelsErrorMessage(res.status) });
   } catch (error) {
     const status = getSafeOutboundFetchErrorStatus(error);
     if (status) {

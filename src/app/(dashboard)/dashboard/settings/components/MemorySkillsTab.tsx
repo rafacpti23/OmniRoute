@@ -23,6 +23,11 @@ interface QdrantSettings {
   apiKeyMasked: string | null;
 }
 
+interface EmbeddingModelOption {
+  value: string;
+  label: string;
+}
+
 const STRATEGIES = [
   { value: "recent", labelKey: "recent", descKey: "recentDesc" },
   { value: "semantic", labelKey: "semantic", descKey: "semanticDesc" },
@@ -31,7 +36,9 @@ const STRATEGIES = [
 
 export default function MemorySkillsTab() {
   const [config, setConfig] = useState<MemoryConfig>({
-    enabled: true,
+    // Off by default (matches DEFAULT_MEMORY_SETTINGS) — memory injects ~maxTokens
+    // of billed context per request, so it's opt-in. See PRD-2026-06-19-no-memory-header.
+    enabled: false,
     maxTokens: 2000,
     retentionDays: 30,
     strategy: "hybrid",
@@ -66,6 +73,8 @@ export default function MemorySkillsTab() {
   >([]);
   const [qdrantCleanupLoading, setQdrantCleanupLoading] = useState(false);
   const [qdrantCleanupMsg, setQdrantCleanupMsg] = useState("");
+  const [embeddingOptions, setEmbeddingOptions] = useState<EmbeddingModelOption[]>([]);
+  const [qdrantHelpOpen, setQdrantHelpOpen] = useState(false);
 
   const [skillsmpApiKey, setSkillsmpApiKey] = useState("");
   const [skillsmpSaving, setSkillsmpSaving] = useState(false);
@@ -80,8 +89,9 @@ export default function MemorySkillsTab() {
       fetch("/api/settings/memory").then((res) => (res.ok ? res.json() : null)),
       fetch("/api/settings").then((res) => (res.ok ? res.json() : null)),
       fetch("/api/settings/qdrant").then((res) => (res.ok ? res.json() : null)),
+      fetch("/api/settings/qdrant/embedding-models").then((res) => (res.ok ? res.json() : null)),
     ])
-      .then(([memData, settingsData, qdrantData]) => {
+      .then(([memData, settingsData, qdrantData, embeddingData]) => {
         if (memData) setConfig(memData);
         if (settingsData?.skillsmpApiKey) {
           setSkillsmpApiKey(settingsData.skillsmpApiKey);
@@ -89,6 +99,9 @@ export default function MemorySkillsTab() {
         if (qdrantData) {
           setQdrant(qdrantData);
           setQdrantApiKeyInput("");
+        }
+        if (embeddingData?.models && Array.isArray(embeddingData.models)) {
+          setEmbeddingOptions(embeddingData.models);
         }
         if (
           settingsData?.skillsProvider === "skillsmp" ||
@@ -192,18 +205,23 @@ export default function MemorySkillsTab() {
       const data = await res.json().catch(() => null);
       if (res.ok && data?.ok) {
         setQdrantCleanupMsg(
-          `OK: removeu ${data.deletedCount ?? 0} ponto(s) (retencao: ${data.retentionDays} dias)`
+          t("qdrantCleanupSuccess", {
+            count: data.deletedCount ?? 0,
+            days: data.retentionDays,
+          })
         );
       } else {
-        const err = data?.error || "Falha na limpeza";
-        setQdrantCleanupMsg(`Erro: ${String(err)}`);
+        const err = data?.error || t("qdrantCleanupFailed");
+        setQdrantCleanupMsg(t("qdrantCleanupError", { error: String(err) }));
       }
     } catch (e) {
-      setQdrantCleanupMsg(`Erro: ${e instanceof Error ? e.message : String(e)}`);
+      setQdrantCleanupMsg(
+        t("qdrantCleanupError", { error: e instanceof Error ? e.message : String(e) })
+      );
     } finally {
       setQdrantCleanupLoading(false);
     }
-  }, []);
+  }, [t]);
 
   const saveSkillsmpApiKey = useCallback(async () => {
     setSkillsmpSaving(true);
@@ -344,6 +362,22 @@ export default function MemorySkillsTab() {
           </button>
         </div>
 
+        {/* Token-cost warning — memory injection is billed (PRD-2026-06-19) */}
+        {config.enabled && (
+          <div
+            className="flex items-start gap-2 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 mb-4 text-amber-600 dark:text-amber-400"
+            role="note"
+            data-testid="memory-token-cost-warning"
+          >
+            <span className="material-symbols-outlined text-[18px] leading-none mt-0.5" aria-hidden="true">
+              info
+            </span>
+            <p className="text-xs leading-relaxed">
+              {t("memoryTokenCostWarning", { tokens: config.maxTokens.toLocaleString() })}
+            </p>
+          </div>
+        )}
+
         {/* Memory config fields */}
         {config.enabled && (
           <>
@@ -435,14 +469,10 @@ export default function MemorySkillsTab() {
             </span>
           </div>
           <div>
-            <h3 className="text-lg font-semibold">Qdrant (Memoria vetorial)</h3>
-            <p className="text-sm text-text-muted">
-              Opcional. Indexa memorias do tipo semantic em um banco vetorial externo para busca
-              mais rapida.
-            </p>
+            <h3 className="text-lg font-semibold">{t("qdrantTitle")}</h3>
+            <p className="text-sm text-text-muted">{t("qdrantDesc")}</p>
           </div>
 
-          {/* LED */}
           <span
             className={`ml-auto inline-flex items-center gap-2 text-xs font-medium ${
               qdrant.enabled
@@ -458,16 +488,18 @@ export default function MemorySkillsTab() {
               }`}
               aria-hidden="true"
             />
-            {qdrant.enabled ? (qdrantHealth?.ok ? "Ativo" : "Com erro") : "Desativado"}
+            {qdrant.enabled
+              ? qdrantHealth?.ok
+                ? t("qdrantStatusActive")
+                : t("qdrantStatusError")
+              : t("qdrantStatusDisabled")}
           </span>
         </div>
 
         <div className="flex items-center justify-between p-4 rounded-lg bg-surface/30 border border-border/30 mb-4">
           <div>
-            <p className="text-sm font-medium">Ativar Qdrant</p>
-            <p className="text-xs text-text-muted mt-0.5">
-              Quando ativo, a estrategia semantic/hybrid pode usar Qdrant para recuperar memorias.
-            </p>
+            <p className="text-sm font-medium">{t("qdrantEnable")}</p>
+            <p className="text-xs text-text-muted mt-0.5">{t("qdrantEnableDesc")}</p>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -475,7 +507,7 @@ export default function MemorySkillsTab() {
               disabled={qdrantChecking || qdrantSaving}
               className="px-3 h-8 text-xs font-medium rounded-lg bg-white/5 border border-border/60 hover:bg-white/10 disabled:opacity-50 transition-colors"
             >
-              {qdrantChecking ? "Testando..." : "Testar conexao"}
+              {qdrantChecking ? t("qdrantTesting") : t("qdrantTestConnection")}
             </button>
             <button
               data-testid="qdrant-enabled-switch"
@@ -498,12 +530,12 @@ export default function MemorySkillsTab() {
 
         {qdrantStatus === "saved" && (
           <div className="mb-4 text-xs font-medium text-emerald-500 flex items-center gap-1">
-            <span className="material-symbols-outlined text-[14px]">check_circle</span> Configuracao
-            salva
+            <span className="material-symbols-outlined text-[14px]">check_circle</span>{" "}
+            {t("qdrantSaved")}
           </div>
         )}
         {qdrantStatus === "error" && (
-          <div className="mb-4 text-xs font-medium text-red-500">Falha ao salvar configuracao</div>
+          <div className="mb-4 text-xs font-medium text-red-500">{t("qdrantSaveError")}</div>
         )}
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -515,13 +547,11 @@ export default function MemorySkillsTab() {
               placeholder="http://127.0.0.1"
               className="w-full px-3 py-2 rounded-lg bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
             />
-            <p className="text-xs text-text-muted mt-2">
-              Sem a porta. Ex: 127.0.0.1 ou http://qdrant
-            </p>
+            <p className="text-xs text-text-muted mt-2">{t("qdrantHostHint")}</p>
           </div>
 
           <div className="p-4 rounded-lg bg-surface/30 border border-border/30">
-            <label className="text-sm font-medium block mb-2">Porta</label>
+            <label className="text-sm font-medium block mb-2">{t("qdrantPort")}</label>
             <input
               value={qdrant.port}
               onChange={(e) =>
@@ -533,7 +563,7 @@ export default function MemorySkillsTab() {
               placeholder="6333"
               className="w-full px-3 py-2 rounded-lg bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
             />
-            <p className="text-xs text-text-muted mt-2">Padrao do Qdrant: 6333</p>
+            <p className="text-xs text-text-muted mt-2">{t("qdrantPortHint")}</p>
           </div>
 
           <div className="p-4 rounded-lg bg-surface/30 border border-border/30">
@@ -544,30 +574,61 @@ export default function MemorySkillsTab() {
               placeholder="omniroute_memory"
               className="w-full px-3 py-2 rounded-lg bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
             />
-            <p className="text-xs text-text-muted mt-2">
-              Onde os pontos de memoria serao gravados.
-            </p>
+            <p className="text-xs text-text-muted mt-2">{t("qdrantCollectionHint")}</p>
           </div>
 
           <div className="p-4 rounded-lg bg-surface/30 border border-border/30">
-            <label className="text-sm font-medium block mb-2">Modelo de embedding</label>
+            <div className="flex items-center gap-2 mb-2">
+              <label className="text-sm font-medium block">{t("qdrantEmbeddingModel")}</label>
+              <button
+                type="button"
+                onClick={() => setQdrantHelpOpen((v) => !v)}
+                className="inline-flex items-center justify-center w-5 h-5 rounded-full border border-border/70 text-xs text-text-muted hover:bg-white/10"
+                title={t("qdrantHelpTitle")}
+                aria-label={t("qdrantHelpTitle")}
+              >
+                ?
+              </button>
+            </div>
+            {qdrantHelpOpen && (
+              <div className="mb-3 p-3 rounded-lg bg-background/60 border border-border/60 text-xs text-text-muted leading-relaxed">
+                <p className="font-medium text-white mb-1">{t("qdrantHelpQuickTitle")}</p>
+                <p>{t("qdrantHelpStep1")}</p>
+                <p>{t("qdrantHelpStep2")}</p>
+                <p>{t("qdrantHelpStep3")}</p>
+                <p>{t("qdrantHelpStep4")}</p>
+              </div>
+            )}
+            <select
+              value=""
+              onChange={(e) => {
+                const value = e.target.value;
+                if (value) setQdrant((s) => ({ ...s, embeddingModel: value }));
+              }}
+              className="w-full px-3 py-2 rounded-lg bg-background border border-border text-sm mb-2 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+            >
+              <option value="">{t("qdrantEmbeddingQuickSelect")}</option>
+              {embeddingOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.value}
+                </option>
+              ))}
+            </select>
             <input
               value={qdrant.embeddingModel}
               onChange={(e) => setQdrant((s) => ({ ...s, embeddingModel: e.target.value }))}
-              placeholder="openai/text-embedding-3-small"
+              placeholder={t("qdrantEmbeddingInputPlaceholder")}
               className="w-full px-3 py-2 rounded-lg bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
             />
-            <p className="text-xs text-text-muted mt-2">
-              Formato: provider/model. Precisa ter credencial desse provider configurada.
-            </p>
+            <p className="text-xs text-text-muted mt-2">{t("qdrantEmbeddingHint")}</p>
           </div>
 
           <div className="p-4 rounded-lg bg-surface/30 border border-border/30 md:col-span-2">
             <label className="text-sm font-medium block mb-2">
-              API Key (opcional){" "}
+              API Key ({t("optional")}){" "}
               {qdrant.hasApiKey && qdrant.apiKeyMasked ? (
                 <span className="text-xs text-text-muted font-mono">
-                  atual: {qdrant.apiKeyMasked}
+                  {t("current")}: {qdrant.apiKeyMasked}
                 </span>
               ) : null}
             </label>
@@ -577,7 +638,9 @@ export default function MemorySkillsTab() {
                 value={qdrantApiKeyInput}
                 onChange={(e) => setQdrantApiKeyInput(e.target.value)}
                 placeholder={
-                  qdrant.hasApiKey ? "(deixe vazio para manter)" : "(deixe vazio se nao usar)"
+                  qdrant.hasApiKey
+                    ? t("qdrantApiKeyPlaceholderKeep")
+                    : t("qdrantApiKeyPlaceholderOptional")
                 }
                 className="flex-1 px-3 py-2 rounded-lg bg-background border border-border text-sm font-mono focus:outline-none focus:ring-1 focus:ring-emerald-500"
               />
@@ -587,7 +650,7 @@ export default function MemorySkillsTab() {
                   disabled={qdrantSaving}
                   className="px-3 py-2 text-sm font-medium rounded-lg bg-white/5 border border-border/60 hover:bg-white/10 disabled:opacity-50 transition-colors"
                 >
-                  Remover
+                  {t("remove")}
                 </button>
               )}
               <button
@@ -599,37 +662,32 @@ export default function MemorySkillsTab() {
                 disabled={qdrantSaving}
                 className="px-4 py-2 text-sm font-medium rounded-lg bg-emerald-500 text-white hover:bg-emerald-600 disabled:opacity-50 transition-colors"
               >
-                {qdrantSaving ? "Salvando..." : "Salvar"}
+                {qdrantSaving ? t("saving") : t("save")}
               </button>
             </div>
-            <p className="text-xs text-text-muted mt-2">
-              Dica: edite host/porta/collection/modelo e clique em Salvar. A chave e opcional.
-            </p>
+            <p className="text-xs text-text-muted mt-2">{t("qdrantSaveHint")}</p>
           </div>
         </div>
 
-        {/* Test search */}
         <div className="mt-4 p-4 rounded-lg bg-surface/30 border border-border/30">
           <div className="flex items-center justify-between gap-2">
             <div>
-              <p className="text-sm font-medium">Teste de busca</p>
-              <p className="text-xs text-text-muted mt-0.5">
-                Gera embedding e faz search no Qdrant.
-              </p>
+              <p className="text-sm font-medium">{t("qdrantSearchTestTitle")}</p>
+              <p className="text-xs text-text-muted mt-0.5">{t("qdrantSearchTestDesc")}</p>
             </div>
             <button
               onClick={testQdrantSearch}
               disabled={qdrantSearching}
               className="px-4 py-2 text-sm font-medium rounded-lg bg-white/5 border border-border/60 hover:bg-white/10 disabled:opacity-50 transition-colors"
             >
-              {qdrantSearching ? "Buscando..." : "Buscar"}
+              {qdrantSearching ? t("searching") : t("search")}
             </button>
           </div>
           <div className="mt-3 flex gap-2">
             <input
               value={qdrantQuery}
               onChange={(e) => setQdrantQuery(e.target.value)}
-              placeholder="Ex: preferencias do usuario, historico, etc"
+              placeholder={t("qdrantSearchPlaceholder")}
               className="flex-1 px-3 py-2 rounded-lg bg-background border border-border text-sm focus:outline-none focus:ring-1 focus:ring-emerald-500"
             />
           </div>
@@ -651,20 +709,16 @@ export default function MemorySkillsTab() {
             </div>
           )}
           {qdrantResults.length === 0 && qdrantQuery.trim().length > 0 && !qdrantSearching && (
-            <p className="mt-3 text-xs text-text-muted">
-              Sem resultados (ou Qdrant desconfigurado).
-            </p>
+            <p className="mt-3 text-xs text-text-muted">{t("qdrantNoResults")}</p>
           )}
         </div>
 
-        {/* Retention cleanup */}
         <div className="mt-4 p-4 rounded-lg bg-surface/30 border border-border/30">
           <div className="flex items-center justify-between gap-2">
             <div>
-              <p className="text-sm font-medium">Retencao e limpeza</p>
+              <p className="text-sm font-medium">{t("qdrantCleanupTitle")}</p>
               <p className="text-xs text-text-muted mt-0.5">
-                Remove pontos expirados e antigos, baseado em {t("retentionDays")} (
-                {config.retentionDays} {t("days")}).
+                {t("qdrantCleanupDesc")} {t("retentionDays")} ({config.retentionDays} {t("days")}).
               </p>
             </div>
             <button
@@ -672,14 +726,14 @@ export default function MemorySkillsTab() {
               disabled={qdrantCleanupLoading}
               className="px-4 py-2 text-sm font-medium rounded-lg bg-white/5 border border-border/60 hover:bg-white/10 disabled:opacity-50 transition-colors"
             >
-              {qdrantCleanupLoading ? "Limpando..." : "Limpar agora"}
+              {qdrantCleanupLoading ? t("cleaning") : t("cleanNow")}
             </button>
           </div>
           {qdrantCleanupMsg && <p className="mt-2 text-xs text-text-muted">{qdrantCleanupMsg}</p>}
         </div>
       </Card>
 
-      {/* Skills Settings (placeholder) */}
+      {/* Skills Settings */}
       <Card data-testid="skills-settings-card">
         <div className="flex items-center gap-3 mb-5">
           <div className="p-2 rounded-lg bg-amber-500/10 text-amber-500">
@@ -726,7 +780,7 @@ export default function MemorySkillsTab() {
             </span>
           </div>
           <div>
-            <h3 className="text-lg font-semibold">SkillsMP Marketplace</h3>
+            <h3 className="text-lg font-semibold">{t("memorySkillsSkillsmpMarketplace")}</h3>
             <p className="text-sm text-text-muted">
               Connect to SkillsMP to discover and install skills from the marketplace.
             </p>
@@ -738,12 +792,14 @@ export default function MemorySkillsTab() {
             </span>
           )}
           {skillsmpStatus === "error" && (
-            <span className="ml-auto text-xs font-medium text-red-500">Failed to save</span>
+            <span className="ml-auto text-xs font-medium text-red-500">
+              {t("memorySkillsFailedToSave")}
+            </span>
           )}
         </div>
 
         <div className="p-4 rounded-lg bg-surface/30 border border-border/30">
-          <label className="text-sm font-medium block mb-2">API Key</label>
+          <label className="text-sm font-medium block mb-2">{t("memorySkillsApiKey")}</label>
           <div className="flex gap-2">
             <input
               type="password"
@@ -776,7 +832,7 @@ export default function MemorySkillsTab() {
             </span>
           </div>
           <div>
-            <h3 className="text-lg font-semibold">Active Skills Provider</h3>
+            <h3 className="text-lg font-semibold">{t("memorySkillsActiveSkillsProvider")}</h3>
             <p className="text-sm text-text-muted">
               Choose which provider the Skills page uses for search and install.
             </p>
@@ -788,7 +844,9 @@ export default function MemorySkillsTab() {
             </span>
           )}
           {skillsProviderStatus === "error" && (
-            <span className="ml-auto text-xs font-medium text-red-500">Failed to save</span>
+            <span className="ml-auto text-xs font-medium text-red-500">
+              {t("memorySkillsFailedToSave")}
+            </span>
           )}
         </div>
 

@@ -1,10 +1,17 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import PropTypes from "prop-types";
 import Modal from "./Modal";
 import Button from "./Button";
 import Input from "./Input";
+
+type KiroAuthModalProps = {
+  isOpen: boolean;
+  providerId?: string;
+  providerLabel?: string;
+  onMethodSelect: (method: string, config?: Record<string, unknown>) => void;
+  onClose: () => void;
+};
 
 /**
  * Kiro Auth Method Selection Modal
@@ -16,7 +23,7 @@ export default function KiroAuthModal({
   providerLabel = "Kiro",
   onMethodSelect,
   onClose,
-}) {
+}: KiroAuthModalProps) {
   const [selectedMethod, setSelectedMethod] = useState(null);
   const [idcStartUrl, setIdcStartUrl] = useState("");
   const [idcRegion, setIdcRegion] = useState("us-east-1");
@@ -138,26 +145,28 @@ export default function KiroAuthModal({
               </div>
             </button>
 
-            {/* AWS IAM Identity Center (IDC) - HIDDEN */}
+            {/* AWS IAM Identity Center (IDC) */}
             <button
               onClick={() => handleMethodSelect("idc")}
-              className="hidden w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
+              className="w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
             >
               <div className="flex items-start gap-3">
                 <span className="material-symbols-outlined text-primary mt-0.5">business</span>
                 <div className="flex-1">
-                  <h3 className="font-semibold mb-1">AWS IAM Identity Center</h3>
+                  <h3 className="font-semibold mb-1">
+                    Your Organization (AWS IAM Identity Center)
+                  </h3>
                   <p className="text-sm text-text-muted">
-                    For enterprise users with custom AWS IAM Identity Center.
+                    Use your company SSO start URL (example: https://your-org.awsapps.com/start).
                   </p>
                 </div>
               </div>
             </button>
 
-            {/* Google Social Login - HIDDEN */}
+            {/* Google Social Login */}
             <button
-              onClick={() => handleMethodSelect("social-google")}
-              className="hidden w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
+              onClick={() => handleSocialLogin("google")}
+              className="w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
             >
               <div className="flex items-start gap-3">
                 <span className="material-symbols-outlined text-primary mt-0.5">
@@ -165,25 +174,21 @@ export default function KiroAuthModal({
                 </span>
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">Google Account</h3>
-                  <p className="text-sm text-text-muted">
-                    Login with your Google account (manual callback).
-                  </p>
+                  <p className="text-sm text-text-muted">Login with your Google account.</p>
                 </div>
               </div>
             </button>
 
-            {/* GitHub Social Login - HIDDEN */}
+            {/* GitHub Social Login */}
             <button
-              onClick={() => handleMethodSelect("social-github")}
-              className="hidden w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
+              onClick={() => handleSocialLogin("github")}
+              className="w-full p-4 text-left border border-border rounded-lg hover:bg-sidebar transition-colors"
             >
               <div className="flex items-start gap-3">
                 <span className="material-symbols-outlined text-primary mt-0.5">code</span>
                 <div className="flex-1">
                   <h3 className="font-semibold mb-1">GitHub Account</h3>
-                  <p className="text-sm text-text-muted">
-                    Login with your GitHub account (manual callback).
-                  </p>
+                  <p className="text-sm text-text-muted">Login with your GitHub account.</p>
                 </div>
               </div>
             </button>
@@ -400,11 +405,3 @@ export default function KiroAuthModal({
     </Modal>
   );
 }
-
-KiroAuthModal.propTypes = {
-  isOpen: PropTypes.bool.isRequired,
-  providerId: PropTypes.string,
-  providerLabel: PropTypes.string,
-  onMethodSelect: PropTypes.func.isRequired,
-  onClose: PropTypes.func.isRequired,
-};

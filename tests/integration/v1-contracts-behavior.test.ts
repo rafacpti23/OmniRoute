@@ -8,7 +8,7 @@ test("contract: /api/v1 OPTIONS exposes CORS and allowed methods", async () => {
   const response = await OPTIONS();
 
   assert.equal(response.status, 200);
-  assert.ok(response.headers.has("Access-Control-Allow-Origin"));
+  assert.ok(response.headers.has("Access-Control-Allow-Methods"));
 });
 
 test("contract: /api/v1/embeddings OPTIONS exposes POST/GET/OPTIONS", async () => {
@@ -44,8 +44,8 @@ test("contract: /api/v1 and /api/v1/models return consistent model IDs", async (
   assert.ok(Array.isArray(v1Body.data));
   assert.ok(Array.isArray(v1ModelsBody.data));
 
-  const v1Ids = [...new Set(v1Body.data.map((item) => item.id))].sort();
-  const v1ModelsIds = [...new Set(v1ModelsBody.data.map((item) => item.id))].sort();
+  const v1Ids = [...new Set(v1Body.data.map((item: any) => item.id))].sort();
+  const v1ModelsIds = [...new Set(v1ModelsBody.data.map((item: any) => item.id))].sort();
 
   assert.deepEqual(v1Ids, v1ModelsIds);
 });
@@ -169,5 +169,8 @@ test("contract: /api/v1/messages/count_tokens computes token estimate from text 
 
   assert.equal(response.status, 200);
   const body = (await response.json()) as any;
-  assert.equal(body.input_tokens, 3);
+  // Real tiktoken count (countTextTokens): "abcd" => 1, "12345678" => 3 (digits split).
+  // The previous expectation (3) was the old ceil(chars/4) heuristic, replaced by the
+  // tiktoken-based estimator; the accurate total for this payload is 4.
+  assert.equal(body.input_tokens, 4);
 });

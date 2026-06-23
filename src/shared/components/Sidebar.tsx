@@ -1,9 +1,8 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import PropTypes from "prop-types";
+import { useState, useEffect, useRef, useCallback } from "react";
 import Link from "next/link";
-import { usePathname, useSearchParams } from "next/navigation";
+import { usePathname } from "next/navigation";
 import { cn } from "@/shared/utils/cn";
 import { getActiveSidebarHref } from "@/shared/utils/sidebarRouteMatch";
 import { APP_CONFIG } from "@/shared/constants/appConfig";
@@ -13,29 +12,65 @@ import { ConfirmModal } from "./Modal";
 import CloudSyncStatus from "./CloudSyncStatus";
 import { useTranslations } from "next-intl";
 import {
+  HIDDEN_SIDEBAR_GROUP_LABELS_SETTING_KEY,
+  normalizeHiddenSidebarGroupLabels,
+} from "@/shared/constants/sidebarGroupVisibility";
+import {
   HIDDEN_SIDEBAR_ITEMS_SETTING_KEY,
   SIDEBAR_SETTINGS_UPDATED_EVENT,
+  SIDEBAR_SECTION_ORDER_KEY,
+  SIDEBAR_ITEM_ORDER_KEY,
   SIDEBAR_SECTIONS,
   normalizeHiddenSidebarItems,
+  applySectionOrder,
+  applyItemOrder,
+  type SidebarSectionId,
+  type SidebarItemDefinition,
+  type SidebarItemGroup,
+  type SidebarItemOrder,
 } from "@/shared/constants/sidebarVisibility";
 
 const isE2EMode = process.env.NEXT_PUBLIC_OMNIROUTE_E2E_MODE === "1";
+const DEFAULT_EXPANDED: SidebarSectionId = "omni-proxy";
+const EXPANDED_SECTIONS_KEY = "sidebar-expanded-sections";
+const PINNED_SECTIONS_KEY = "sidebar-pinned-sections";
+
+type SidebarProps = {
+  onClose?: () => void;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+  isMacElectron?: boolean;
+};
+
+type HoveredItem = { id: string; label: string; x: number; y: number } | null;
+
+function loadFromStorage<T>(key: string, fallback: T): T {
+  try {
+    const stored = localStorage.getItem(key);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (Array.isArray(parsed)) return parsed as T;
+    }
+  } catch {}
+  return fallback;
+}
+
+function saveToStorage(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {}
+}
 
 export default function Sidebar({
   onClose,
   collapsed = false,
   onToggleCollapse,
   isMacElectron = false,
-}: {
-  onClose?: any;
-  collapsed?: boolean;
-  onToggleCollapse?: any;
-  isMacElectron?: boolean;
-}) {
+}: SidebarProps) {
   const pathname = usePathname();
-  const searchParams = useSearchParams();
   const t = useTranslations("sidebar");
   const tc = useTranslations("common");
+  const sidebarRef = useRef<HTMLElement>(null);
   const [showShutdownModal, setShowShutdownModal] = useState(false);
   const [showRestartModal, setShowRestartModal] = useState(false);
   const [isShuttingDown, setIsShuttingDown] = useState(false);
@@ -43,40 +78,93 @@ export default function Sidebar({
   const [isDisconnected, setIsDisconnected] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
   const [hiddenSidebarItems, setHiddenSidebarItems] = useState<string[]>([]);
+  const [hiddenSidebarGroupLabels, setHiddenSidebarGroupLabels] = useState<string[]>([]);
+  const [sidebarSectionOrder, setSidebarSectionOrder] = useState<SidebarSectionId[]>([]);
+  const [sidebarItemOrder, setSidebarItemOrder] = useState<SidebarItemOrder>({});
   const [customAppName, setCustomAppName] = useState<string | null>(null);
   const [customLogo, setCustomLogo] = useState<string | null>(null);
-  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const [expandedSections, setExpandedSections] = useState<Set<SidebarSectionId>>(
+    new Set([DEFAULT_EXPANDED])
+  );
+  const [pinnedSections, setPinnedSections] = useState<Set<SidebarSectionId>>(new Set());
+  const [hoveredItem, setHoveredItem] = useState<HoveredItem>(null);
+
+  // Load persisted state on mount; OmniProxy is pinned by default on first visit
+  useEffect(() => {
+    const storedExpanded = loadFromStorage<SidebarSectionId[]>(EXPANDED_SECTIONS_KEY, [
+      DEFAULT_EXPANDED,
+    ]);
+    const pinnedRaw = (() => {
+      try {
+        return localStorage.getItem(PINNED_SECTIONS_KEY);
+      } catch {
+        return null;
+      }
+    })();
+    const storedPinned: SidebarSectionId[] =
+      pinnedRaw !== null
+        ? (JSON.parse(pinnedRaw) as SidebarSectionId[])
+        : (SIDEBAR_SECTIONS.filter((s) => s.defaultPinned).map((s) => s.id) as SidebarSectionId[]);
+
+    const initialExpanded = new Set<SidebarSectionId>(
+      storedExpanded.length > 0 ? storedExpanded : [DEFAULT_EXPANDED]
+    );
+    const initialPinned = new Set<SidebarSectionId>(storedPinned);
+    // Pinned sections must also be expanded
+    for (const id of initialPinned) initialExpanded.add(id);
+
+    setExpandedSections(initialExpanded);
+    setPinnedSections(initialPinned);
+  }, []);
 
   useEffect(() => {
     const applySettings = (data) => {
       setShowDebug(data?.debugMode === true);
       setHiddenSidebarItems(normalizeHiddenSidebarItems(data?.[HIDDEN_SIDEBAR_ITEMS_SETTING_KEY]));
+      setHiddenSidebarGroupLabels(
+        normalizeHiddenSidebarGroupLabels(data?.[HIDDEN_SIDEBAR_GROUP_LABELS_SETTING_KEY])
+      );
       setCustomAppName(data?.instanceName || null);
       setCustomLogo(data?.customLogoBase64 || data?.customLogoUrl || null);
     };
 
     fetch("/api/settings")
       .then((res) => res.json())
-      .then((data) => applySettings(data))
+      .then((data) => {
+        applySettings(data);
+        if (Array.isArray(data?.[SIDEBAR_SECTION_ORDER_KEY])) {
+          setSidebarSectionOrder(data[SIDEBAR_SECTION_ORDER_KEY] as SidebarSectionId[]);
+        }
+        if (data?.[SIDEBAR_ITEM_ORDER_KEY] && typeof data[SIDEBAR_ITEM_ORDER_KEY] === "object") {
+          setSidebarItemOrder(data[SIDEBAR_ITEM_ORDER_KEY] as SidebarItemOrder);
+        }
+      })
       .catch(() => {});
 
     const handleSettingsUpdated = (event: Event) => {
       const detail = (event as CustomEvent<Record<string, unknown>>).detail || {};
-
-      if ("debugMode" in detail) {
-        setShowDebug(detail.debugMode === true);
-      }
-
+      if ("debugMode" in detail) setShowDebug(detail.debugMode === true);
       if (HIDDEN_SIDEBAR_ITEMS_SETTING_KEY in detail) {
         setHiddenSidebarItems(
           normalizeHiddenSidebarItems(detail[HIDDEN_SIDEBAR_ITEMS_SETTING_KEY])
         );
       }
-
-      if ("instanceName" in detail) {
-        setCustomAppName((detail.instanceName as string) || null);
+      if (HIDDEN_SIDEBAR_GROUP_LABELS_SETTING_KEY in detail) {
+        setHiddenSidebarGroupLabels(
+          normalizeHiddenSidebarGroupLabels(detail[HIDDEN_SIDEBAR_GROUP_LABELS_SETTING_KEY])
+        );
       }
-
+      if (SIDEBAR_SECTION_ORDER_KEY in detail && Array.isArray(detail[SIDEBAR_SECTION_ORDER_KEY])) {
+        setSidebarSectionOrder(detail[SIDEBAR_SECTION_ORDER_KEY] as SidebarSectionId[]);
+      }
+      if (
+        SIDEBAR_ITEM_ORDER_KEY in detail &&
+        detail[SIDEBAR_ITEM_ORDER_KEY] &&
+        typeof detail[SIDEBAR_ITEM_ORDER_KEY] === "object"
+      ) {
+        setSidebarItemOrder(detail[SIDEBAR_ITEM_ORDER_KEY] as SidebarItemOrder);
+      }
+      if ("instanceName" in detail) setCustomAppName((detail.instanceName as string) || null);
       if ("customLogoBase64" in detail) {
         setCustomLogo((detail.customLogoBase64 as string) || null);
       } else if ("customLogoUrl" in detail) {
@@ -85,13 +173,151 @@ export default function Sidebar({
     };
 
     window.addEventListener(SIDEBAR_SETTINGS_UPDATED_EVENT, handleSettingsUpdated as EventListener);
-
-    return () => {
+    return () =>
       window.removeEventListener(
         SIDEBAR_SETTINGS_UPDATED_EVENT,
         handleSettingsUpdated as EventListener
       );
+  }, []);
+
+  const getSidebarLabel = (key: string, fallback: string) =>
+    typeof t.has === "function" && t.has(key) ? t(key) : fallback;
+
+  const resolveItem = (item: SidebarItemDefinition, hidden: Set<string>) => {
+    if (hidden.has(item.id)) return null;
+    const subtitle = item.subtitleKey
+      ? getSidebarLabel(item.subtitleKey, item.subtitleFallback ?? "")
+      : item.subtitleFallback;
+    return {
+      ...item,
+      label: getSidebarLabel(item.i18nKey, item.labelFallback ?? item.id),
+      subtitle: subtitle || undefined,
     };
+  };
+
+  const hiddenSidebarSet = new Set(hiddenSidebarItems);
+  const hiddenSidebarGroupLabelsSet = new Set(hiddenSidebarGroupLabels);
+
+  const orderedSections = applySectionOrder(
+    SIDEBAR_SECTIONS.filter((section) => section.visibility !== "debug" || showDebug),
+    sidebarSectionOrder
+  );
+
+  const visibleSections = orderedSections
+    .map((section) => {
+      const orderedChildren = applyItemOrder(
+        section.children,
+        sidebarItemOrder[section.id as SidebarSectionId] ?? []
+      );
+
+      const children = orderedChildren
+        .map((child) => {
+          if ("type" in child && child.type === "group") {
+            const items = child.items
+              .map((item) => resolveItem(item, hiddenSidebarSet))
+              .filter(Boolean) as (SidebarItemDefinition & { label: string })[];
+            if (items.length === 0) return null;
+            // Smart-grouping: single visible item → inline flat (no group header)
+            if (items.length === 1) return items[0];
+            return {
+              ...child,
+              title: getSidebarLabel(child.titleKey, child.titleFallback),
+              separatorHidden: hiddenSidebarGroupLabelsSet.has(child.id),
+              items,
+            } as SidebarItemGroup & {
+              title: string;
+              separatorHidden: boolean;
+              items: (SidebarItemDefinition & { label: string })[];
+            };
+          }
+          return resolveItem(child as SidebarItemDefinition, hiddenSidebarSet);
+        })
+        .filter(Boolean);
+
+      return {
+        ...section,
+        title: getSidebarLabel(section.titleKey, section.titleFallback),
+        children,
+      };
+    })
+    .filter((section) => {
+      const allItems = section.children.flatMap((child: any) =>
+        child.type === "group" ? child.items : [child]
+      );
+      return allItems.length > 0;
+    });
+
+  const allVisibleItems = visibleSections.flatMap((section) =>
+    section.children.flatMap((child: any) => (child.type === "group" ? child.items : [child]))
+  );
+
+  const activeHref = getActiveSidebarHref(pathname, allVisibleItems);
+
+  // Auto-expand the section containing the active page (without closing others)
+  useEffect(() => {
+    if (collapsed) return;
+    for (const section of visibleSections) {
+      const sectionItems = section.children.flatMap((child: any) =>
+        child.type === "group" ? child.items : [child]
+      );
+      if (sectionItems.some((item: any) => !item.external && item.href === activeHref)) {
+        setExpandedSections((prev) => {
+          if (prev.has(section.id as SidebarSectionId)) return prev;
+          const next = new Set(prev);
+          next.add(section.id as SidebarSectionId);
+          saveToStorage(EXPANDED_SECTIONS_KEY, [...next]);
+          return next;
+        });
+        break;
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeHref, collapsed]);
+
+  // Accordion toggle: opening a section closes all non-pinned sections
+  const toggleSection = useCallback(
+    (sectionId: SidebarSectionId) => {
+      setExpandedSections((prev) => {
+        const isOpen = prev.has(sectionId);
+        let next: Set<SidebarSectionId>;
+        if (isOpen) {
+          // Close this section
+          next = new Set(prev);
+          next.delete(sectionId);
+        } else {
+          // Accordion: keep only pinned sections + the new one
+          next = new Set<SidebarSectionId>();
+          for (const id of pinnedSections) {
+            next.add(id);
+          }
+          next.add(sectionId);
+        }
+        saveToStorage(EXPANDED_SECTIONS_KEY, [...next]);
+        return next;
+      });
+    },
+    [pinnedSections]
+  );
+
+  const togglePin = useCallback((sectionId: SidebarSectionId) => {
+    setPinnedSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(sectionId)) {
+        next.delete(sectionId);
+      } else {
+        next.add(sectionId);
+        // Ensure the section is expanded when pinned
+        setExpandedSections((prevExp) => {
+          if (prevExp.has(sectionId)) return prevExp;
+          const nextExp = new Set(prevExp);
+          nextExp.add(sectionId);
+          saveToStorage(EXPANDED_SECTIONS_KEY, [...nextExp]);
+          return nextExp;
+        });
+      }
+      saveToStorage(PINNED_SECTIONS_KEY, [...next]);
+      return next;
+    });
   }, []);
 
   const handleShutdown = async () => {
@@ -99,7 +325,7 @@ export default function Sidebar({
     try {
       await fetch("/api/shutdown", { method: "POST" });
     } catch (e) {
-      // Expected to fail as server shuts down; ignore error
+      // Expected to fail as server shuts down
     }
     setIsShuttingDown(false);
     setShowShutdownModal(false);
@@ -116,113 +342,56 @@ export default function Sidebar({
     setIsRestarting(false);
     setShowRestartModal(false);
     setIsDisconnected(true);
-    setTimeout(() => {
-      globalThis.location.reload();
-    }, 3000);
+    setTimeout(() => globalThis.location.reload(), 3000);
   };
 
-  const getSidebarLabel = (key: string, fallback: string) =>
-    typeof t.has === "function" && t.has(key) ? t(key) : fallback;
-
-  const hiddenSidebarSet = new Set(hiddenSidebarItems);
-  const visibleSections = SIDEBAR_SECTIONS.filter(
-    (section) => section.visibility !== "debug" || showDebug
-  )
-    .map((section) => ({
-      ...section,
-      title: getSidebarLabel(section.titleKey, section.titleFallback),
-      items: section.items
-        .map((item) => ({ ...item, label: t(item.i18nKey) }))
-        .filter((item) => !hiddenSidebarSet.has(item.id)),
-    }))
-    .filter((section) => section.items.length > 0);
-  const activeHref = getActiveSidebarHref(
-    pathname,
-    visibleSections.flatMap((section) =>
-      section.items.flatMap((item) => [item, ...(item.children || [])])
-    )
+  const handleMouseEnter = useCallback(
+    (e: React.MouseEvent<HTMLElement>, id: string, label: string) => {
+      if (!collapsed) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const sidebarRect = sidebarRef.current?.getBoundingClientRect();
+      setHoveredItem({
+        id,
+        label,
+        x: (sidebarRect?.right ?? 64) + 8,
+        y: rect.top + rect.height / 2,
+      });
+    },
+    [collapsed]
   );
-  const currentTab = searchParams.get("tab") || "users";
+
+  const handleMouseLeave = useCallback(() => setHoveredItem(null), []);
 
   const renderNavLink = (item) => {
-    const hasChildren = Array.isArray(item.children) && item.children.length > 0;
-    const active =
-      !item.external &&
-      (activeHref === item.href || item.children?.some((child) => activeHref === child.href));
-    const expanded = expandedGroups[item.id] ?? active;
+    const active = !item.external && activeHref === item.href;
     const className = cn(
-      "sidebar-link",
       "flex items-center gap-3 rounded-lg transition-all group",
-      collapsed ? "justify-center px-2 py-2.5" : "px-4 py-2",
-      active && "is-active",
+      collapsed ? "justify-center px-2 py-2.5" : "px-3 py-1.5",
       active
         ? "bg-primary/10 text-primary"
         : "text-text-muted hover:bg-surface/50 hover:text-text-main"
     );
     const iconClassName = cn(
-      "material-symbols-outlined text-[18px]",
+      "material-symbols-outlined text-[18px] shrink-0",
       active ? "fill-1" : "group-hover:text-primary transition-colors"
     );
     const content = (
       <>
         <span className={iconClassName}>{item.icon}</span>
-        {!collapsed && <span className="text-sm font-medium flex-1">{item.label}</span>}
-        {!collapsed && hasChildren && (
-          <span
-            className={cn(
-              "material-symbols-outlined text-[18px] transition-transform",
-              expanded && "rotate-90"
+        {!collapsed && (
+          <div className="flex min-w-0 flex-col">
+            <span className="truncate text-sm font-medium">{item.label}</span>
+            {item.subtitle && (
+              <span className="truncate text-[10px] text-text-muted/60">{item.subtitle}</span>
             )}
-            aria-hidden="true"
-          >
-            chevron_right
-          </span>
+          </div>
         )}
       </>
     );
-
-    if (hasChildren && !collapsed) {
-      return (
-        <div key={item.id}>
-          <button
-            type="button"
-            onClick={() => setExpandedGroups((state) => ({ ...state, [item.id]: !expanded }))}
-            title={collapsed ? item.label : undefined}
-            className={cn(className, "w-full text-left")}
-            aria-expanded={expanded}
-          >
-            {content}
-          </button>
-          {expanded && (
-            <div className="mt-1 space-y-1 pl-8">
-              {item.children.map((child) => {
-                const childUrl = new URL(child.href, "http://localhost");
-                const childTab = childUrl.searchParams.get("tab");
-                const childActive = pathname === childUrl.pathname && childTab === currentTab;
-                return (
-                  <Link
-                    key={child.id}
-                    href={child.href}
-                    onClick={onClose}
-                    className={cn(
-                      "flex items-center gap-2 rounded-md px-3 py-1.5 text-sm transition-all",
-                      childActive
-                        ? "bg-primary/10 text-primary"
-                        : "text-text-muted hover:bg-surface/50 hover:text-text-main"
-                    )}
-                  >
-                    {child.icon && (
-                      <span className="material-symbols-outlined text-[15px]">{child.icon}</span>
-                    )}
-                    <span>{t(child.i18nKey)}</span>
-                  </Link>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      );
-    }
+    const sharedProps = {
+      onMouseEnter: (e: React.MouseEvent<HTMLElement>) => handleMouseEnter(e, item.id, item.label),
+      onMouseLeave: handleMouseLeave,
+    };
 
     if (item.external) {
       return (
@@ -232,8 +401,8 @@ export default function Sidebar({
           target="_blank"
           rel="noopener noreferrer"
           onClick={onClose}
-          title={collapsed ? item.label : undefined}
           className={className}
+          {...sharedProps}
         >
           {content}
         </a>
@@ -245,8 +414,8 @@ export default function Sidebar({
         key={item.href}
         href={item.href}
         onClick={onClose}
-        title={collapsed ? item.label : undefined}
         className={className}
+        {...sharedProps}
       >
         {content}
       </Link>
@@ -256,27 +425,26 @@ export default function Sidebar({
   return (
     <>
       <aside
+        ref={sidebarRef}
         className={cn(
-          "sidebar-root",
           "flex h-full min-h-0 flex-col border-r border-black/5 bg-sidebar transition-all duration-300 ease-in-out dark:border-white/5",
-          collapsed ? "w-16" : "w-80"
+          collapsed ? "w-16" : "w-[220px]"
         )}
-        style={{
-          paddingTop: isMacElectron ? "var(--desktop-safe-top)" : undefined,
-        }}
+        style={{ paddingTop: isMacElectron ? "var(--desktop-safe-top)" : undefined }}
       >
         <a
           href="#main-content"
           className="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:p-3 focus:bg-primary focus:text-white focus:rounded-md focus:m-2"
         >
-          Skip to content
+          {t("skipToContent")}
         </a>
+
         {(onToggleCollapse || !isMacElectron) && (
           <div
             className={cn(
               "flex items-center gap-2 pb-2",
               isMacElectron ? "pt-3" : "pt-5",
-              collapsed ? "px-3 justify-center" : "px-6"
+              collapsed ? "px-3 justify-center" : "px-4"
             )}
             aria-hidden="true"
           >
@@ -291,13 +459,13 @@ export default function Sidebar({
             {onToggleCollapse && (
               <button
                 onClick={onToggleCollapse}
-                title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+                title={collapsed ? t("expandSidebar") : t("collapseSidebar")}
                 aria-expanded={!collapsed}
-                aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+                aria-label={collapsed ? t("expandSidebar") : t("collapseSidebar")}
                 className={cn(
                   "rounded-md p-1 text-text-muted/50 transition-colors hover:bg-black/5 hover:text-text-muted dark:hover:bg-white/5",
                   collapsed && !isMacElectron && "mt-2",
-                  isMacElectron && "ml-auto"
+                  isMacElectron && "ms-auto"
                 )}
               >
                 <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
@@ -308,12 +476,12 @@ export default function Sidebar({
           </div>
         )}
 
-        <div className={cn("sidebar-brand py-4", collapsed ? "px-2" : "px-6")}>
+        <div className={cn("py-3", collapsed ? "px-2" : "px-4")}>
           <Link
-            href="/dashboard"
-            className={cn("flex items-center", collapsed ? "justify-center" : "gap-3")}
+            href="/home"
+            className={cn("flex items-center", collapsed ? "justify-center" : "gap-2.5")}
           >
-            <div className="flex items-center justify-center size-9 rounded bg-linear-to-br from-[#E54D5E] to-[#C93D4E] shrink-0">
+            <div className="flex items-center justify-center size-8 rounded bg-linear-to-br from-[#E54D5E] to-[#C93D4E] shrink-0">
               {customLogo ? (
                 <img
                   src={customLogo}
@@ -321,15 +489,15 @@ export default function Sidebar({
                   className="size-5 object-contain"
                 />
               ) : (
-                <OmniRouteLogo size={20} className="text-white" />
+                <OmniRouteLogo size={18} className="text-white" />
               )}
             </div>
             {!collapsed && (
-              <div className="flex flex-col">
-                <h1 className="text-lg font-semibold tracking-tight text-text-main">
+              <div className="flex flex-col min-w-0">
+                <h1 className="text-sm font-semibold tracking-tight text-text-main truncate">
                   {customAppName || APP_CONFIG.name}
                 </h1>
-                <span className="text-xs text-text-muted">v{APP_CONFIG.version}</span>
+                <span className="text-[10px] text-text-muted">v{APP_CONFIG.version}</span>
               </div>
             )}
           </Link>
@@ -338,24 +506,112 @@ export default function Sidebar({
         <nav
           aria-label="Main navigation"
           className={cn(
-            "min-h-0 flex-1 space-y-1 overflow-y-auto py-2 custom-scrollbar",
-            collapsed ? "px-2" : "px-4"
+            "min-h-0 flex-1 overflow-y-auto py-1 custom-scrollbar",
+            collapsed ? "px-2 space-y-0.5" : "px-3"
           )}
         >
-          {visibleSections.map((section) => {
-            const showTitle = section.showTitleInSidebar !== false;
+          {visibleSections.map((section, idx) => {
+            const sectionId = section.id as SidebarSectionId;
+            const isExpanded = expandedSections.has(sectionId);
+            const isPinned = pinnedSections.has(sectionId);
+            const isFirst = idx === 0;
+            const sectionItems = section.children.flatMap((child: any) =>
+              child.type === "group" ? child.items : [child]
+            );
 
+            // Collapsed (mini) mode: flat items with dividers between sections
+            if (collapsed) {
+              return (
+                <div key={section.id}>
+                  {!isFirst && (
+                    <div className="border-t border-black/5 dark:border-white/5 my-1.5" />
+                  )}
+                  {sectionItems.map(renderNavLink)}
+                </div>
+              );
+            }
+
+            // Sections without a visible title (e.g. Home) render items directly
+            if (section.showTitle === false) {
+              return (
+                <div key={section.id} className={cn("space-y-0.5", !isFirst && "mt-1")}>
+                  {sectionItems.map(renderNavLink)}
+                </div>
+              );
+            }
+
+            // Expanded mode: collapsible section with pin
             return (
-              <div key={section.id} className={showTitle ? "pt-4 mt-2" : undefined}>
-                {!collapsed && showTitle && (
-                  <p className="sidebar-section-title px-4 text-xs font-semibold text-text-muted/60 uppercase tracking-wider mb-2">
+              <div key={section.id} className={isFirst ? "space-y-0.5" : "mt-2"}>
+                <div
+                  className="flex items-center gap-0.5 px-2 py-1 rounded-md hover:bg-surface/30 transition-colors cursor-pointer group/header"
+                  onClick={() => toggleSection(sectionId)}
+                  role="button"
+                  aria-expanded={isExpanded}
+                >
+                  <span className="flex-1 text-[10px] font-semibold text-text-muted/60 uppercase tracking-wider group-hover/header:text-text-muted/90 transition-colors">
                     {section.title}
-                  </p>
+                  </span>
+
+                  {/* Pin button — right side near chevron */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      togglePin(sectionId);
+                    }}
+                    title={isPinned ? t("unpinSection") : t("pinSectionOpen")}
+                    className={cn(
+                      "p-0.5 rounded transition-all shrink-0",
+                      isPinned
+                        ? "text-primary opacity-100"
+                        : "text-text-muted/30 opacity-0 group-hover/header:opacity-100 hover:text-text-muted/70"
+                    )}
+                  >
+                    <span
+                      className="material-symbols-outlined"
+                      style={{
+                        fontSize: "10px",
+                        ...(isPinned ? { fontVariationSettings: "'FILL' 1" } : {}),
+                      }}
+                    >
+                      push_pin
+                    </span>
+                  </button>
+
+                  <span
+                    className={cn(
+                      "material-symbols-outlined text-[14px] text-text-muted/40 transition-all duration-200 group-hover/header:text-text-muted/70 shrink-0",
+                      isExpanded && "rotate-180"
+                    )}
+                  >
+                    expand_more
+                  </span>
+                </div>
+
+                {isExpanded && (
+                  <div className="mt-0.5 space-y-0.5">
+                    {section.children.map((child: any) => {
+                      if (child.type === "group") {
+                        if (child.items.length === 0) return null;
+                        const separatorHidden = child.separatorHidden === true;
+                        return (
+                          <div key={child.id} className={separatorHidden ? "mt-0.5" : "mt-2"}>
+                            {!separatorHidden && (
+                              <div className="flex items-center gap-1.5 px-2 py-0.5 mb-0.5">
+                                <div className="h-px flex-1 bg-black/8 dark:bg-white/8" />
+                                <span className="text-[8px] font-semibold text-text-muted/40 uppercase tracking-widest">
+                                  {child.title}
+                                </span>
+                              </div>
+                            )}
+                            {child.items.map(renderNavLink)}
+                          </div>
+                        );
+                      }
+                      return renderNavLink(child);
+                    })}
+                  </div>
                 )}
-                {collapsed && showTitle && (
-                  <div className="border-t border-black/5 dark:border-white/5 mb-2" />
-                )}
-                {section.items.map(renderNavLink)}
               </div>
             );
           })}
@@ -366,10 +622,10 @@ export default function Sidebar({
         <div
           className={cn(
             "shrink-0 border-t border-black/5 dark:border-white/5",
-            collapsed ? "p-2 flex flex-col gap-1" : "p-3 flex gap-2"
+            collapsed ? "p-2 flex flex-col gap-1" : "p-2 flex gap-2"
           )}
           style={{
-            paddingBottom: isMacElectron ? "calc(0.75rem + var(--desktop-safe-bottom))" : undefined,
+            paddingBottom: isMacElectron ? "calc(0.5rem + var(--desktop-safe-bottom))" : undefined,
           }}
         >
           <button
@@ -378,11 +634,11 @@ export default function Sidebar({
             className={cn(
               "flex items-center justify-center gap-2 rounded-lg font-medium transition-all",
               "text-amber-500 hover:bg-amber-500/10 border border-amber-500/20 hover:border-amber-500/40",
-              collapsed ? "p-2" : "flex-1 min-w-0 px-3 py-2 text-xs"
+              collapsed ? "p-2" : "flex-1 min-w-0 px-2 py-1.5 text-xs"
             )}
           >
-            <span className="material-symbols-outlined text-[18px]">restart_alt</span>
-            {!collapsed && t("restart")}
+            <span className="material-symbols-outlined text-[16px]">restart_alt</span>
+            {!collapsed && <span className="truncate">{t("restart")}</span>}
           </button>
           <button
             onClick={() => setShowShutdownModal(true)}
@@ -390,14 +646,27 @@ export default function Sidebar({
             className={cn(
               "flex items-center justify-center gap-2 rounded-lg font-medium transition-all",
               "text-red-500 hover:bg-red-500/10 border border-red-500/20 hover:border-red-500/40",
-              collapsed ? "p-2" : "flex-1 min-w-0 px-3 py-2 text-xs"
+              collapsed ? "p-2" : "flex-1 min-w-0 px-2 py-1.5 text-xs"
             )}
           >
-            <span className="material-symbols-outlined text-[18px]">power_settings_new</span>
-            {!collapsed && t("shutdown")}
+            <span className="material-symbols-outlined text-[16px]">power_settings_new</span>
+            {!collapsed && <span className="truncate">{t("shutdown")}</span>}
           </button>
         </div>
       </aside>
+
+      {/* Styled tooltip for collapsed (mini) sidebar */}
+      {collapsed && hoveredItem && (
+        <div
+          className="fixed z-[200] pointer-events-none flex items-center"
+          style={{ left: hoveredItem.x, top: hoveredItem.y, transform: "translateY(-50%)" }}
+        >
+          <div className="w-0 h-0 border-t-[5px] border-b-[5px] border-r-[6px] border-t-transparent border-b-transparent border-r-sidebar dark:border-r-sidebar" />
+          <div className="px-2.5 py-1.5 bg-sidebar text-text-main text-xs font-medium rounded-md shadow-lg border border-black/10 dark:border-white/10 whitespace-nowrap">
+            {hoveredItem.label}
+          </div>
+        </div>
+      )}
 
       <ConfirmModal
         isOpen={showShutdownModal}
@@ -429,12 +698,10 @@ export default function Sidebar({
             <div className="flex items-center justify-center size-16 rounded-full bg-red-500/20 text-red-500 mx-auto mb-4">
               <span className="material-symbols-outlined text-[32px]">power_off</span>
             </div>
-            <h2 className="text-xl font-semibold text-white mb-2">Server Disconnected</h2>
-            <p className="text-text-muted mb-6">
-              The proxy server has been stopped or is restarting.
-            </p>
+            <h2 className="text-xl font-semibold text-white mb-2">{t("serverDisconnected")}</h2>
+            <p className="text-text-muted mb-6">{t("serverDisconnectedMsg")}</p>
             <Button variant="secondary" onClick={() => globalThis.location.reload()}>
-              Reload Page
+              {t("reloadPage")}
             </Button>
           </div>
         </div>
@@ -442,10 +709,3 @@ export default function Sidebar({
     </>
   );
 }
-
-Sidebar.propTypes = {
-  onClose: PropTypes.func,
-  collapsed: PropTypes.bool,
-  onToggleCollapse: PropTypes.func,
-  isMacElectron: PropTypes.bool,
-};

@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useMemo, useEffect } from "react";
-import PropTypes from "prop-types";
 import { useTranslations } from "next-intl";
 import Modal from "./Modal";
 import { getModelsByProviderId, PROVIDER_ID_TO_ALIAS } from "@/shared/constants/models";
@@ -9,26 +8,60 @@ import { getCompatibleFallbackModels } from "@/lib/providers/managedAvailableMod
 import {
   getModelCatalogSourceLabel,
   matchesModelCatalogQuery,
+  normalizeModelCatalogSource,
 } from "@/shared/utils/modelCatalogSearch";
 import {
   OAUTH_PROVIDERS,
-  FREE_PROVIDERS,
+  NOAUTH_PROVIDERS,
   APIKEY_PROVIDERS,
   isOpenAICompatibleProvider,
   isAnthropicCompatibleProvider,
 } from "@/shared/constants/providers";
 
-// Provider order: OAuth first, then Free, then API Key (matches dashboard/providers)
+// Provider order: OAuth first, then no-auth, then API Key (matches dashboard/providers)
 const PROVIDER_ORDER = [
   ...Object.keys(OAUTH_PROVIDERS),
-  ...Object.keys(FREE_PROVIDERS),
+  ...Object.keys(NOAUTH_PROVIDERS),
   ...Object.keys(APIKEY_PROVIDERS),
 ];
+
+type ModelSelectModalProps = {
+  isOpen: boolean;
+  onClose: () => void;
+  onSelect: (model: unknown) => void;
+  /**
+   * Optional toggle callback — when set, clicking a model already in
+   * `addedModelValues` invokes this instead of `onSelect`, so the modal acts
+   * as an in-place add/remove toggle. Ported from upstream PR
+   * decolua/9router#889 (Fajar Hidayat).
+   */
+  onDeselect?: (model: unknown) => void;
+  selectedModel?: string;
+  selectedModels?: string[];
+  activeProviders?: Array<{ provider: string }>;
+  title?: string;
+  modelAliases?: Record<string, string>;
+  addedModelValues?: string[];
+  multiSelect?: boolean;
+  showCombos?: boolean;
+  alwaysIncludeProviders?: string[] | null;
+  /**
+   * When true, picking a model does NOT auto-close the modal — the caller must close
+   * explicitly. A "Done" button is rendered in the modal footer so the user has a clear
+   * way to confirm they are finished adding entries. Useful in combo creation, where the
+   * user typically adds several models in a row. Mutually exclusive with `multiSelect`
+   * (which renders its own Clear + Done footer driven by `selectedModels`).
+   * Inspired by upstream PR decolua/9router#1031. Combined with `onDeselect`, this also
+   * enables the toggle-style deselection from upstream PR decolua/9router#889.
+   */
+  keepOpenOnSelect?: boolean;
+};
 
 export default function ModelSelectModal({
   isOpen,
   onClose,
   onSelect,
+  onDeselect,
   selectedModel,
   selectedModels = [],
   activeProviders = [],
@@ -37,7 +70,9 @@ export default function ModelSelectModal({
   addedModelValues = [],
   multiSelect = false,
   showCombos = true,
-}) {
+  alwaysIncludeProviders = [],
+  keepOpenOnSelect = false,
+}: ModelSelectModalProps) {
   const t = useTranslations("common");
   const resolvedTitle = title ?? t("selectModel");
   const [searchQuery, setSearchQuery] = useState("");
@@ -94,9 +129,14 @@ export default function ModelSelectModal({
   }, [isOpen]);
 
   const allProviders = useMemo(
-    () => ({ ...OAUTH_PROVIDERS, ...FREE_PROVIDERS, ...APIKEY_PROVIDERS }),
+    () => ({ ...OAUTH_PROVIDERS, ...NOAUTH_PROVIDERS, ...APIKEY_PROVIDERS }),
     []
   );
+  const alwaysIncludeProvidersKey = Array.isArray(alwaysIncludeProviders)
+    ? alwaysIncludeProviders
+        .filter((providerId) => typeof providerId === "string" && providerId)
+        .join("\0")
+    : "";
 
   // Group models by provider with priority order
   const groupedModels = useMemo(() => {
@@ -104,10 +144,14 @@ export default function ModelSelectModal({
 
     // Get all active provider IDs from connections
     const activeConnectionIds = activeProviders.map((p) => p.provider);
+    const explicitProviderIds = alwaysIncludeProvidersKey
+      ? alwaysIncludeProvidersKey.split("\0")
+      : [];
 
     // Only show connected providers (including both standard and custom)
     const providerIdsToShow = new Set([
-      ...activeConnectionIds, // Only connected providers
+      ...activeConnectionIds, // Connected providers
+      ...explicitProviderIds, // Zero-config providers required by specific clients
     ]);
 
     // Sort by PROVIDER_ORDER
@@ -144,7 +188,7 @@ export default function ModelSelectModal({
             name: cm.name || cm.id,
             value: `${alias}/${cm.id}`,
             isCustom: true,
-            source: cm.source === "api-sync" ? "api-sync" : "custom",
+            source: normalizeModelCatalogSource(cm.source) === "imported" ? "imported" : "custom",
           }));
 
         const allModels = [...aliasModels, ...customEntries];
@@ -198,7 +242,7 @@ export default function ModelSelectModal({
             name: cm.name || cm.id,
             value: `${nodePrefix}/${cm.id}`,
             isCustom: true,
-            source: cm.source === "api-sync" ? "api-sync" : "custom",
+            source: normalizeModelCatalogSource(cm.source) === "imported" ? "imported" : "custom",
           }));
 
         const allModels = [...nodeModels, ...fallbackEntries, ...customEntries];
@@ -231,7 +275,7 @@ export default function ModelSelectModal({
             name: cm.name || cm.id,
             value: `${alias}/${cm.id}`,
             isCustom: true,
-            source: cm.source === "api-sync" ? "api-sync" : "custom",
+            source: normalizeModelCatalogSource(cm.source) === "imported" ? "imported" : "custom",
           }));
 
         const allModels = [...systemEntries, ...customEntries];
@@ -248,7 +292,14 @@ export default function ModelSelectModal({
     });
 
     return groups;
-  }, [activeProviders, modelAliases, allProviders, providerNodes, customModels]);
+  }, [
+    activeProviders,
+    alwaysIncludeProvidersKey,
+    modelAliases,
+    allProviders,
+    providerNodes,
+    customModels,
+  ]);
 
   // Filter combos by search query
   const filteredCombos = useMemo(() => {
@@ -295,12 +346,49 @@ export default function ModelSelectModal({
   const isValueSelected = (value: string) => resolvedSelectedModels.includes(value);
 
   const handleSelect = (model: any) => {
-    onSelect(model);
-    if (!multiSelect) {
+    // Upstream PR decolua/9router#889: when the model is already in
+    // `addedModelValues` AND a deselect callback was supplied, the click acts
+    // as an in-place remove instead of a duplicate add.
+    const candidateValue =
+      typeof model?.value === "string"
+        ? model.value
+        : typeof model?.name === "string"
+          ? model.name
+          : typeof model === "string"
+            ? model
+            : "";
+    const isAdded = candidateValue ? addedModelValues.includes(candidateValue) : false;
+
+    if (isAdded && onDeselect) {
+      onDeselect(model);
+    } else {
+      onSelect(model);
+    }
+
+    // Legacy single-pick auto-closes; multiSelect or keepOpenOnSelect keep the
+    // modal open so the user can toggle several entries in a row.
+    if (!multiSelect && !keepOpenOnSelect) {
       onClose();
       setSearchQuery("");
     }
   };
+
+  // Footer "Done" button for single-select callers that opted out of auto-close
+  // (e.g. combo creation, where users add several models in a row). Skipped when
+  // `multiSelect` is on — that mode renders its own Clear + Done footer below the body.
+  const doneFooter =
+    keepOpenOnSelect && !multiSelect ? (
+      <button
+        type="button"
+        onClick={() => {
+          onClose();
+          setSearchQuery("");
+        }}
+        className="w-full px-3 py-2 text-sm font-medium rounded border border-primary bg-primary text-white hover:bg-primary/90 transition-colors"
+      >
+        {t("done")}
+      </button>
+    ) : null;
 
   return (
     <Modal
@@ -312,6 +400,7 @@ export default function ModelSelectModal({
       title={resolvedTitle}
       size="md"
       className="p-4!"
+      footer={doneFooter}
     >
       {/* Search - compact */}
       <div className="mb-3">
@@ -442,21 +531,3 @@ export default function ModelSelectModal({
     </Modal>
   );
 }
-
-ModelSelectModal.propTypes = {
-  isOpen: PropTypes.bool.isRequired,
-  onClose: PropTypes.func.isRequired,
-  onSelect: PropTypes.func.isRequired,
-  selectedModel: PropTypes.string,
-  selectedModels: PropTypes.arrayOf(PropTypes.string),
-  activeProviders: PropTypes.arrayOf(
-    PropTypes.shape({
-      provider: PropTypes.string.isRequired,
-    })
-  ),
-  title: PropTypes.string,
-  modelAliases: PropTypes.object,
-  addedModelValues: PropTypes.arrayOf(PropTypes.string),
-  multiSelect: PropTypes.bool,
-  showCombos: PropTypes.bool,
-};

@@ -11,7 +11,7 @@ const {
   pruneStandaloneArtifacts,
   resolveNextBuildEnv,
   syncStandaloneNativeAssets,
-} = await import("../../scripts/build-next-isolated.mjs");
+} = await import("../../scripts/build/build-next-isolated.mjs");
 
 async function withTempDir(fn) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omniroute-build-next-isolated-"));
@@ -107,15 +107,47 @@ test("resolveNextBuildEnv forces stable build worker mode unless already provide
   assert.equal(preservedEnv.NODE_ENV, "production");
 });
 
+// Escalated bug (WhatsApp BR, cmqiuhd7600): a local `npm run build` stalls/OOMs
+// during the webpack production pass ("Compiling instrumentation" bundles the whole
+// server graph). #4076/#4104 raised the heap only in the Docker builder stage; the
+// local/native path (build-next-isolated.mjs → resolveNextBuildEnv) was left on V8's
+// default ~2 GB ceiling, so memory-constrained npm-global installs hit the same OOM.
+test("resolveNextBuildEnv raises the Node heap for memory-constrained local builds", () => {
+  const env = resolveNextBuildEnv({ NODE_ENV: "production" });
+  const match = (env.NODE_OPTIONS ?? "").match(/--max-old-space-size=(\d+)/);
+  assert.ok(
+    match,
+    "local build must set NODE_OPTIONS --max-old-space-size to avoid the webpack-pass OOM"
+  );
+  assert.ok(
+    Number(match[1]) >= 4096,
+    `build heap default must be >= 4096 MB (the V8 default ~2 GB OOMed); got ${match[1]}`
+  );
+});
+
+test("resolveNextBuildEnv does not clobber an existing --max-old-space-size (Docker)", () => {
+  const env = resolveNextBuildEnv({ NODE_OPTIONS: "--max-old-space-size=8192" });
+  const occurrences = (env.NODE_OPTIONS.match(/--max-old-space-size=/g) || []).length;
+  assert.equal(occurrences, 1, "must not duplicate the heap flag when one is already set");
+  assert.match(env.NODE_OPTIONS, /--max-old-space-size=8192/);
+});
+
+test("resolveNextBuildEnv honors the OMNIROUTE_BUILD_MEMORY_MB override", () => {
+  const env = resolveNextBuildEnv({ OMNIROUTE_BUILD_MEMORY_MB: "6144" });
+  assert.match(env.NODE_OPTIONS, /--max-old-space-size=6144/);
+});
+
 test("getTransientBuildPaths leaves _tasks in place by default", () => {
   const paths = getTransientBuildPaths("/repo", {});
 
+  // Layer 1 deleted the root-level `app/` move-out hack, so the only default
+  // transient path left is the Wine prefix. ("legacy app snapshot" is gone.)
   assert.deepEqual(
     paths.map((entry) => entry.label),
-    ["legacy app snapshot", "local Wine prefix"]
+    ["local Wine prefix"]
   );
   assert.equal(
-    paths.some((entry) => entry.sourcePath === "/repo/_tasks"),
+    paths.some((entry) => path.basename(entry.sourcePath) === "_tasks"),
     false
   );
 });
@@ -124,20 +156,24 @@ test("getTransientBuildPaths only moves _tasks when explicitly enabled", () => {
   const paths = getTransientBuildPaths("/repo", { OMNIROUTE_BUILD_MOVE_TASKS: "1" });
 
   assert.equal(
-    paths.some((entry) => entry.sourcePath === "/repo/_tasks"),
+    paths.some((entry) => path.basename(entry.sourcePath) === "_tasks"),
     true
   );
 });
 
 test("pruneStandaloneArtifacts removes traced _tasks from standalone output", async () => {
   await withTempDir(async (tempDir) => {
-    const tracedTaskFile = path.join(tempDir, ".next", "standalone", "_tasks", "plan.md");
+    // Layer 1 moved the Next distDir default to .build/next.
+    const tracedTaskFile = path.join(tempDir, ".build", "next", "standalone", "_tasks", "plan.md");
     await fs.mkdir(path.dirname(tracedTaskFile), { recursive: true });
     await fs.writeFile(tracedTaskFile, "transient planning artifact");
 
     await pruneStandaloneArtifacts(tempDir);
 
-    assert.equal(fsSync.existsSync(path.join(tempDir, ".next", "standalone", "_tasks")), false);
+    assert.equal(
+      fsSync.existsSync(path.join(tempDir, ".build", "next", "standalone", "_tasks")),
+      false
+    );
   });
 });
 
@@ -152,7 +188,8 @@ test("syncStandaloneNativeAssets copies wreq-js native runtime into standalone o
     );
     const destinationNativeFile = path.join(
       tempDir,
-      ".next",
+      ".build",
+      "next",
       "standalone",
       "node_modules",
       "wreq-js",
@@ -170,6 +207,6 @@ test("syncStandaloneNativeAssets copies wreq-js native runtime into standalone o
 
     assert.equal(changed, true);
     assert.equal(await fs.readFile(destinationNativeFile, "utf8"), "native module bytes");
-    assert.match(logs[0] ?? "", /wreq-js\/rust/);
+    assert.match((logs[0] ?? "").replaceAll("\\", "/"), /wreq-js\/rust/);
   });
 });

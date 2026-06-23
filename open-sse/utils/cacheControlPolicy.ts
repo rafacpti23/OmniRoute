@@ -72,7 +72,27 @@ const DETERMINISTIC_STRATEGIES: Set<RoutingStrategyValue> = new Set(["priority",
 /**
  * Providers that support prompt caching
  */
-const CACHING_PROVIDERS = new Set(["claude", "anthropic", "zai", "qwen", "deepseek"]);
+const CACHING_PROVIDERS = new Set([
+  "claude",
+  "anthropic",
+  "zai",
+  "qwen",
+  "deepseek",
+  // #3088 — Xiaomi MiMo honors OpenAI-format cache_control breakpoints. Without
+  // this entry, shouldPreserveCacheControl() returns false for Claude Code
+  // clients and filterToOpenAIFormat() strips cache_control, so Xiaomi never
+  // sees the cache hints and every request is a cache miss.
+  "xiaomi-mimo",
+  // #3955 — OpenAI / Codex / Azure-OpenAI use AUTOMATIC prefix caching: the longest
+  // matching prefix of a request is cached upstream WITHOUT any explicit cache_control
+  // markers. They must count as caching providers so the cache-aware compression guard
+  // preserves the cacheable prefix (system prompt / earliest messages) instead of
+  // rewriting it and forcing a cache miss. This also activates the intended
+  // `prompt_cache_key` cache-routing hint for OpenAI in chatCore.
+  "openai",
+  "codex",
+  "azure",
+]);
 
 /**
  * Detect if the client is Claude Code or another caching-aware client

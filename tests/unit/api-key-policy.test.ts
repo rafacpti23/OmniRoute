@@ -27,7 +27,18 @@ process.env.API_KEY_SECRET = process.env.API_KEY_SECRET || "task-607-api-key-sec
 
 const coreDb = await import("../../src/lib/db/core.ts");
 const apiKeysDb = await import("../../src/lib/db/apiKeys.ts");
+const combosDb = await import("../../src/lib/db/combos.ts");
+const modelComboMappingsDb = await import("../../src/lib/db/modelComboMappings.ts");
 const costRules = await import("../../src/domain/costRules.ts");
+const rateLimiter = await import("../../src/shared/utils/rateLimiter.ts");
+
+rateLimiter.setRateLimiterTestMode(true);
+
+function getFsErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  const { code } = error as { code?: unknown };
+  return typeof code === "string" ? code : undefined;
+}
 
 async function resetStorage() {
   apiKeysDb.resetApiKeyState();
@@ -40,8 +51,9 @@ async function resetStorage() {
         fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
       }
       break;
-    } catch (error: any) {
-      if ((error?.code === "EBUSY" || error?.code === "EPERM") && attempt < 9) {
+    } catch (error: unknown) {
+      const code = getFsErrorCode(error);
+      if ((code === "EBUSY" || code === "EPERM") && attempt < 9) {
         await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
       } else {
         throw error;
@@ -72,9 +84,21 @@ function makePolicyRequest(apiKey) {
   });
 }
 
+function makeAnthropicPolicyRequest(apiKey) {
+  return new Request("http://localhost/v1/messages", {
+    method: "POST",
+    headers: apiKey
+      ? {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        }
+      : { "anthropic-version": "2023-06-01" },
+  });
+}
+
 async function readErrorMessage(response) {
-  const body = (await response.json()) as any;
-  return body.error.message;
+  const body = (await response.json()) as { error?: { message?: unknown } };
+  return typeof body.error?.message === "string" ? body.error.message : "";
 }
 
 function getCurrentUtcDay() {
@@ -86,6 +110,7 @@ function getCurrentUtcDay() {
 }
 
 test.beforeEach(async () => {
+  delete process.env.DEFAULT_RATE_LIMIT_PER_DAY;
   await resetStorage();
 });
 
@@ -458,6 +483,145 @@ test("enforceApiKeyPolicy rejects disallowed models and exhausted budgets", asyn
   assert.match(await readErrorMessage(overBudget.rejection), /Daily budget exceeded/);
 });
 
+test("enforceApiKeyPolicy returns Anthropic error envelope for /v1/messages model denials", async () => {
+  const restrictedKey = await createKeyWithPolicy({
+    allowedModels: ["cc/*"],
+    blockedModels: ["claude-fable*", "fable"],
+  });
+  const policy = await loadPolicy("anthropic-model-denial");
+
+  const denied = await policy.enforceApiKeyPolicy(
+    makeAnthropicPolicyRequest(restrictedKey.key),
+    "claude-fable-5"
+  );
+
+  assert.equal(denied.rejection.status, 400);
+  const body = await denied.rejection.json();
+  assert.equal(body.type, "error");
+  assert.equal(body.error.type, "invalid_request_error");
+  assert.match(body.error.message, /claude-fable-5/);
+  assert.equal(
+    body.error.message,
+    'Model "claude-fable-5" is not enabled or quota is insufficient. Choose another allowed model.'
+  );
+  assert.doesNotMatch(body.error.message, /login|authenticate|api key|credential|omniroute/i);
+  assert.equal(body.error.code, undefined);
+});
+
+test("enforceApiKeyPolicy does not rate-limit unrestricted keys by default", async () => {
+  const unrestrictedKey = await createKeyWithPolicy({ allowedModels: ["openai/*"] });
+  const policy = await loadPolicy("default-no-request-limit");
+
+  for (let i = 0; i < 1005; i += 1) {
+    const result = await policy.enforceApiKeyPolicy(
+      makePolicyRequest(unrestrictedKey.key),
+      "openai/gpt-4.1"
+    );
+    assert.equal(result.rejection, null);
+  }
+});
+
+test("enforceApiKeyPolicy enforces explicit env fallback request limits", async () => {
+  process.env.DEFAULT_RATE_LIMIT_PER_DAY = "1";
+  const unrestrictedKey = await createKeyWithPolicy({ allowedModels: ["openai/*"] });
+  const policy = await loadPolicy("env-request-limit");
+
+  const first = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(unrestrictedKey.key),
+    "openai/gpt-4.1"
+  );
+  assert.equal(first.rejection, null);
+
+  const second = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(unrestrictedKey.key),
+    "openai/gpt-4.1"
+  );
+  assert.equal(second.rejection.status, 429);
+  assert.match(await readErrorMessage(second.rejection), /Request limit exceeded/);
+});
+
+test("enforceApiKeyPolicy enforces custom multi-window rate limits", async () => {
+  const limitedKey = await createKeyWithPolicy({
+    allowedModels: ["openai/*"],
+    rateLimits: [{ limit: 1, window: 60 }],
+  });
+  const policy = await loadPolicy("custom-request-limits");
+
+  const first = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(limitedKey.key),
+    "openai/gpt-4.1"
+  );
+  assert.equal(first.rejection, null);
+
+  const second = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(limitedKey.key),
+    "openai/gpt-4.1"
+  );
+  assert.equal(second.rejection.status, 429);
+  assert.match(await readErrorMessage(second.rejection), /Request limit exceeded/);
+});
+
+test("enforceApiKeyPolicy enforces combo allowlists separately from model allowlists", async () => {
+  const allowedKey = await createKeyWithPolicy({
+    allowedModels: ["openai/*"],
+    allowedCombos: ["fast-chat", "mapped-chat"],
+  });
+  const blockedKey = await createKeyWithPolicy({
+    allowedCombos: ["slow-chat"],
+  });
+  await combosDb.createCombo({
+    name: "fast-chat",
+    strategy: "priority",
+    models: ["anthropic/claude-3-5-sonnet"],
+  });
+  await combosDb.createCombo({
+    name: "mapped-chat",
+    strategy: "priority",
+    models: ["openai/gpt-4.1"],
+  });
+  const mappedCombo = await combosDb.getComboByName("mapped-chat");
+  assert.ok(mappedCombo?.id);
+  await modelComboMappingsDb.createModelComboMapping({
+    pattern: "mapped-model-*",
+    comboId: mappedCombo.id as string,
+  });
+  const policy = await loadPolicy("combo-access");
+
+  const allowed = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(allowedKey.key),
+    "combo/fast-chat"
+  );
+  assert.equal(allowed.rejection, null);
+
+  const blocked = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(blockedKey.key),
+    "combo/fast-chat"
+  );
+  assert.equal(blocked.rejection.status, 403);
+  assert.match(await readErrorMessage(blocked.rejection), /Combo "fast-chat" is not allowed/);
+
+  const mapped = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(allowedKey.key),
+    "mapped-model-1"
+  );
+  assert.equal(mapped.rejection, null);
+});
+
+test("enforceApiKeyPolicy applies configured throttle delay", async () => {
+  const delayedKey = await createKeyWithPolicy({ throttleDelayMs: 25 });
+  const policy = await loadPolicy("throttle-delay");
+
+  const startedAt = Date.now();
+  const result = await policy.enforceApiKeyPolicy(
+    makePolicyRequest(delayedKey.key),
+    "openai/gpt-4.1"
+  );
+
+  assert.equal(result.rejection, null);
+  assert.equal(result.apiKeyInfo.throttleDelayMs, 25);
+  assert.ok(Date.now() - startedAt >= 20);
+});
+
 test("enforceApiKeyPolicy enforces request-per-minute limits and returns success when allowed", async () => {
   const limitedKey = await createKeyWithPolicy({
     allowedModels: ["openai/*"],
@@ -477,5 +641,5 @@ test("enforceApiKeyPolicy enforces request-per-minute limits and returns success
     "openai/gpt-4.1"
   );
   assert.equal(second.rejection.status, 429);
-  assert.match(await readErrorMessage(second.rejection), /Per-minute request limit exceeded/);
+  assert.match(await readErrorMessage(second.rejection), /Request limit exceeded/);
 });

@@ -154,12 +154,16 @@ const MODELS_DEV_PROVIDER_MAP: Record<string, string[]> = {
   openai: ["openai", "cx"], // cx = Codex (uses OpenAI models)
   anthropic: ["anthropic", "cc"], // cc = Claude Code
   google: ["gemini", "gemini-cli"],
+  "google-vertex": ["gemini", "vertex"],
+  "google-vertex-anthropic": ["anthropic", "cc", "vertex"],
   vertex_ai: ["gemini", "vertex"],
   deepseek: ["deepseek", "if"], // if = Qoder (routes through DeepSeek)
   groq: ["groq"],
   xai: ["xai"],
   mistral: ["mistral"],
+  togetherai: ["together", "openrouter"],
   together_ai: ["together", "openrouter"],
+  "fireworks-ai": ["fireworks"],
   fireworks: ["fireworks"],
   cerebras: ["cerebras"],
   cohere: ["cohere"],
@@ -172,11 +176,34 @@ const MODELS_DEV_PROVIDER_MAP: Record<string, string[]> = {
   perplexity: ["pplx", "perplexity"],
   // OAuth / special providers
   bedrock: ["kiro", "kr"], // kr = Kiro (AWS Bedrock)
+  "github-copilot": ["github", "gh"],
+  "github-models": ["github", "gh"],
+  kilo: ["kilocode", "kc", "kilo-gateway"],
+  kilocode: ["kilocode", "kc", "kilo-gateway"],
+  "kimi-for-coding": ["kimi-coding", "kmc", "kimi-coding-apikey", "kmca"],
+  // The `opencode` models.dev entry used to map only to "opencode-zen" because
+  // that is the historical alias pair. But OmniRoute's catalog & combo targets
+  // reference models under BOTH provider IDs:
+  //   - `opencode-zen/big-pickle` (alias form)
+  //   - `opencode/big-pickle`    (canonical id form, used by live API catalog
+  //                               and by combos like "Opencode FREE Omni")
+  // If we only store synced capabilities under "opencode-zen", the canonical
+  // `opencode/<model>` lookup in getCanonicalModelMetadata returns null and
+  // any combo that targets `opencode/...` ends up with no computed context.
+  // Symmetric mapping keeps both lookup paths populated.
+  opencode: ["opencode", "opencode-zen"],
+  "opencode-go": ["opencode-go", "opencode-zen"],
   // Additional providers that may overlap with OmniRoute
-  alibaba: ["ali", "alibaba", "bcp", "alicode", "alicode-intl"],
+  alibaba: ["ali", "alibaba"],
+  "alibaba-cn": ["ali-cn", "alibaba-cn", "alibaba-china"],
+  "alibaba-coding-plan": ["bcp", "bailian-coding-plan"],
   zai: ["zai", "glm"], // GLM models via Z.AI
+  "zai-coding-plan": ["zai", "glm"],
+  moonshotai: ["moonshot", "kimi"],
+  "moonshotai-cn": ["moonshot", "kimi"],
   moonshot: ["moonshot", "kimi", "kimi-coding", "kmc", "kmca"],
   minimax: ["minimax", "minimax-cn"],
+  "minimax-cn": ["minimax-cn"],
   longcat: ["lc", "longcat"],
   pollinations: ["pol", "pollinations"],
   puter: ["pu", "puter"],
@@ -184,7 +211,6 @@ const MODELS_DEV_PROVIDER_MAP: Record<string, string[]> = {
   scaleway: ["scw"],
   ollama: ["ollamacloud", "ollama-cloud"],
   blackbox: ["bb", "blackbox"],
-  kilocode: ["kc", "kilocode"],
   cline: ["cl", "cline"],
   cursor: ["cu", "cursor"],
   github: ["gh", "github"],
@@ -551,23 +577,65 @@ export function getSyncedCapabilities(provider?: string, modelId?: string): Capa
   return result;
 }
 
+/**
+ * Resolved providers/aliases to also try when looking up a synced capability.
+ * Required because models.dev has historically stored capability rows under the
+ * alias side of an alias pair (e.g. "opencode-zen") while the catalog & combo
+ * targets reference the canonical id (e.g. "opencode"). Without this fallback,
+ * combos whose targets use the canonical id (e.g. "Opencode FREE Omni" → all
+ * `opencode/...` models) end up with `context_length: null` in the catalog.
+ */
+const SYNCED_CAPABILITY_FALLBACK_ALIASES: Record<string, string[]> = {
+  opencode: ["opencode-zen"],
+  "opencode-zen": ["opencode"],
+  "opencode-go": ["opencode-zen"],
+};
+
 export function getSyncedCapability(
   provider: string,
   modelId: string
 ): ModelCapabilityEntry | null {
   if (!provider || !modelId) return null;
 
+  // Fast path: every provider is in the in-memory cache, skip SQLite entirely.
   if (cachedCapabilitiesLoadedAll) {
-    return cachedCapabilities?.[provider]?.[modelId] ?? null;
+    const lookupCached = (p: string) => cachedCapabilities?.[p]?.[modelId] ?? null;
+    const directCached = lookupCached(provider);
+    if (directCached) return directCached;
+    const fallbacks = SYNCED_CAPABILITY_FALLBACK_ALIASES[provider];
+    if (fallbacks) {
+      for (const alt of fallbacks) {
+        const found = lookupCached(alt);
+        if (found) return found;
+      }
+    }
+    return null;
   }
 
+  // Cold path: hit SQLite. Prepare the statement once, reuse for every alias.
   const db = getDbInstance();
   ensureCapabilitiesTable();
-  const row = db
-    .prepare("SELECT * FROM model_capabilities WHERE provider = ? AND model_id = ? LIMIT 1")
-    .get(provider, modelId);
-  if (!row) return null;
-  return mapCapabilityRecord(toRecord(row));
+  const stmt = db.prepare(
+    "SELECT * FROM model_capabilities WHERE provider = ? AND model_id = ? LIMIT 1"
+  );
+  const lookupDb = (p: string): ModelCapabilityEntry | null => {
+    const row = stmt.get(p, modelId);
+    if (!row) return null;
+    return mapCapabilityRecord(toRecord(row));
+  };
+
+  const direct = lookupDb(provider);
+  if (direct) return direct;
+
+  const fallbacks = SYNCED_CAPABILITY_FALLBACK_ALIASES[provider];
+  if (fallbacks) {
+    for (const alt of fallbacks) {
+      const found = lookupDb(alt);
+      if (found) return found;
+    }
+  }
+
+  return null;
 }
 
 /**

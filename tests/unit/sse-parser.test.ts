@@ -114,6 +114,26 @@ test("parseSSEToClaudeResponse parses text, thinking, tool_use, and usage events
   assert.deepEqual(parsed.usage, { input_tokens: 10, output_tokens: 4 });
 });
 
+test("parseSSEToClaudeResponse tolerates event-only types and missing blank separators", () => {
+  const rawSSE = [
+    "event: message_start",
+    'data: {"message":{"id":"msg_event_fallback","model":"claude-sonnet-4-6","role":"assistant","usage":{"input_tokens":3}}}',
+    "event: content_block_delta",
+    'data: {"index":0,"delta":{"text":"event fallback ok"}}',
+    "event: message_delta",
+    'data: {"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}',
+    "event: message_stop",
+    "data: {}",
+  ].join("\n");
+
+  const parsed = parseSSEToClaudeResponse(rawSSE, "fallback-model");
+
+  assert.equal(parsed.id, "msg_event_fallback");
+  assert.equal(parsed.model, "claude-sonnet-4-6");
+  assert.equal((parsed.content[0] as any).text, "event fallback ok");
+  assert.deepEqual(parsed.usage, { input_tokens: 3, output_tokens: 2 });
+});
+
 test("parseSSEToClaudeResponse ignores malformed payloads and returns null when nothing valid remains", () => {
   const parsed = parseSSEToClaudeResponse(
     ["event: content_block_delta", "data: not-json", "", "data: [DONE]"].join("\n"),
@@ -227,4 +247,47 @@ test("parseSSEToResponsesOutput treats response.canceled as terminal and reconst
   assert.equal(parsed.status, "canceled");
   assert.equal(parsed.output[0].type, "message");
   assert.equal(parsed.output[0].content[0].text, "Bye");
+});
+
+test("parseSSEToOpenAIResponse deduplicates repeated tool call snapshots", () => {
+  const args = JSON.stringify({ command: "find /tmp -name test.txt" });
+  const first = {
+    id: "chatcmpl_tool",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_1",
+              type: "function",
+              function: { name: "shell", arguments: args },
+            },
+          ],
+        },
+      },
+    ],
+  };
+  const second = {
+    id: "chatcmpl_tool",
+    choices: [
+      {
+        index: 0,
+        delta: { tool_calls: [{ index: 0, function: { arguments: args } }] },
+        finish_reason: "tool_calls",
+      },
+    ],
+  };
+  const rawSSE = [
+    `data: ${JSON.stringify(first)}`,
+    `data: ${JSON.stringify(second)}`,
+    "data: [DONE]",
+  ].join("\n");
+
+  const parsed = parseSSEToOpenAIResponse(rawSSE, "fallback-model");
+  const toolCall = parsed.choices[0].message.tool_calls[0];
+
+  assert.equal(toolCall.function.arguments, args);
+  assert.equal(JSON.parse(toolCall.function.arguments).command, "find /tmp -name test.txt");
 });

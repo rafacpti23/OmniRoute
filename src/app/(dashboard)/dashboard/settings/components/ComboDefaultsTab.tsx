@@ -1,9 +1,12 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Card, Button, Input, Toggle } from "@/shared/components";
 import { cn } from "@/shared/utils/cn";
-import { ROUTING_STRATEGIES } from "@/shared/constants/routingStrategies";
+import {
+  ROUTING_STRATEGIES,
+  SETTINGS_FALLBACK_STRATEGY_VALUES,
+} from "@/shared/constants/routingStrategies";
 import { useTranslations } from "next-intl";
 
 const STRATEGY_LABEL_FALLBACKS: Record<string, string> = {
@@ -15,6 +18,32 @@ const LEGACY_COMBO_RESILIENCE_KEYS = new Set([
   "healthCheckEnabled",
   "healthCheckTimeoutMs",
 ]);
+const ACCOUNT_FALLBACK_STRATEGIES = new Set<string>(SETTINGS_FALLBACK_STRATEGY_VALUES);
+const MS_PER_SECOND = 1000;
+
+function msToSeconds(value: unknown): number {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) return 0;
+  return Math.round(ms / MS_PER_SECOND);
+}
+
+function msToOptionalSecondsInput(value: unknown): string {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  return String(Math.round(ms / MS_PER_SECOND));
+}
+
+function secondsInputToMs(value: string, maxSeconds: number): number {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+  return Math.min(maxSeconds, Math.round(seconds)) * MS_PER_SECOND;
+}
+
+function secondsInputToOptionalMs(value: string, maxSeconds = 86400): number | undefined {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+  return Math.min(maxSeconds, Math.round(seconds)) * MS_PER_SECOND;
+}
 
 function translateOrFallback(
   t: ReturnType<typeof useTranslations>,
@@ -44,6 +73,17 @@ function sanitizeProviderOverrides(overrides?: Record<string, any> | null) {
   );
 }
 
+function toGlobalRoutingPatch(strategy: string | undefined, stickyRoundRobinLimit?: number) {
+  const patch: Record<string, unknown> = {};
+  if (strategy && ACCOUNT_FALLBACK_STRATEGIES.has(strategy)) {
+    patch.fallbackStrategy = strategy;
+  }
+  if (strategy === "round-robin" && stickyRoundRobinLimit !== undefined) {
+    patch.stickyRoundRobinLimit = stickyRoundRobinLimit;
+  }
+  return patch;
+}
+
 export default function ComboDefaultsTab() {
   const [comboDefaults, setComboDefaults] = useState<any>({
     strategy: "priority",
@@ -51,13 +91,24 @@ export default function ComboDefaultsTab() {
     retryDelayMs: 2000,
     maxComboDepth: 3,
     trackMetrics: true,
+    reasoningTokenBufferEnabled: true,
     handoffThreshold: 0.85,
     handoffModel: "",
     maxMessagesForSummary: 30,
     stickyRoundRobinLimit: 3,
+    resetAwareQuotaCacheTtlMs: 0,
+    resetAwareQuotaCacheMaxStaleMs: 0,
+    zeroLatencyOptimizationsEnabled: false,
   });
+  const [codexSessionAffinityTtlMs, setCodexSessionAffinityTtlMs] = useState(0);
   const [providerOverrides, setProviderOverrides] = useState<any>({});
-  const [newOverrideProvider, setNewOverrideProvider] = useState("");
+  const [availableProviders, setAvailableProviders] = useState<{ id: string; provider: string }[]>(
+    []
+  );
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [highlightedIdx, setHighlightedIdx] = useState(0);
+  const dropdownRef = useRef<HTMLDivElement>(null);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ type: "success" | "error" | ""; message: string }>({
     type: "",
@@ -84,13 +135,34 @@ export default function ComboDefaultsTab() {
     Promise.all([
       fetch("/api/settings/combo-defaults").then((res) => res.json()),
       fetch("/api/settings").then((res) => res.json()),
+      fetch("/api/providers")
+        .then((res) => res.json())
+        .then((providers: any[]) => {
+          // Filter: include a provider only if at least one of its connections is active.
+          // Disabled providers (all connections inactive) are excluded.
+          const byProvider = new Map<string, any[]>();
+          for (const p of providers) {
+            if (!p.provider) continue;
+            const list = byProvider.get(p.provider) || [];
+            list.push(p);
+            byProvider.set(p.provider, list);
+          }
+          const activeProviders = Array.from(byProvider.entries())
+            .filter(([, conns]) => conns.some((c) => c.isActive !== false))
+            .map(([name]) => name)
+            .sort();
+          setAvailableProviders(activeProviders.map((p) => ({ id: p, provider: p })));
+        })
+        .catch(() => {
+          /* providers fetch is non-critical */
+        }),
     ])
       .then(([comboData, settingsData]) => {
         setComboDefaults((prev) => ({
           ...prev,
           ...sanitizeComboRuntimeConfig(comboData.comboDefaults),
           strategy:
-            settingsData.fallbackStrategy ?? comboData.comboDefaults?.strategy ?? prev.strategy,
+            comboData.comboDefaults?.strategy ?? settingsData.fallbackStrategy ?? prev.strategy,
           stickyRoundRobinLimit:
             settingsData.stickyRoundRobinLimit ??
             comboData.comboDefaults?.stickyRoundRobinLimit ??
@@ -99,8 +171,24 @@ export default function ComboDefaultsTab() {
         if (comboData.providerOverrides) {
           setProviderOverrides(sanitizeProviderOverrides(comboData.providerOverrides));
         }
+        setCodexSessionAffinityTtlMs(
+          Number.isFinite(Number(settingsData.codexSessionAffinityTtlMs))
+            ? Number(settingsData.codexSessionAffinityTtlMs)
+            : 0
+        );
       })
       .catch((err) => console.error("Failed to fetch combo defaults:", err));
+  }, []);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setDropdownOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
   const showStatus = (type: "success" | "error", message: string) => {
@@ -109,8 +197,7 @@ export default function ComboDefaultsTab() {
   };
 
   const syncGlobalRoutingSettings = async (patch: Record<string, unknown>) => {
-    const keys = Object.keys(patch);
-    if (keys.length === 0) return true;
+    if (Object.keys(patch).length === 0) return;
 
     const res = await fetch("/api/settings", {
       method: "PATCH",
@@ -121,21 +208,16 @@ export default function ComboDefaultsTab() {
     if (!res.ok) {
       throw new Error("Failed to sync global routing settings");
     }
-
-    return true;
   };
 
   const saveComboDefaults = async () => {
     setSaving(true);
     try {
       const { stickyRoundRobinLimit, ...comboDefaultsPayload } = comboDefaults;
-      const settingsPatch: Record<string, unknown> = {};
-      if (comboDefaults.strategy) {
-        settingsPatch.fallbackStrategy = comboDefaults.strategy;
-      }
-      if (comboDefaults.strategy === "round-robin" && stickyRoundRobinLimit !== undefined) {
-        settingsPatch.stickyRoundRobinLimit = stickyRoundRobinLimit;
-      }
+      const settingsPatch = {
+        ...toGlobalRoutingPatch(comboDefaults.strategy, stickyRoundRobinLimit),
+        codexSessionAffinityTtlMs,
+      };
 
       const comboDefaultsRes = await fetch("/api/settings/combo-defaults", {
         method: "PATCH",
@@ -160,19 +242,70 @@ export default function ComboDefaultsTab() {
     }
   };
 
-  const addProviderOverride = () => {
-    const name = newOverrideProvider.trim().toLowerCase();
-    if (!name || providerOverrides[name]) return;
-    setProviderOverrides((prev) => ({ ...prev, [name]: { maxRetries: 1 } }));
-    setNewOverrideProvider("");
+  const addProviderOverride = (name: string) => {
+    const trimmed = name.trim().toLowerCase();
+    if (!trimmed || providerOverrides[trimmed]) return;
+    setProviderOverrides((prev) => ({ ...prev, [trimmed]: { maxRetries: 1 } }));
+    setDropdownOpen(false);
+    setSearchQuery("");
+    setHighlightedIdx(0);
   };
 
-  const removeProviderOverride = (provider) => {
+  const removeProviderOverride = (provider: string) => {
     setProviderOverrides((prev) => {
       const copy = { ...prev };
       delete copy[provider];
       return copy;
     });
+  };
+
+  // Reorder a provider override by rebuilding the object in the new order.
+  // direction: -1 = move up, +1 = move down
+  const moveProviderOverride = (provider: string, direction: -1 | 1) => {
+    setProviderOverrides((prev) => {
+      const keys = Object.keys(prev);
+      const idx = keys.indexOf(provider);
+      if (idx < 0) return prev;
+      const target = idx + direction;
+      if (target < 0 || target >= keys.length) return prev;
+      // Swap positions
+      [keys[idx], keys[target]] = [keys[target], keys[idx]];
+      // Rebuild object in new order
+      const reordered: Record<string, any> = {};
+      for (const k of keys) {
+        reordered[k] = prev[k];
+      }
+      return reordered;
+    });
+  };
+
+  // Filtered provider list — excludes already-added ones, filtered by search query
+  const filteredProviders = availableProviders.filter(
+    (p) =>
+      !providerOverrides[p.provider] && p.provider.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
+  const handleDropdownKeyDown = (e: React.KeyboardEvent) => {
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        setHighlightedIdx((prev) => Math.min(prev + 1, filteredProviders.length - 1));
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        setHighlightedIdx((prev) => Math.max(prev - 1, 0));
+        break;
+      case "Enter":
+        e.preventDefault();
+        if (filteredProviders[highlightedIdx]) {
+          addProviderOverride(filteredProviders[highlightedIdx].provider);
+        }
+        break;
+      case "Escape":
+        e.preventDefault();
+        setDropdownOpen(false);
+        break;
+    }
   };
 
   return (
@@ -205,14 +338,14 @@ export default function ComboDefaultsTab() {
           {translateOrFallback(
             t,
             "routingAdvancedGuideHint1",
-            "Use Fill First for predictable priority, Round Robin for fairness, and P2C for latency resilience."
+            "This strategy is synced to both new combo defaults and global account fallback routing."
           )}
         </p>
         <p className="text-xs text-text-muted">
           {translateOrFallback(
             t,
             "routingAdvancedGuideHint2",
-            "If providers vary in quality or cost, start with Cost Opt for background work and Least Used for balanced wear."
+            "Use Fill First for predictable account priority, Round Robin plus Sticky Limit for account batches, and P2C for latency resilience."
           )}
         </p>
       </div>
@@ -243,7 +376,7 @@ export default function ComboDefaultsTab() {
                 onClick={async () => {
                   setComboDefaults((prev) => ({ ...prev, strategy: s.value }));
                   try {
-                    await syncGlobalRoutingSettings({ fallbackStrategy: s.value });
+                    await syncGlobalRoutingSettings(toGlobalRoutingPatch(s.value));
                   } catch (error) {
                     console.error("Failed to sync fallback strategy:", error);
                     showStatus("error", t("errorOccurred"));
@@ -309,6 +442,99 @@ export default function ComboDefaultsTab() {
               className="text-sm"
             />
           ))}
+          <Input
+            label={translateOrFallback(t, "targetTimeout", "Target timeout (seconds)")}
+            type="number"
+            min={1}
+            max={86400}
+            step={1}
+            value={msToOptionalSecondsInput(comboDefaults.targetTimeoutMs)}
+            placeholder={translateOrFallback(t, "inheritRequestTimeout", "Inherit request timeout")}
+            onChange={(e) =>
+              setComboDefaults((prev) => ({
+                ...prev,
+                targetTimeoutMs: secondsInputToOptionalMs(e.target.value),
+              }))
+            }
+            className="text-sm"
+          />
+        </div>
+        <p className="text-xs text-text-muted">
+          {translateOrFallback(
+            t,
+            "targetTimeoutHint",
+            "Combo targets inherit the current request timeout by default. Set a lower value here only when you want faster fallback."
+          )}
+        </p>
+
+        <div className="grid grid-cols-1 gap-3 pt-3 border-t border-border/50">
+          <div>
+            <p className="font-medium text-sm">
+              {translateOrFallback(t, "codexSessionAffinityTitle", "Codex session affinity")}
+            </p>
+            <p className="text-xs text-text-muted">
+              {translateOrFallback(
+                t,
+                "codexSessionAffinityDesc",
+                "Keeps one Codex conversation on the same account for this many seconds. 0 disables it."
+              )}
+            </p>
+          </div>
+          <Input
+            label={translateOrFallback(t, "codexSessionAffinityTtl", "Affinity TTL (seconds)")}
+            type="number"
+            min={0}
+            max={86400}
+            step={60}
+            value={msToSeconds(codexSessionAffinityTtlMs)}
+            onChange={(e) => setCodexSessionAffinityTtlMs(secondsInputToMs(e.target.value, 86400))}
+            className="text-sm"
+          />
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-3 border-t border-border/50">
+          <div className="md:col-span-2">
+            <p className="font-medium text-sm">
+              {translateOrFallback(t, "resetAwareQuotaCacheTitle", "Reset-aware quota cache")}
+            </p>
+            <p className="text-xs text-text-muted">
+              {translateOrFallback(
+                t,
+                "resetAwareQuotaCacheDesc",
+                "Caches quota telemetry for reset-aware ordering only. Quota preflight still protects requests. 0/0 keeps live fetching."
+              )}
+            </p>
+          </div>
+          <Input
+            label={translateOrFallback(t, "resetAwareQuotaCacheTtl", "Fresh TTL (seconds)")}
+            type="number"
+            min={0}
+            max={300}
+            step={5}
+            value={msToSeconds(comboDefaults.resetAwareQuotaCacheTtlMs)}
+            onChange={(e) =>
+              setComboDefaults((prev) => ({
+                ...prev,
+                resetAwareQuotaCacheTtlMs: secondsInputToMs(e.target.value, 300),
+              }))
+            }
+            className="text-sm"
+          />
+          <Input
+            label={translateOrFallback(t, "resetAwareQuotaCacheMaxStale", "Max stale (seconds)")}
+            type="number"
+            min={0}
+            max={3600}
+            step={30}
+            value={msToSeconds(comboDefaults.resetAwareQuotaCacheMaxStaleMs)}
+            onChange={(e) =>
+              setComboDefaults((prev) => ({
+                ...prev,
+                resetAwareQuotaCacheMaxStaleMs: secondsInputToMs(e.target.value, 3600),
+              }))
+            }
+            className="text-sm"
+          />
         </div>
 
         {/* Round-Robin specific */}
@@ -341,6 +567,21 @@ export default function ComboDefaultsTab() {
                 setComboDefaults((prev) => ({
                   ...prev,
                   queueTimeoutMs: parseInt(e.target.value) || 0,
+                }))
+              }
+              className="text-sm"
+            />
+            <Input
+              label={t("queueDepth")}
+              type="number"
+              min={0}
+              max={100}
+              value={comboDefaults.queueDepth ?? ""}
+              placeholder="20"
+              onChange={(e) =>
+                setComboDefaults((prev) => ({
+                  ...prev,
+                  queueDepth: parseInt(e.target.value) || 0,
                 }))
               }
               className="text-sm"
@@ -420,6 +661,52 @@ export default function ComboDefaultsTab() {
               }
             />
           </div>
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <p className="font-medium text-sm">
+                {translateOrFallback(t, "reasoningTokenBuffer", "Reasoning token buffer")}
+              </p>
+              <p className="text-xs text-text-muted">
+                {translateOrFallback(
+                  t,
+                  "reasoningTokenBufferDesc",
+                  "Allow combo routing to add max_tokens headroom only for known reasoning models when the full buffer fits inside a known output cap."
+                )}
+              </p>
+            </div>
+            <Toggle
+              checked={comboDefaults.reasoningTokenBufferEnabled !== false}
+              onChange={() =>
+                setComboDefaults((prev) => ({
+                  ...prev,
+                  reasoningTokenBufferEnabled: prev.reasoningTokenBufferEnabled === false,
+                }))
+              }
+            />
+          </div>
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium text-sm">
+                {translateOrFallback(t, "zeroLatencyOptimizations", "Zero-latency optimizations")}
+              </p>
+              <p className="text-xs text-text-muted">
+                {translateOrFallback(
+                  t,
+                  "zeroLatencyOptimizationsDesc",
+                  "Opt in to hedging, predictive TTFT skips, and proactive fallback compression. Leave off to prevent these latency features from racing targets or compressing fallback requests."
+                )}
+              </p>
+            </div>
+            <Toggle
+              checked={comboDefaults.zeroLatencyOptimizationsEnabled === true}
+              onChange={() =>
+                setComboDefaults((prev) => ({
+                  ...prev,
+                  zeroLatencyOptimizationsEnabled: prev.zeroLatencyOptimizationsEnabled !== true,
+                }))
+              }
+            />
+          </div>
         </div>
 
         {/* Provider Overrides */}
@@ -427,57 +714,122 @@ export default function ComboDefaultsTab() {
           <p className="font-medium text-sm mb-2">{t("providerOverrides")}</p>
           <p className="text-xs text-text-muted mb-3">{t("providerOverridesDesc")}</p>
 
-          {Object.entries(providerOverrides).map(([provider, config]: [string, any]) => (
-            <div
-              key={provider}
-              className="flex items-center gap-2 mb-2 p-2 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]"
-            >
-              <span className="text-xs font-mono font-medium min-w-[80px]">{provider}</span>
-              <Input
-                type="number"
-                min="0"
-                max="5"
-                value={config.maxRetries ?? 1}
-                onChange={(e) =>
-                  setProviderOverrides((prev) => ({
-                    ...prev,
-                    [provider]: { ...prev[provider], maxRetries: parseInt(e.target.value) || 0 },
-                  }))
-                }
-                className="text-xs w-16"
-                aria-label={t("providerMaxRetriesAria", { provider })}
-              />
-              <span className="text-[10px] text-text-muted">{t("retries")}</span>
-              <button
-                onClick={() => removeProviderOverride(provider)}
-                className="ml-auto text-red-400 hover:text-red-500 transition-colors"
-                aria-label={t("removeProviderOverrideAria", { provider })}
+          {Object.entries(providerOverrides).map(
+            ([provider, config]: [string, any], index: number) => (
+              <div
+                key={provider}
+                className="flex items-center gap-1.5 mb-2 p-2 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]"
               >
-                <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-                  close
-                </span>
-              </button>
-            </div>
-          ))}
+                {/* Reorder arrows (combo-builder pattern) */}
+                <div className="flex flex-col gap-0.5">
+                  <button
+                    onClick={() => moveProviderOverride(provider, -1)}
+                    disabled={index === 0}
+                    className={`p-0.5 rounded ${index === 0 ? "text-text-muted/20 cursor-not-allowed" : "text-text-muted hover:text-primary hover:bg-black/5 dark:hover:bg-white/5"}`}
+                    title="Move up"
+                  >
+                    <span className="material-symbols-outlined text-[12px]">arrow_upward</span>
+                  </button>
+                  <button
+                    onClick={() => moveProviderOverride(provider, 1)}
+                    disabled={index === Object.keys(providerOverrides).length - 1}
+                    className={`p-0.5 rounded ${index === Object.keys(providerOverrides).length - 1 ? "text-text-muted/20 cursor-not-allowed" : "text-text-muted hover:text-primary hover:bg-black/5 dark:hover:bg-white/5"}`}
+                    title="Move down"
+                  >
+                    <span className="material-symbols-outlined text-[12px]">arrow_downward</span>
+                  </button>
+                </div>
+                <span className="text-xs font-mono font-medium min-w-[80px]">{provider}</span>
+                <Input
+                  type="number"
+                  min="0"
+                  max="5"
+                  value={config.maxRetries ?? 1}
+                  onChange={(e) =>
+                    setProviderOverrides((prev) => ({
+                      ...prev,
+                      [provider]: { ...prev[provider], maxRetries: parseInt(e.target.value) || 0 },
+                    }))
+                  }
+                  className="text-xs w-16"
+                  aria-label={t("providerMaxRetriesAria", { provider })}
+                />
+                <span className="text-[10px] text-text-muted">{t("retries")}</span>
+                <button
+                  onClick={() => removeProviderOverride(provider)}
+                  className="ml-auto text-red-400 hover:text-red-500 transition-colors"
+                  aria-label={t("removeProviderOverrideAria", { provider })}
+                >
+                  <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
+                    close
+                  </span>
+                </button>
+              </div>
+            )
+          )}
 
-          <div className="flex items-center gap-2 mt-2">
-            <Input
-              type="text"
-              placeholder={t("newProviderNamePlaceholder")}
-              value={newOverrideProvider}
-              onChange={(e) => setNewOverrideProvider(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addProviderOverride()}
-              className="text-xs flex-1"
-              aria-label={t("newProviderNameAria")}
-            />
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={addProviderOverride}
-              disabled={!newOverrideProvider.trim()}
+          <div className="relative" ref={dropdownRef}>
+            <button
+              type="button"
+              onClick={() => setDropdownOpen(!dropdownOpen)}
+              className="flex items-center gap-2 px-3 py-2 text-xs rounded-lg border border-border/50 bg-black/[0.02] dark:bg-white/[0.02] hover:bg-black/[0.05] dark:hover:bg-white/[0.05] transition-colors w-full mt-2"
             >
-              {tc("add")}
-            </Button>
+              <span className="flex-1 text-left text-text-muted">
+                {t("selectProviderPlaceholder") || "Select provider..."}
+              </span>
+              <span
+                className="material-symbols-outlined text-[16px] transition-transform"
+                style={{ transform: dropdownOpen ? "rotate(180deg)" : "none" }}
+              >
+                expand_more
+              </span>
+            </button>
+
+            {dropdownOpen && (
+              <div className="absolute z-50 mt-1 w-full rounded-lg border border-border/50 bg-white dark:bg-gray-900 shadow-lg overflow-hidden">
+                <div className="p-2 border-b border-border/50">
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => {
+                      setSearchQuery(e.target.value);
+                      setHighlightedIdx(0);
+                    }}
+                    className="w-full px-2 py-1.5 text-xs rounded-md border border-border/50 bg-transparent outline-none focus:border-amber-500 transition-colors"
+                    placeholder={t("searchProviderPlaceholder") || "Search providers..."}
+                    aria-label={t("searchProviderAria") || "Search providers"}
+                    onKeyDown={handleDropdownKeyDown}
+                    autoFocus
+                  />
+                </div>
+                <ul role="listbox" className="max-h-48 overflow-auto py-1">
+                  {filteredProviders.length === 0 ? (
+                    <li className="px-3 py-2 text-xs text-text-muted text-center">
+                      {availableProviders.filter((p) => !providerOverrides[p.provider]).length === 0
+                        ? "All providers added"
+                        : "No providers found"}
+                    </li>
+                  ) : (
+                    filteredProviders.map((p, idx) => (
+                      <li
+                        key={p.provider}
+                        role="option"
+                        aria-selected={idx === highlightedIdx}
+                        className={`px-3 py-2 text-xs cursor-pointer transition-colors ${
+                          idx === highlightedIdx
+                            ? "bg-black/[0.05] dark:bg-white/[0.05] font-medium"
+                            : "hover:bg-black/[0.03] dark:hover:bg-white/[0.03]"
+                        }`}
+                        onClick={() => addProviderOverride(p.provider)}
+                        onMouseEnter={() => setHighlightedIdx(idx)}
+                      >
+                        {p.provider}
+                      </li>
+                    ))
+                  )}
+                </ul>
+              </div>
+            )}
           </div>
         </div>
 

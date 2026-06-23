@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import {
+  deleteModelAliasesForProvider,
   deleteProviderConnectionsByProvider,
   deleteProviderNode,
   getProviderConnections,
@@ -33,7 +34,7 @@ function sanitizeClaudeCodeCompatibleBaseUrl(baseUrl: string) {
 
 // PUT /api/provider-nodes/[id] - Update provider node
 export async function PUT(request: Request, { params }: { params: Promise<{ id: string }> }) {
-  let rawBody;
+  let rawBody: unknown;
   try {
     rawBody = await request.json();
   } catch {
@@ -54,7 +55,8 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const { name, prefix, apiType, baseUrl, chatPath, modelsPath } = validation.data;
+    const { name, prefix, apiType, baseUrl, chatPath, modelsPath, customHeaders } =
+      validation.data;
     const node: any = await getProviderNodeById(id);
 
     if (!node) {
@@ -89,6 +91,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       baseUrl: sanitizedBaseUrl,
       chatPath: chatPath || null,
       modelsPath: isClaudeCodeCompatibleProvider(id) ? null : modelsPath || null,
+      customHeaders: customHeaders || null,
     };
 
     if (node.type === "openai-compatible") {
@@ -110,6 +113,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
           baseUrl: sanitizedBaseUrl,
           nodeName: updated.name,
           chatPath: updated.chatPath || undefined,
+          customHeaders: updated.customHeaders || undefined,
         } as JsonRecord;
         if (updated.modelsPath) {
           providerSpecificData.modelsPath = updated.modelsPath;
@@ -136,7 +140,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
 }
 
 // DELETE /api/provider-nodes/[id] - Delete provider node and its connections
-export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function DELETE(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
     const node = await getProviderNodeById(id);
@@ -147,6 +151,9 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
 
     await deleteProviderConnectionsByProvider(id);
     await deleteProviderNode(id);
+    // #1409: drop orphaned model-alias rows (key=<alias>, value="<providerId>/<model>")
+    // so re-importing the same provider isn't blocked by stale "already exists" aliases.
+    await deleteModelAliasesForProvider(id);
 
     return NextResponse.json({ success: true });
   } catch (error) {

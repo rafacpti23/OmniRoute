@@ -18,11 +18,11 @@ test("getProviderCategory: OAuth providers return 'oauth'", () => {
   assert.equal(getProviderCategory("antigravity"), "oauth");
   assert.equal(getProviderCategory("cursor"), "oauth");
   assert.equal(getProviderCategory("kiro"), "oauth");
-  assert.equal(getProviderCategory("gemini-cli"), "oauth");
   assert.equal(getProviderCategory("cline"), "oauth");
 });
 
 test("getProviderCategory: API key providers return 'apikey'", () => {
+  assert.equal(getProviderCategory("gemini-cli"), "apikey");
   assert.equal(getProviderCategory("groq"), "apikey");
   assert.equal(getProviderCategory("fireworks"), "apikey");
   assert.equal(getProviderCategory("cerebras"), "apikey");
@@ -45,6 +45,7 @@ test("getProviderProfile: OAuth provider returns oauth profile", () => {
   assert.equal(profile.useUpstreamRetryHints, false);
   assert.equal(profile.maxBackoffSteps, PROVIDER_PROFILES.oauth.maxBackoffLevel);
   assert.equal(profile.failureThreshold, PROVIDER_PROFILES.oauth.circuitBreakerThreshold);
+  assert.equal(profile.degradationThreshold, PROVIDER_PROFILES.oauth.degradationThreshold);
   assert.equal(profile.resetTimeoutMs, PROVIDER_PROFILES.oauth.circuitBreakerReset);
   assert.equal(profile.transientCooldown, PROVIDER_PROFILES.oauth.transientCooldown);
   assert.equal(
@@ -62,6 +63,7 @@ test("getProviderProfile: API provider returns apikey profile", () => {
   assert.equal(profile.useUpstreamRetryHints, true);
   assert.equal(profile.maxBackoffSteps, PROVIDER_PROFILES.apikey.maxBackoffLevel);
   assert.equal(profile.failureThreshold, PROVIDER_PROFILES.apikey.circuitBreakerThreshold);
+  assert.equal(profile.degradationThreshold, PROVIDER_PROFILES.apikey.degradationThreshold);
   assert.equal(profile.resetTimeoutMs, PROVIDER_PROFILES.apikey.circuitBreakerReset);
   assert.equal(profile.transientCooldown, PROVIDER_PROFILES.apikey.transientCooldown);
   assert.equal(
@@ -188,7 +190,10 @@ test("parseRetryFromErrorText: parses will reset after variant", () => {
 
 // ─── T06: Keyword Matching for Long Cooldowns ────────────────────────────────
 
-test("quota reset text is ignored when upstream retry hints are disabled", () => {
+// Fix #1308 / #4429: QUOTA_EXHAUSTED text can provide a precise upstream reset
+// window, but the operator's upstream retry hint setting must still decide
+// whether that window is used for cooldowns.
+test("quota reset text is ignored for oauth providers when upstream retry hints are disabled", () => {
   const result = checkFallbackError(
     429,
     "Your quota will reset after 27h41m36s",
@@ -198,9 +203,13 @@ test("quota reset text is ignored when upstream retry hints are disabled", () =>
     null
   );
   assert.equal(result.shouldFallback, true);
-  assert.equal(result.cooldownMs, PROVIDER_PROFILES.oauth.transientCooldown);
-  assert.equal(result.newBackoffLevel, 1);
+  assert.notEqual(result.cooldownMs, 99696000);
+  assert.ok(
+    result.cooldownMs < 5 * 60 * 1000,
+    `expected local short cooldown, got ${result.cooldownMs}ms`
+  );
   assert.equal(result.usedUpstreamRetryHint, false);
+  assert.equal(result.reason, "quota_exhausted");
 });
 
 test("quota reset text is honored when upstream retry hints are enabled", () => {
@@ -216,6 +225,14 @@ test("quota reset text is honored when upstream retry hints are enabled", () => 
   assert.equal(result.cooldownMs, 2 * 60 * 60 * 1000);
   assert.equal(result.newBackoffLevel, 0);
   assert.equal(result.usedUpstreamRetryHint, true);
+});
+
+test("subscription quota uses long cooldown when upstream retry hints are disabled", () => {
+  const result = checkFallbackError(429, "Usage Limit Reached", 0, null, "antigravity", null);
+  assert.equal(result.shouldFallback, true);
+  assert.equal(result.cooldownMs, 60 * 60 * 1000);
+  assert.equal(result.reason, RateLimitReason.QUOTA_EXHAUSTED);
+  assert.equal(result.usedUpstreamRetryHint, false);
 });
 
 test("high transient backoff levels clamp to the configured maxBackoffSteps", () => {

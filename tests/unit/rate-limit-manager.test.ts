@@ -144,6 +144,36 @@ test("rate limit manager handles 429 limiter teardown and disable cleanup", asyn
   assert.equal(rateLimitManager.getRateLimitStatus("gemini", "conn-disable").active, false);
 });
 
+test("rate limit manager uses model-scoped limiter keys for GitHub Copilot (#1624)", async () => {
+  rateLimitManager.enableRateLimitProtection("conn-github");
+  rateLimitManager.updateFromHeaders(
+    "github",
+    "conn-github",
+    {
+      "x-ratelimit-limit-requests": "50",
+      "x-ratelimit-remaining-requests": "3",
+      "x-ratelimit-reset-requests": "15s",
+    },
+    200,
+    "gpt-5.1-codex-max"
+  );
+  await rateLimitManager.__flushLearnedLimitsForTests();
+
+  // GitHub should use model-scoped key: github:conn-github:gpt-5.1-codex-max
+  const allStatuses = rateLimitManager.getAllRateLimitStatus();
+  assert.ok(
+    allStatuses["github:conn-github:gpt-5.1-codex-max"],
+    "GitHub limiter key should be model-scoped (github:conn:model)"
+  );
+  // Verify the limiter state is model-scoped via test helper
+  const limiterState = await rateLimitManager.__getLimiterStateForTests(
+    "github",
+    "conn-github",
+    "gpt-5.1-codex-max"
+  );
+  assert.equal(limiterState?.key, "github:conn-github:gpt-5.1-codex-max");
+});
+
 test("rate limit manager parses retry hints from response bodies and locks models", async () => {
   rateLimitManager.enableRateLimitProtection("conn-body");
   rateLimitManager.updateFromResponseBody(
@@ -176,6 +206,41 @@ test("rate limit manager parses retry hints from response bodies and locks model
     null
   );
   assert.equal(rateLimitManager.getRateLimitStatus("openai", "conn-body").active, true);
+});
+
+test("RATE_LIMIT_AUTO_ENABLE env var overrides dashboard auto-enable setting", async () => {
+  const conn = await providersDb.createProviderConnection({
+    provider: "openai",
+    authType: "apikey",
+    name: "Env Override",
+    apiKey: "sk-env",
+    isActive: true,
+  });
+
+  // Dashboard says auto-enable on, but env says off → off wins
+  const original = process.env.RATE_LIMIT_AUTO_ENABLE;
+  process.env.RATE_LIMIT_AUTO_ENABLE = "false";
+  try {
+    await rateLimitManager.initializeRateLimits();
+    assert.equal(rateLimitManager.isRateLimitEnabled(conn.id), false);
+  } finally {
+    if (original === undefined) delete process.env.RATE_LIMIT_AUTO_ENABLE;
+    else process.env.RATE_LIMIT_AUTO_ENABLE = original;
+  }
+
+  // Reset and verify the opposite: env=true forces on even when dashboard would be off
+  await rateLimitManager.__resetRateLimitManagerForTests();
+  process.env.RATE_LIMIT_AUTO_ENABLE = "true";
+  try {
+    await rateLimitManager.applyRequestQueueSettings({
+      ...resilienceSettings.DEFAULT_RESILIENCE_SETTINGS.requestQueue,
+      autoEnableApiKeyProviders: false,
+    });
+    assert.equal(rateLimitManager.isRateLimitEnabled(conn.id), true);
+  } finally {
+    if (original === undefined) delete process.env.RATE_LIMIT_AUTO_ENABLE;
+    else process.env.RATE_LIMIT_AUTO_ENABLE = original;
+  }
 });
 
 test("rate limit manager recomputes auto-enabled API key connections when queue settings change", async () => {

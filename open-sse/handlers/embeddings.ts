@@ -1,4 +1,3 @@
-import { randomUUID } from "crypto";
 /**
  * Embedding Handler
  *
@@ -16,10 +15,23 @@ import { randomUUID } from "crypto";
 
 import {
   getEmbeddingProvider,
+  getEmbeddingModelDefaultParams,
   parseEmbeddingModel,
   type EmbeddingProvider,
 } from "../config/embeddingRegistry.ts";
 import { saveCallLog } from "@/lib/usageDb";
+import { createRequestLogger } from "../utils/requestLogger.ts";
+import { isDetailedLoggingEnabled } from "@/lib/db/detailedLogs";
+import { getCallLogPipelineCaptureStreamChunks } from "@/lib/logEnv";
+import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
+import { stripStaleEncodingHeaders } from "../utils/upstreamResponseHeaders.ts";
+import { sanitizeErrorMessage } from "../utils/error.ts";
+
+interface ClientRawRequest {
+  endpoint: string;
+  body: Record<string, unknown>;
+  headers: Record<string, string>;
+}
 
 /**
  * Handle embedding request.
@@ -33,12 +45,20 @@ export async function handleEmbedding({
   log,
   resolvedProvider = null,
   resolvedModel = null,
+  clientRawRequest = null,
+  apiKeyId = null,
+  apiKeyName = null,
+  connectionId = null,
 }: {
   body: Record<string, unknown>;
-  credentials: { apiKey?: string; accessToken?: string } | null;
+  credentials: { apiKey?: string | null; accessToken?: string | null } | null;
   log?: { info: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
   resolvedProvider?: EmbeddingProvider | null;
   resolvedModel?: string | null;
+  clientRawRequest?: ClientRawRequest | null;
+  apiKeyId?: string | null;
+  apiKeyName?: string | null;
+  connectionId?: string | null;
 }) {
   // Use pre-resolved provider/model from route handler if available (supports dynamic provider_nodes).
   let provider: string | null;
@@ -57,6 +77,31 @@ export async function handleEmbedding({
   }
 
   const startTime = Date.now();
+
+  // Set up request logger for pipeline artifact capture
+  const detailedLoggingEnabled = await isDetailedLoggingEnabled();
+  const captureStreamChunks = getCallLogPipelineCaptureStreamChunks();
+  const reqLogger = await createRequestLogger(
+    provider || "openai",
+    "openai",
+    body.model as string,
+    {
+      enabled: detailedLoggingEnabled,
+      captureStreamChunks,
+      connectionId: connectionId || undefined,
+      model: model || body.model as string,
+      provider: provider || undefined,
+    }
+  );
+
+  // Log client raw request
+  if (clientRawRequest) {
+    reqLogger.logClientRawRequest(
+      clientRawRequest.endpoint,
+      clientRawRequest.body,
+      clientRawRequest.headers
+    );
+  }
 
   // Summarized request body for call log (avoid storing large embedding input arrays)
   const logRequestBody = {
@@ -99,8 +144,35 @@ export async function handleEmbedding({
     }
   }
 
+  // Gemini embedding models (gemini-embedding-001 / -2-preview / text-embedding-004)
+  // default to 3072-dim vectors. Clients targeting pgvector-style schemas typically
+  // request a smaller size (e.g. 1536) via OpenAI's `dimensions` field, but Google's
+  // OpenAI-compatibility shim at /v1beta/openai/embeddings does not document the
+  // `dimensions` → `outputDimensionality` translation. Mirror the request value into
+  // the Gemini-native `outputDimensionality` field so the upstream actually returns
+  // the requested vector size. Ported from upstream decolua/9router#1366.
+  if (provider === "gemini" && upstreamBody.outputDimensionality === undefined) {
+    const outputDimensionality = Number(body.dimensions);
+    if (Number.isFinite(outputDimensionality) && outputDimensionality > 0) {
+      upstreamBody.outputDimensionality = outputDimensionality;
+    }
+  }
+
+  // Inject model-level default params (e.g. NVIDIA NIM asymmetric models require
+  // `input_type`) only for keys the client did not already supply, so a
+  // client-sent value is never overwritten. Symmetric models carry no defaults
+  // and are unaffected. See issue #1378.
+  const defaultParams = getEmbeddingModelDefaultParams(providerConfig, model);
+  if (defaultParams) {
+    for (const [key, value] of Object.entries(defaultParams)) {
+      if (upstreamBody[key] === undefined) {
+        upstreamBody[key] = value;
+      }
+    }
+  }
+
   // Build headers
-  const headers = {
+  const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
 
@@ -129,6 +201,30 @@ export async function handleEmbedding({
   }
 
   try {
+    // Quota share enforcement (fail-open: errors allow the request through)
+    if (apiKeyId && connectionId && provider) {
+      try {
+        const { enforceQuotaShare } = await import("@/lib/quota/enforce");
+        const quotaDecision = await enforceQuotaShare({
+          apiKeyId,
+          connectionId,
+          provider,
+        });
+        if (quotaDecision.kind === "block") {
+          return {
+            success: false,
+            status: quotaDecision.httpStatus ?? 429,
+            error: quotaDecision.reason || "Quota share limit reached",
+          };
+        }
+      } catch {
+        // fail-open per B16
+      }
+    }
+
+    // Log provider request
+    reqLogger.logTargetRequest(providerConfig.baseUrl, headers, upstreamBody);
+
     const response = await fetch(providerConfig.baseUrl, {
       method: "POST",
       headers,
@@ -141,6 +237,18 @@ export async function handleEmbedding({
         log.error("EMBED", `${provider} error ${response.status}: ${errorText.slice(0, 200)}`);
       }
 
+      // Log provider response
+      reqLogger.logProviderResponse(response.status, "", response.headers, errorText.slice(0, 500));
+
+      // Build client error response
+      const clientErrorBody = toJsonErrorPayload(
+        errorText.slice(0, 500),
+        "Embedding provider error"
+      );
+      reqLogger.logConvertedResponse(clientErrorBody);
+
+      const pipelinePayloads = detailedLoggingEnabled ? reqLogger.getPipelinePayloads() : null;
+
       // Save error call log for Logger panel
       saveCallLog({
         method: "POST",
@@ -151,16 +259,37 @@ export async function handleEmbedding({
         duration: Date.now() - startTime,
         error: errorText.slice(0, 500),
         requestBody: logRequestBody,
+        pipelinePayloads,
+        apiKeyId,
+        apiKeyName,
+        connectionId,
       }).catch(() => {});
 
       return {
         success: false,
         status: response.status,
         error: errorText,
+        headers: stripStaleEncodingHeaders(response.headers),
       };
     }
 
     const data = await response.json();
+
+    // Log provider response
+    reqLogger.logProviderResponse(response.status, "", response.headers, data);
+
+    // Normalize response to OpenAI format
+    const normalizedResponse = {
+      object: "list",
+      data: data.data || data,
+      model: `${provider}/${model}`,
+      usage: data.usage || { prompt_tokens: 0, total_tokens: 0 },
+    };
+
+    // Log client response
+    reqLogger.logConvertedResponse(normalizedResponse);
+
+    const pipelinePayloads = detailedLoggingEnabled ? reqLogger.getPipelinePayloads() : null;
 
     // Save success call log for Logger panel
     // Embeddings only have input tokens (prompt_tokens + total_tokens), no output/completion tokens
@@ -181,22 +310,44 @@ export async function handleEmbedding({
         object: "list",
         data_count: data.data?.length || 0,
       },
+      pipelinePayloads,
+      apiKeyId,
+      apiKeyName,
+      connectionId,
     }).catch(() => {});
 
-    // Normalize response to OpenAI format
+    // Record quota consumption (fire-and-forget, never blocks)
+    if (apiKeyId && connectionId && provider) {
+      try {
+        const { scheduleRecordConsumption } = await import("@/lib/quota/spendRecorder");
+        scheduleRecordConsumption({
+          apiKeyId,
+          connectionId,
+          provider,
+          cost: {
+            tokens: data.usage?.prompt_tokens || data.usage?.total_tokens || 0,
+            requests: 1,
+          },
+        });
+      } catch {
+        // fail-open per B29
+      }
+    }
+
     return {
       success: true,
-      data: {
-        object: "list",
-        data: data.data || data,
-        model: `${provider}/${model}`,
-        usage: data.usage || { prompt_tokens: 0, total_tokens: 0 },
-      },
+      data: normalizedResponse,
+      headers: stripStaleEncodingHeaders(response.headers),
     };
   } catch (err) {
     if (log) {
       log.error("EMBED", `${provider} fetch error: ${err.message}`);
     }
+
+    // Log error
+    reqLogger.logError(err, upstreamBody);
+
+    const pipelinePayloads = detailedLoggingEnabled ? reqLogger.getPipelinePayloads() : null;
 
     // Save exception call log for Logger panel
     saveCallLog({
@@ -208,12 +359,16 @@ export async function handleEmbedding({
       duration: Date.now() - startTime,
       error: err.message,
       requestBody: logRequestBody,
+      pipelinePayloads,
+      apiKeyId,
+      apiKeyName,
+      connectionId,
     }).catch(() => {});
 
     return {
       success: false,
       status: 502,
-      error: `Embedding provider error: ${err.message}`,
+      error: `Embedding provider error: ${sanitizeErrorMessage(err.message)}`,
     };
   }
 }

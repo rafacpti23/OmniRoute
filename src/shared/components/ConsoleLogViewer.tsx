@@ -46,6 +46,7 @@ const POLL_INTERVAL = 5000; // 5 seconds
 
 export default function ConsoleLogViewer() {
   const t = useTranslations("loggers");
+  const tv = useTranslations("logs.consoleViewer");
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -70,11 +71,11 @@ export default function ConsoleLogViewer() {
       setLastUpdated(new Date());
       setError(null);
     } catch (err: any) {
-      setError(err.message || "Failed to fetch logs");
+      setError(err.message || tv("fetchFailed"));
     } finally {
       setLoading(false);
     }
-  }, [levelFilter]);
+  }, [levelFilter, tv]);
 
   // Initial fetch + polling
   useEffect(() => {
@@ -94,7 +95,7 @@ export default function ConsoleLogViewer() {
     const text = JSON.stringify(entry, null, 2);
     const success = await copyToClipboard(text);
     if (!success) {
-      setError("Failed to copy log entry");
+      setError(tv("copyFailed"));
       return;
     }
 
@@ -118,8 +119,23 @@ export default function ConsoleLogViewer() {
     }
   };
 
-  const getText = (entry: LogEntry) => entry.msg || entry.message || "";
-  const getComponent = (entry: LogEntry) => entry.component || entry.module || "";
+  const stringifyValue = (value: unknown) => {
+    if (value === undefined || value === null) return "";
+    if (typeof value === "string") return value;
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+      return String(value);
+    }
+
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  };
+
+  const getText = (entry: LogEntry) => stringifyValue(entry.msg || entry.message || "");
+  const getComponent = (entry: LogEntry) => stringifyValue(entry.component || entry.module || "");
+  const getCorrelationId = (entry: LogEntry) => stringifyValue(entry.correlationId);
 
   // Apply text search filter
   const filteredLogs = searchText
@@ -242,11 +258,12 @@ export default function ConsoleLogViewer() {
             </div>
           ) : (
             filteredLogs.map((entry, idx) => {
-              const level = (entry.level || "info").toLowerCase();
+              const level = stringifyValue(entry.level || "info").toLowerCase();
               const colorClass = LEVEL_COLORS[level] || LEVEL_COLORS.info;
               const bgClass = LEVEL_BG[level] || "";
               const comp = getComponent(entry);
               const msg = getText(entry);
+              const correlationId = getCorrelationId(entry);
 
               return (
                 <div
@@ -274,17 +291,15 @@ export default function ConsoleLogViewer() {
                   <span className="text-[#c9d1d9] flex-1 break-all">
                     {msg}
                     {/* Extra meta */}
-                    {entry.correlationId && (
-                      <span className="text-[#484f58] ml-2">
-                        cid:{entry.correlationId.slice(0, 8)}
-                      </span>
+                    {correlationId && (
+                      <span className="text-[#484f58] ml-2">cid:{correlationId.slice(0, 8)}</span>
                     )}
                   </span>
 
                   {/* Copy button */}
                   <button
                     onClick={() => handleCopy(entry, idx)}
-                    title="Copy log entry"
+                    title={tv("copyLogEntry")}
                     className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0 text-[#8b949e] hover:text-white"
                   >
                     <span className="material-symbols-outlined text-[14px]">

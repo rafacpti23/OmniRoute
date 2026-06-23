@@ -12,6 +12,8 @@ test("upstream timeout config derives hidden fetch timeouts from FETCH_TIMEOUT_M
   assert.deepEqual(config, {
     fetchTimeoutMs: 600000,
     streamIdleTimeoutMs: 600000,
+    sseHeartbeatIntervalMs: 15000,
+    streamReadinessTimeoutMs: 80000,
     fetchHeadersTimeoutMs: 600000,
     fetchBodyTimeoutMs: 600000,
     fetchConnectTimeoutMs: 30000,
@@ -29,6 +31,7 @@ test("REQUEST_TIMEOUT_MS becomes the common timeout baseline when specific overr
 
   assert.equal(upstreamConfig.fetchTimeoutMs, 600000);
   assert.equal(upstreamConfig.streamIdleTimeoutMs, 600000);
+  assert.equal(upstreamConfig.streamReadinessTimeoutMs, 600000);
   assert.equal(upstreamConfig.fetchHeadersTimeoutMs, 600000);
   assert.equal(upstreamConfig.fetchBodyTimeoutMs, 600000);
   assert.equal(apiBridgeConfig.proxyTimeoutMs, 600000);
@@ -40,12 +43,14 @@ test("upstream timeout config honors explicit overrides and falls back on invali
     REQUEST_TIMEOUT_MS: "550000",
     FETCH_TIMEOUT_MS: "600000",
     STREAM_IDLE_TIMEOUT_MS: "600000",
+    STREAM_READINESS_TIMEOUT_MS: "90000",
     FETCH_HEADERS_TIMEOUT_MS: "610000",
     FETCH_BODY_TIMEOUT_MS: "0",
     FETCH_CONNECT_TIMEOUT_MS: "45000",
     FETCH_KEEPALIVE_TIMEOUT_MS: "-1",
   });
 
+  assert.equal(config.streamReadinessTimeoutMs, 90000);
   assert.equal(config.fetchHeadersTimeoutMs, 610000);
   assert.equal(config.fetchBodyTimeoutMs, 0);
   assert.equal(config.fetchConnectTimeoutMs, 45000);
@@ -92,4 +97,43 @@ test("API bridge timeouts align request timeout with long proxy timeout by defau
     serverKeepAliveTimeoutMs: 5000,
     serverSocketTimeoutMs: 0,
   });
+});
+
+test("idle timeout default stays at 10min (600_000) for slow-thinking model safety", () => {
+  // NOTE: PR #2233 originally lowered this to 300_000, but the reviewer asked to keep
+  // the legacy default (slow thinking models, long Anthropic extended-thinking runs).
+  // The heartbeat-shape change is preserved; only the idle-timeout default revert remains.
+  assert.equal(runtimeTimeouts.DEFAULT_STREAM_IDLE_TIMEOUT_MS, 600_000);
+  assert.equal(runtimeTimeouts.getUpstreamTimeoutConfig({}).streamIdleTimeoutMs, 600_000);
+});
+
+test("heartbeat interval default = 15s, env-overridable", () => {
+  assert.equal(runtimeTimeouts.DEFAULT_SSE_HEARTBEAT_INTERVAL_MS, 15_000);
+  assert.equal(runtimeTimeouts.getUpstreamTimeoutConfig({}).sseHeartbeatIntervalMs, 15_000);
+  assert.equal(
+    runtimeTimeouts.getUpstreamTimeoutConfig({ SSE_HEARTBEAT_INTERVAL_MS: "8000" })
+      .sseHeartbeatIntervalMs,
+    8_000
+  );
+  assert.equal(
+    runtimeTimeouts.getUpstreamTimeoutConfig({ SSE_HEARTBEAT_INTERVAL_MS: "0" })
+      .sseHeartbeatIntervalMs,
+    0
+  );
+});
+
+test("API bridge proxy timeout defaults to the long upstream request window", () => {
+  const config = runtimeTimeouts.getApiBridgeTimeoutConfig({});
+
+  assert.equal(config.proxyTimeoutMs, 600000);
+  assert.equal(config.serverRequestTimeoutMs, 600000);
+});
+
+test("REQUEST_TIMEOUT_MS=0 disables API bridge proxy and request timeouts consistently", () => {
+  const config = runtimeTimeouts.getApiBridgeTimeoutConfig({
+    REQUEST_TIMEOUT_MS: "0",
+  });
+
+  assert.equal(config.proxyTimeoutMs, 0);
+  assert.equal(config.serverRequestTimeoutMs, 0);
 });

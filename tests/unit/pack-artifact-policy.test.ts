@@ -10,18 +10,24 @@ import {
   findMissingArtifactPaths,
   findUnexpectedArtifactPaths,
   normalizeArtifactPath,
-} from "../../scripts/pack-artifact-policy.ts";
+} from "../../scripts/build/pack-artifact-policy.ts";
 
 test("normalizeArtifactPath normalizes slashes and leading relative markers", () => {
   assert.equal(
-    normalizeArtifactPath("./app\\scripts\\scratch\\test.js"),
-    "app/scripts/scratch/test.js"
+    normalizeArtifactPath("./app\\scripts\\ad-hoc\\test.js"),
+    "app/scripts/ad-hoc/test.js"
   );
 });
 
 test("findUnexpectedArtifactPaths flags staged app files outside the allowlist", () => {
   const unexpectedPaths = findUnexpectedArtifactPaths(
-    ["package-lock.json", "scripts/sync-env.mjs", "server.js"],
+    [
+      "open-sse/services/compression/engines/rtk/filters/generic-output.json",
+      "open-sse/services/compression/rules/en/filler.json",
+      "package-lock.json",
+      "scripts/dev/sync-env.mjs",
+      "server.js",
+    ],
     {
       exactPaths: APP_STAGING_ALLOWED_EXACT_PATHS,
       prefixPaths: APP_STAGING_ALLOWED_PATH_PREFIXES,
@@ -33,34 +39,68 @@ test("findUnexpectedArtifactPaths flags staged app files outside the allowlist",
 
 test("findUnexpectedArtifactPaths flags app pack files outside the allowlist", () => {
   const unexpectedPaths = findUnexpectedArtifactPaths(
-    ["app/server.js", "app/scripts/sync-env.mjs", "app/scripts/prepublish.mjs", "docs/extra.md"],
+    [
+      "dist/open-sse/services/compression/engines/rtk/filters/generic-output.json",
+      "dist/open-sse/services/compression/rules/en/filler.json",
+      "dist/server.js",
+      "dist/scripts/dev/sync-env.mjs",
+      "dist/scripts/build/prepublish.mjs",
+      "docs/extra.md",
+    ],
     {
       exactPaths: PACK_ARTIFACT_ALLOWED_EXACT_PATHS,
       prefixPaths: PACK_ARTIFACT_ALLOWED_PATH_PREFIXES,
     }
   );
 
-  assert.deepEqual(unexpectedPaths, ["app/scripts/prepublish.mjs", "docs/extra.md"]);
+  assert.deepEqual(unexpectedPaths, ["dist/scripts/build/prepublish.mjs", "docs/extra.md"]);
+});
+
+test("webdav-handler.mjs is allowed in staging dist/ (server-ws.mjs dependency, missed in 3.8.22 build)", () => {
+  const unexpectedPaths = findUnexpectedArtifactPaths(["webdav-handler.mjs"], {
+    exactPaths: APP_STAGING_ALLOWED_EXACT_PATHS,
+    prefixPaths: APP_STAGING_ALLOWED_PATH_PREFIXES,
+  });
+  assert.deepEqual(unexpectedPaths, []);
+});
+
+test("setupPolyfill.ts is allowed in the tarball (bin/omniroute.mjs imports it at startup)", () => {
+  const unexpectedPaths = findUnexpectedArtifactPaths(["open-sse/utils/setupPolyfill.ts"], {
+    exactPaths: PACK_ARTIFACT_ALLOWED_EXACT_PATHS,
+    prefixPaths: PACK_ARTIFACT_ALLOWED_PATH_PREFIXES,
+  });
+
+  assert.deepEqual(unexpectedPaths, []);
 });
 
 test("findMissingArtifactPaths flags missing root runtime files in the tarball", () => {
   const missingPaths = findMissingArtifactPaths(
     [
-      "app/server.js",
+      "dist/server.js",
       "bin/omniroute.mjs",
       "package.json",
-      "scripts/postinstall.mjs",
-      "scripts/postinstallSupport.mjs",
+      "scripts/build/postinstall.mjs",
+      "scripts/build/postinstallSupport.mjs",
     ],
     PACK_ARTIFACT_REQUIRED_PATHS
   );
 
+  // findMissingArtifactPaths returns the missing required paths sorted
+  // alphabetically (bin/ < dist/ < scripts/ < src/), minus the paths present
+  // above (dist/server.js, bin/omniroute.mjs, package.json, the postinstall scripts).
   assert.deepEqual(missingPaths, [
-    "app/responses-ws-proxy.mjs",
-    "app/server-ws.mjs",
+    "bin/cli/program.mjs",
     "bin/mcp-server.mjs",
     "bin/nodeRuntimeSupport.mjs",
-    "scripts/native-binary-compat.mjs",
+    "dist/http-method-guard.cjs",
+    "dist/open-sse/services/compression/engines/rtk/filters/generic-output.json",
+    "dist/open-sse/services/compression/rules/en/filler.json",
+    "dist/peer-stamp.mjs",
+    "dist/responses-ws-proxy.mjs",
+    "dist/server-ws.mjs",
+    "dist/webdav-handler.mjs",
+    "scripts/build/colocateOptionals.mjs",
+    "scripts/build/native-binary-compat.mjs",
     "src/shared/utils/nodeRuntimeSupport.ts",
   ]);
 });

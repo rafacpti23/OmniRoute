@@ -37,8 +37,8 @@ export default function Card({
       className={cn(
         "card-root",
         "bg-surface",
-        "border border-black/5 dark:border-white/5",
-        "rounded-lg shadow-sm",
+        "border border-border",
+        "rounded-card shadow-sm",
         hover && "hover:shadow-md hover:border-primary/30 transition-all cursor-pointer",
         paddings[padding],
         className
@@ -66,15 +66,19 @@ export default function Card({
   );
 }
 
+interface CardSectionProps extends React.HTMLAttributes<HTMLDivElement> {
+  children?: React.ReactNode;
+}
+
 // Sub-component: Bordered section inside Card
-Card.Section = function CardSection({ children, className, ...props }) {
+Card.Section = function CardSection({ children, className, ...props }: CardSectionProps) {
   return (
     <div
       className={cn(
         "card-section",
         "p-4 rounded-lg",
         "bg-black/[0.02] dark:bg-white/[0.02]",
-        "border border-black/5 dark:border-white/5",
+        "border border-border",
         className
       )}
       {...props}
@@ -84,14 +88,18 @@ Card.Section = function CardSection({ children, className, ...props }) {
   );
 };
 
+interface CardRowProps extends React.HTMLAttributes<HTMLDivElement> {
+  children?: React.ReactNode;
+}
+
 // Sub-component: Hoverable row inside Card
-Card.Row = function CardRow({ children, className, ...props }) {
+Card.Row = function CardRow({ children, className, ...props }: CardRowProps) {
   return (
     <div
       className={cn(
         "card-row",
         "p-3 -mx-3 px-3 transition-colors",
-        "border-b border-black/5 dark:border-white/5 last:border-b-0",
+        "border-b border-border last:border-b-0",
         "hover:bg-black/[0.02] dark:hover:bg-white/[0.02]",
         className
       )}
@@ -102,8 +110,18 @@ Card.Row = function CardRow({ children, className, ...props }) {
   );
 };
 
+interface CardListItemProps extends React.HTMLAttributes<HTMLDivElement> {
+  children?: React.ReactNode;
+  actions?: React.ReactNode;
+}
+
 // Sub-component: List item with hover actions (macOS style)
-Card.ListItem = function CardListItem({ children, actions, className, ...props }) {
+Card.ListItem = function CardListItem({
+  children,
+  actions,
+  className,
+  ...props
+}: CardListItemProps) {
   return (
     <div
       className={cn(

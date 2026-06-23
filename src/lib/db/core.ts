@@ -4,20 +4,29 @@
  * All domain modules import `getDbInstance` and helpers from here.
  */
 
-import Database from "better-sqlite3";
+import type { SqliteAdapter } from "./adapters/types";
+import {
+  tryOpenSync,
+  getSqlJsAdapter,
+  preInitSqlJs,
+  openDatabaseAsync,
+} from "./adapters/driverFactory";
 import path from "path";
 import fs from "fs";
 import { resolveDataDir, getLegacyDotDataDir } from "../dataPaths";
 import { runMigrations } from "./migrationRunner";
 import { runDbHealthCheck } from "./healthCheck";
+import { resetAllDbModuleState } from "./stateReset";
 import { parseStoredPayload } from "../logPayloads";
 import {
   buildArtifactRelativePath,
   writeCallArtifact,
   type CallLogArtifact,
 } from "../usage/callLogArtifacts";
+import { migrateLegacyEncryptedString } from "./encryption";
+import { invalidateDbCache } from "./readCache";
 
-type SqliteDatabase = import("better-sqlite3").Database;
+type SqliteDatabase = SqliteAdapter;
 type JsonRecord = Record<string, unknown>;
 type CheckpointMode = "PASSIVE" | "FULL" | "RESTART" | "TRUNCATE";
 type PreservedTableSnapshot = {
@@ -59,7 +68,12 @@ export const SQLITE_FILE = isCloud ? null : path.join(DATA_DIR, "storage.sqlite"
 const JSON_DB_FILE = isCloud ? null : path.join(DATA_DIR, "db.json");
 export const DB_BACKUPS_DIR = isCloud ? null : path.join(DATA_DIR, "db_backups");
 const DEFAULT_CRITICAL_TABLE_ROW_LIMIT = 10_000;
-const SKIP_PRESERVE_NAMESPACES = new Set(["syncedAvailableModels", "providerLimitsCache", "lkgp"]);
+const SKIP_PRESERVE_NAMESPACES = new Set([
+  "syncedAvailableModels",
+  "providerLimitsCache",
+  "lkgp",
+  "gemini_thought_signatures",
+]);
 const CRITICAL_DB_TABLES: CriticalTableSpec[] = [
   {
     table: "key_value",
@@ -91,6 +105,54 @@ const CRITICAL_DB_TABLES: CriticalTableSpec[] = [
   { table: "upstream_proxy_config", maxRows: 5_000 },
   { table: "webhooks", maxRows: 5_000 },
 ];
+
+export function isNativeSqliteLoadError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = getErrorCode(error);
+  return (
+    message.includes("Module did not self-register") ||
+    message.includes("NODE_MODULE_VERSION") ||
+    message.includes("ERR_DLOPEN_FAILED") ||
+    // bun and similar runtimes that skip the postinstall script never download
+    // the prebuilt *.node binary, so `bindings()` fails with this message
+    // before any DLOPEN even happens (#2358).
+    message.includes("Could not locate the bindings file") ||
+    message.includes("Cannot find module 'better-sqlite3'") ||
+    code === "ERR_DLOPEN_FAILED" ||
+    code === "MODULE_NOT_FOUND"
+  );
+}
+
+export function isSqliteDriverUnavailableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+
+  return (
+    message.includes("Nenhum driver SQLite disponível") ||
+    message.includes("Chame ensureDbInitialized() no startup") ||
+    message.includes("sql.js WASM ainda não foi pré-inicializado")
+  );
+}
+
+function getErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function openSqliteDatabase(sqliteFile: string, options?: Record<string, unknown>): SqliteDatabase {
+  const adapter = tryOpenSync(sqliteFile, options);
+  if (adapter) return adapter;
+
+  const sqlJs = getSqlJsAdapter(sqliteFile);
+  if (sqlJs) return sqlJs;
+
+  throw new Error(
+    `[DB] Nenhum driver SQLite disponível para '${sqliteFile}'. ` +
+      "Chame ensureDbInitialized() no startup. " +
+      "Drivers testados: better-sqlite3 (falhou), node:sqlite (indisponível). " +
+      "sql.js WASM ainda não foi pré-inicializado."
+  );
+}
 
 // Ensure data directory exists — with fallback for restricted home directories (#133)
 if (!isCloud && !fs.existsSync(DATA_DIR)) {
@@ -147,6 +209,10 @@ const SCHEMA_SQL = `
     last_used_at TEXT,
     "group" TEXT,
     max_concurrent INTEGER,
+    proxy_enabled INTEGER NOT NULL DEFAULT 1,
+    per_key_proxy_enabled INTEGER NOT NULL DEFAULT 0,
+    quota_window_thresholds_json TEXT,
+    rate_limit_overrides_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -161,6 +227,9 @@ const SCHEMA_SQL = `
     prefix TEXT,
     api_type TEXT,
     base_url TEXT,
+    chat_path TEXT,
+    models_path TEXT,
+    custom_headers_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -209,6 +278,7 @@ const SCHEMA_SQL = `
     tokens_cache_read INTEGER DEFAULT 0,
     tokens_cache_creation INTEGER DEFAULT 0,
     tokens_reasoning INTEGER DEFAULT 0,
+    service_tier TEXT DEFAULT 'standard',
     status TEXT,
     success INTEGER DEFAULT 1,
     latency_ms INTEGER DEFAULT 0,
@@ -237,6 +307,7 @@ const SCHEMA_SQL = `
     tokens_cache_read INTEGER DEFAULT NULL,
     tokens_cache_creation INTEGER DEFAULT NULL,
     tokens_reasoning INTEGER DEFAULT NULL,
+    tokens_compressed INTEGER DEFAULT NULL,
     cache_source TEXT DEFAULT "upstream",
     request_type TEXT,
     source_format TEXT,
@@ -350,6 +421,22 @@ const SCHEMA_SQL = `
   );
   CREATE INDEX IF NOT EXISTS idx_sc_sig ON semantic_cache(signature);
   CREATE INDEX IF NOT EXISTS idx_sc_model ON semantic_cache(model);
+
+  CREATE TABLE IF NOT EXISTS quota_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    window_key TEXT NOT NULL,
+    remaining_percentage REAL,
+    is_exhausted INTEGER DEFAULT 0,
+    next_reset_at TEXT,
+    window_duration_ms INTEGER,
+    raw_data TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_quota_snapshots_provider_time ON quota_snapshots(provider, created_at);
+  CREATE INDEX IF NOT EXISTS idx_quota_snapshots_connection_time ON quota_snapshots(connection_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_quota_snapshots_created_at ON quota_snapshots(created_at);
 `;
 
 // ──────────────── Column Mapping ────────────────
@@ -376,13 +463,34 @@ export function rowToCamel(row: unknown): JsonRecord | null {
   const result: JsonRecord = {};
   for (const [k, v] of Object.entries(row as JsonRecord)) {
     const camelKey = toCamelCase(k);
-    if (camelKey === "isActive" || camelKey === "rateLimitProtection") {
+    if (
+      camelKey === "isActive" ||
+      camelKey === "rateLimitProtection" ||
+      camelKey === "proxyEnabled" ||
+      camelKey === "perKeyProxyEnabled"
+    ) {
       result[camelKey] = v === 1 || v === true;
     } else if (camelKey === "providerSpecificData" && typeof v === "string") {
       try {
         result[camelKey] = JSON.parse(v);
       } catch {
         result[camelKey] = v;
+      }
+    } else if (camelKey.endsWith("Json")) {
+      // Convention: any column with a `_json` suffix is JSON-encoded TEXT.
+      // Surface the parsed object under the friendlier name (key minus the
+      // "Json" suffix) — e.g. quotaWindowThresholdsJson → quotaWindowThresholds.
+      // A NULL/absent column normalizes to `baseKey: null` (not the suffixed
+      // key) so read and write paths expose a consistent shape.
+      const baseKey = camelKey.slice(0, -"Json".length);
+      if (typeof v === "string") {
+        try {
+          result[baseKey] = JSON.parse(v);
+        } catch {
+          result[baseKey] = null;
+        }
+      } else {
+        result[baseKey] = v == null ? null : v;
       }
     } else {
       result[camelKey] = v;
@@ -406,7 +514,7 @@ export function cleanNulls(obj: unknown): JsonRecord {
 // Module-level `let` resets on every webpack recompile, causing connection leaks.
 
 declare global {
-  var __omnirouteDb: import("better-sqlite3").Database | undefined;
+  var __omnirouteDb: SqliteAdapter | undefined;
 }
 
 function getDb(): SqliteDatabase | null {
@@ -451,6 +559,26 @@ function ensureProviderConnectionsColumns(db: SqliteDatabase) {
       db.exec("ALTER TABLE provider_connections ADD COLUMN max_concurrent INTEGER");
       console.log("[DB] Added provider_connections.max_concurrent column");
     }
+    if (!columnNames.has("proxy_enabled")) {
+      db.exec(
+        "ALTER TABLE provider_connections ADD COLUMN proxy_enabled INTEGER NOT NULL DEFAULT 1"
+      );
+      console.log("[DB] Added provider_connections.proxy_enabled column");
+    }
+    if (!columnNames.has("per_key_proxy_enabled")) {
+      db.exec(
+        "ALTER TABLE provider_connections ADD COLUMN per_key_proxy_enabled INTEGER NOT NULL DEFAULT 0"
+      );
+      console.log("[DB] Added provider_connections.per_key_proxy_enabled column");
+    }
+    if (!columnNames.has("quota_window_thresholds_json")) {
+      db.exec("ALTER TABLE provider_connections ADD COLUMN quota_window_thresholds_json TEXT");
+      console.log("[DB] Added provider_connections.quota_window_thresholds_json column");
+    }
+    if (!columnNames.has("rate_limit_overrides_json")) {
+      db.exec("ALTER TABLE provider_connections ADD COLUMN rate_limit_overrides_json TEXT");
+      console.log("[DB] Added provider_connections.rate_limit_overrides_json column");
+    }
     db.exec(
       "CREATE INDEX IF NOT EXISTS idx_pc_max_concurrent ON provider_connections(provider, max_concurrent)"
     );
@@ -483,6 +611,16 @@ function ensureUsageHistoryColumns(db: SqliteDatabase) {
       db.exec("ALTER TABLE usage_history ADD COLUMN error_code TEXT");
       console.log("[DB] Added usage_history.error_code column");
     }
+    if (!columnNames.has("service_tier")) {
+      db.exec("ALTER TABLE usage_history ADD COLUMN service_tier TEXT DEFAULT 'standard'");
+      console.log("[DB] Added usage_history.service_tier column");
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_uh_service_tier ON usage_history(service_tier)");
+    if (!columnNames.has("combo_strategy")) {
+      db.exec("ALTER TABLE usage_history ADD COLUMN combo_strategy TEXT DEFAULT 'direct'");
+      console.log("[DB] Added usage_history.combo_strategy column");
+    }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_uh_combo_strategy ON usage_history(combo_strategy)");
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn("[DB] Failed to verify usage_history schema:", message);
@@ -616,17 +754,22 @@ function summarizeSkippedTables(tables: SkippedTableSnapshot[]): string {
 function listProbeFailureBackups(sqliteFile: string): string[] {
   const directory = path.dirname(sqliteFile);
   const baseName = path.basename(sqliteFile);
+  const prefix = `${baseName}.probe-failed-`;
   if (!fs.existsSync(directory)) return [];
 
   return fs
     .readdirSync(directory)
-    .filter((name) => name.startsWith(`${baseName}.probe-failed-`))
-    .map((name) => path.join(directory, name))
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => ({
+      path: path.join(directory, name),
+      timestamp: Number(name.slice(prefix.length)),
+    }))
     .sort((left, right) => {
-      const leftMtime = fs.statSync(left).mtimeMs;
-      const rightMtime = fs.statSync(right).mtimeMs;
-      return rightMtime - leftMtime;
-    });
+      const leftTimestamp = Number.isFinite(left.timestamp) ? left.timestamp : 0;
+      const rightTimestamp = Number.isFinite(right.timestamp) ? right.timestamp : 0;
+      return rightTimestamp - leftTimestamp || right.path.localeCompare(left.path);
+    })
+    .map((backup) => backup.path);
 }
 
 function captureCriticalDbState(sqliteFile: string): PreservedCriticalDbState {
@@ -644,7 +787,7 @@ function captureCriticalDbState(sqliteFile: string): PreservedCriticalDbState {
 
   let probe: SqliteDatabase | null = null;
   try {
-    probe = new Database(sqliteFile, { readonly: true });
+    probe = openSqliteDatabase(sqliteFile, { readonly: true });
 
     for (const tableSpec of CRITICAL_DB_TABLES) {
       if (!hasTable(probe, tableSpec.table)) continue;
@@ -771,6 +914,7 @@ function offloadLegacyCallLogDetails(db: SqliteDatabase) {
     tokens_cache_read: number | null;
     tokens_cache_creation: number | null;
     tokens_reasoning: number | null;
+    tokens_compressed: number | null;
     request_type: string | null;
     source_format: string | null;
     target_format: string | null;
@@ -822,7 +966,7 @@ function offloadLegacyCallLogDetails(db: SqliteDatabase) {
   const tx = db.transaction(() => {
     for (const row of pendingRows) {
       const artifact: CallLogArtifact = {
-        schemaVersion: 4,
+        schemaVersion: 5,
         summary: {
           id: row.id,
           timestamp: row.timestamp || new Date().toISOString(),
@@ -841,6 +985,7 @@ function offloadLegacyCallLogDetails(db: SqliteDatabase) {
             cacheRead: row.tokens_cache_read ?? null,
             cacheWrite: row.tokens_cache_creation ?? null,
             reasoning: row.tokens_reasoning ?? null,
+            compressed: row.tokens_compressed ?? null,
           },
           requestType: row.request_type || null,
           sourceFormat: row.source_format || null,
@@ -909,7 +1054,7 @@ function shouldRunStartupDbHealthCheck(): boolean {
   return !isAutomatedTestProcess();
 }
 
-function createHealthCheckBackup(db: SqliteDatabase): boolean {
+function createManagedDbBackup(db: SqliteDatabase, reason: string): boolean {
   const isTest = isAutomatedTestProcess();
   if (isTest) return false;
 
@@ -920,17 +1065,70 @@ function createHealthCheckBackup(db: SqliteDatabase): boolean {
     }
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const backupPath = path.join(backupDir, `db_${timestamp}_health-check-repair.sqlite`);
+    const backupPath = path.join(backupDir, `db_${timestamp}_${reason}.sqlite`);
     const escapedBackupPath = backupPath.replace(/'/g, "''");
 
     db.exec(`VACUUM INTO '${escapedBackupPath}'`);
-    console.log(`[DB] Health-check backup created: ${backupPath}`);
+    console.log(`[DB] Backup created (${reason}): ${backupPath}`);
     return true;
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    console.warn("[DB] Failed to create health-check backup:", message);
+    console.warn(`[DB] Failed to create ${reason} backup:`, message);
     return false;
   }
+}
+
+function createHealthCheckBackup(db: SqliteDatabase): boolean {
+  return createManagedDbBackup(db, "health-check-repair");
+}
+
+function autoMigrateLegacyEncryptedConnections(db: SqliteDatabase): number {
+  const rows = db.prepare("SELECT * FROM provider_connections").all() as JsonRecord[];
+  const updateStmt = db.prepare(
+    "UPDATE provider_connections SET api_key = @apiKey, id_token = @idToken, access_token = @accessToken, refresh_token = @refreshToken, updated_at = @updatedAt WHERE id = @id"
+  );
+  const encryptedFields = ["apiKey", "idToken", "accessToken", "refreshToken"] as const;
+  let migratedCount = 0;
+  let backupCreated = false;
+
+  for (const row of rows) {
+    const camelRow = rowToCamel(row);
+    if (!camelRow) continue;
+
+    let updatedRow = false;
+    for (const field of encryptedFields) {
+      if (typeof camelRow[field] !== "string") continue;
+
+      const { updated, value } = migrateLegacyEncryptedString(camelRow[field]);
+      if (updated) {
+        camelRow[field] = value;
+        updatedRow = true;
+      }
+    }
+
+    if (!updatedRow) continue;
+    if (!backupCreated) {
+      createManagedDbBackup(db, "legacy-encryption-migration");
+      backupCreated = true;
+    }
+
+    updateStmt.run({
+      id: camelRow.id,
+      apiKey: camelRow.apiKey ?? null,
+      idToken: camelRow.idToken ?? null,
+      accessToken: camelRow.accessToken ?? null,
+      refreshToken: camelRow.refreshToken ?? null,
+      updatedAt: new Date().toISOString(),
+    });
+    migratedCount++;
+  }
+
+  if (migratedCount > 0) {
+    invalidateDbCache("connections");
+    console.log(`[DB] Auto-migrated ${migratedCount} connection(s) to new static-salt encryption.`);
+  }
+
+  return migratedCount;
 }
 
 let dbHealthCheckTimer: NodeJS.Timeout | null = null;
@@ -965,6 +1163,7 @@ function startDbHealthCheckScheduler(db: SqliteDatabase) {
       if (!db.open) return;
       runDbHealthCheck(db, {
         autoRepair: true,
+        skipIntegrityCheck: process.env.OMNIROUTE_SKIP_DB_HEALTHCHECK === "1",
         expectedSchemaVersion: "1",
         createBackupBeforeRepair: () => createHealthCheckBackup(db),
       });
@@ -993,11 +1192,12 @@ export function getDbInstance(): SqliteDatabase {
     if (isBuildPhase) {
       console.log("[DB] Build phase detected — using in-memory SQLite (read-only)");
     }
-    const memoryDb = new Database(":memory:");
+    const memoryDb = openSqliteDatabase(":memory:");
     memoryDb.pragma("journal_mode = WAL");
     memoryDb.exec(SCHEMA_SQL);
     ensureUsageHistoryColumns(memoryDb);
     ensureCallLogsColumns(memoryDb);
+    ensureProviderConnectionsColumns(memoryDb);
     setDb(memoryDb);
     return memoryDb;
   }
@@ -1009,11 +1209,20 @@ export function getDbInstance(): SqliteDatabase {
   const jsonDbFile = JSON_DB_FILE;
   const probeFailureBackups = listProbeFailureBackups(sqliteFile);
   if (!fs.existsSync(sqliteFile) && probeFailureBackups.length > 0) {
-    throw new Error(
-      `[DB] Manual recovery required before startup. ` +
-        `Detected preserved database from a previous probe failure: ${probeFailureBackups[0]}. ` +
-        `Restore the preserved file or another backup to ${sqliteFile} before restarting.`
-    );
+    const latestBackup = probeFailureBackups[0];
+    try {
+      fs.renameSync(latestBackup, sqliteFile);
+      console.log(
+        `[DB] Auto-restored preserved database from previous probe failure: ${path.basename(latestBackup)}`
+      );
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `[DB] Manual recovery required before startup. ` +
+          `Failed to auto-restore preserved database ${latestBackup}: ${msg}. ` +
+          `Restore the preserved file or another backup to ${sqliteFile} before restarting.`
+      );
+    }
   }
 
   let preservedCriticalState: PreservedCriticalDbState = {
@@ -1025,30 +1234,6 @@ export function getDbInstance(): SqliteDatabase {
   let failedProbePath: string | null = null;
   let failedProbeMessage: string | null = null;
 
-  if (fs.existsSync(sqliteFile)) {
-    preservedCriticalState = captureCriticalDbState(sqliteFile);
-    if (preservedCriticalState.captureSucceeded) {
-      if (preservedCriticalState.preservedTables.length > 0) {
-        console.log(
-          `[DB] Preserved critical DB state before potential recreation: ${summarizePreservedTables(
-            preservedCriticalState.preservedTables
-          )}`
-        );
-      }
-      if (preservedCriticalState.skippedTables.length > 0) {
-        console.warn(
-          `[DB] Critical DB tables skipped during preservation: ${summarizeSkippedTables(
-            preservedCriticalState.skippedTables
-          )}`
-        );
-      }
-    } else if (preservedCriticalState.captureError) {
-      console.warn(
-        `[DB] Could not preserve critical DB state before recreation: ${preservedCriticalState.captureError}`
-      );
-    }
-  }
-
   // Track whether the DB file is brand new (fresh DATA_DIR / Docker volume).
   // This is needed so the migration runner skips the mass-migration safety abort
   // that would otherwise trigger because heuristic seeding marks some migrations
@@ -1059,7 +1244,7 @@ export function getDbInstance(): SqliteDatabase {
   // Uses a single probe connection that becomes the real connection when possible.
   if (fs.existsSync(sqliteFile)) {
     try {
-      const probe = new Database(sqliteFile, { readonly: true });
+      const probe = openSqliteDatabase(sqliteFile, { readonly: true });
       const hasOldSchema = probe
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'")
         .get();
@@ -1080,7 +1265,7 @@ export function getDbInstance(): SqliteDatabase {
           console.log(
             `[DB] Old schema_migrations table found but data exists — preserving data (#146)`
           );
-          const fixDb = new Database(sqliteFile);
+          const fixDb = openSqliteDatabase(sqliteFile);
           try {
             fixDb.exec("DROP TABLE IF EXISTS schema_migrations");
             fixDb.pragma("wal_checkpoint(TRUNCATE)");
@@ -1113,13 +1298,13 @@ export function getDbInstance(): SqliteDatabase {
 
       // If the error is a Node module/ABI failure, throw it immediately to avoid renaming the database
       if (
-        message.includes("Module did not self-register") ||
-        message.includes("could not be found") ||
-        message.includes("ERR_DLOPEN_FAILED") ||
-        (e as any)?.code === "ERR_DLOPEN_FAILED"
+        isNativeSqliteLoadError(e) ||
+        isSqliteDriverUnavailableError(e) ||
+        message.includes("could not be found")
       ) {
         throw e;
       }
+      preservedCriticalState = captureCriticalDbState(sqliteFile);
 
       // SAFETY: Never delete the database — rename to backup so data can be recovered.
       // The old code would silently destroy all user data on any probe failure.
@@ -1151,10 +1336,16 @@ export function getDbInstance(): SqliteDatabase {
     }
   }
 
-  const db = new Database(sqliteFile);
+  const db = openSqliteDatabase(sqliteFile);
   db.pragma("journal_mode = WAL");
-  db.pragma("busy_timeout = 5000");
+  // better-sqlite3 is synchronous, so a contended write parks the Node event loop for up to
+  // busy_timeout ms (a 0-CPU freeze that stacks under load → /health stops responding). The
+  // hot-path writers here (usage_history, call_logs) are best-effort and the WinUI host opens
+  // the same DB, so cap the block at 2s instead of 5s: normal writes complete in <1ms, and a
+  // contended op can no longer freeze the loop past the host watchdog's 6s liveness probe.
+  db.pragma("busy_timeout = 2000");
   db.pragma("synchronous = NORMAL");
+  db.pragma("cache_size = -2048");
   db.exec(SCHEMA_SQL);
   ensureProviderConnectionsColumns(db);
   ensureUsageHistoryColumns(db);
@@ -1172,89 +1363,9 @@ export function getDbInstance(): SqliteDatabase {
     INSERT OR IGNORE INTO _omniroute_migrations (version, name)
     VALUES ('001', 'initial_schema');
   `);
-  if (hasColumn(db, "combos", "sort_order")) {
-    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
-      "020",
-      "combo_sort_order"
-    );
-  }
-  if (hasColumn(db, "provider_connections", "max_concurrent")) {
-    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
-      "029",
-      "provider_connection_max_concurrent"
-    );
-  }
-  if (hasColumn(db, "call_logs", "request_type")) {
-    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
-      "007",
-      "search_request_type"
-    );
-  }
-  if (hasColumn(db, "call_logs", "requested_model")) {
-    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
-      "009",
-      "requested_model"
-    );
-  }
-  if (
-    hasColumn(db, "call_logs", "tokens_cache_read") &&
-    hasColumn(db, "call_logs", "tokens_cache_creation") &&
-    hasColumn(db, "call_logs", "tokens_reasoning")
-  ) {
-    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
-      "018",
-      "call_logs_detailed_tokens"
-    );
-  }
-  if (
-    hasColumn(db, "call_logs", "combo_step_id") &&
-    hasColumn(db, "call_logs", "combo_execution_key")
-  ) {
-    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
-      "021",
-      "combo_call_log_targets"
-    );
-  }
-  const hasCacheSource = hasColumn(db, "call_logs", "cache_source");
-  if (hasCacheSource) {
-    const cacheSourceLegacy = db
-      .prepare("SELECT version FROM _omniroute_migrations WHERE version = ? AND name = ?")
-      .get("022", "call_logs_cache_source") as { version?: string } | undefined;
-    if (cacheSourceLegacy) {
-      const cacheSourceCurrent = db
-        .prepare("SELECT version FROM _omniroute_migrations WHERE version = ?")
-        .get("026") as { version?: string } | undefined;
-      if (cacheSourceCurrent) {
-        db.prepare("DELETE FROM _omniroute_migrations WHERE version = ? AND name = ?").run(
-          "022",
-          "call_logs_cache_source"
-        );
-      } else {
-        db.prepare(
-          "UPDATE _omniroute_migrations SET version = ?, name = ? WHERE version = ? AND name = ?"
-        ).run("026", "call_logs_cache_source", "022", "call_logs_cache_source");
-      }
-    }
-    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
-      "026",
-      "call_logs_cache_source"
-    );
-  }
-  if (
-    hasColumn(db, "call_logs", "detail_state") &&
-    hasColumn(db, "call_logs", "request_summary") &&
-    hasColumn(db, "call_logs", "has_request_body") &&
-    hasColumn(db, "call_logs", "has_response_body") &&
-    !hasColumn(db, "call_logs", "request_body") &&
-    !hasColumn(db, "call_logs", "response_body") &&
-    !hasColumn(db, "call_logs", "error")
-  ) {
-    db.prepare("INSERT OR IGNORE INTO _omniroute_migrations (version, name) VALUES (?, ?)").run(
-      "025",
-      "call_logs_summary_storage"
-    );
-  }
+
   runMigrations(db, { isNewDb });
+
   offloadLegacyCallLogDetails(db);
 
   // Auto-migrate from db.json if exists
@@ -1292,17 +1403,52 @@ export function getDbInstance(): SqliteDatabase {
   );
   versionStmt.run();
   if (shouldRunStartupDbHealthCheck()) {
+    const skipIntegrityCheck = process.env.OMNIROUTE_SKIP_DB_HEALTHCHECK === "1";
+    if (skipIntegrityCheck) {
+      console.log("[DB] Health check skipped (OMNIROUTE_SKIP_DB_HEALTHCHECK=1)");
+    }
     runDbHealthCheck(db, {
       autoRepair: true,
       expectedSchemaVersion: "1",
+      skipIntegrityCheck,
       createBackupBeforeRepair: () => createHealthCheckBackup(db),
     });
   }
 
   setDb(db);
+
+  // Re-encrypt any tokens using the legacy dynamic salt to canonical static salt
+  try {
+    autoMigrateLegacyEncryptedConnections(db);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[DB] Legacy encryption migration failed: ${message}`);
+  }
+
   startDbHealthCheckScheduler(db);
-  console.log(`[DB] SQLite database ready: ${sqliteFile}`);
+  // Log the resolved absolute DATA_DIR + SQLITE_FILE once at init so a
+  // multi-replica / Docker volume-topology mismatch (each replica opening a
+  // different on-disk DB → "phantom"/missing combos & connections) is
+  // diagnosable straight from the logs. (#3147)
+  console.log(
+    `[DB] SQLite database ready: ${sqliteFile} ` +
+      `(DATA_DIR=${path.resolve(DATA_DIR)}, SQLITE_FILE=${path.resolve(sqliteFile)})`
+  );
   return db;
+}
+
+/**
+ * Lightweight liveness probe — runs `SELECT 1` against the singleton DB.
+ * Returns `true` if the database is reachable, `false` on any error.
+ * Intended for use by the `/api/health/ping` route (Hard Rule #5: no raw SQL in routes).
+ */
+export function pingDb(): boolean {
+  try {
+    const result = getDbInstance().prepare("SELECT 1 AS ok").get() as { ok: number } | undefined;
+    return result?.ok === 1;
+  } catch {
+    return false;
+  }
 }
 
 export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | null }): boolean {
@@ -1328,6 +1474,12 @@ export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | nu
       if (db.open) db.close();
     } finally {
       setDb(null);
+      // Module-level caches (prepared statements, schema-check memos — e.g.
+      // apiKeys.ts) are bound to the closed connection. Without this, a recreated
+      // DB (tests, backup restore of an older snapshot) hits "no such column"
+      // on the stale re-prepare path. backup.ts already does this on restore;
+      // close/reset must too (found by the 6A.1 orphan-test re-wire, 2026-06-09).
+      resetAllDbModuleState();
     }
   }
 
@@ -1339,6 +1491,54 @@ export function closeDbInstance(options?: { checkpointMode?: CheckpointMode | nu
  */
 export function resetDbInstance() {
   closeDbInstance();
+}
+
+// ──────────────── Runtime Driver Info ────────────────
+
+type DbDriverInfo = { source: string; kind: string };
+let driverInfoCached: DbDriverInfo | null = null;
+
+function setDriverInfo(info: DbDriverInfo) {
+  driverInfoCached = info;
+}
+
+/** Returns how better-sqlite3 was resolved (bundled / runtime / etc.). Null if not yet init. */
+export function getDriverInfo(): DbDriverInfo | null {
+  return driverInfoCached;
+}
+
+/**
+ * Async initializer that pre-resolves the SQLite runtime before first DB access.
+ *
+ * Call this at process startup (before any call to getDbInstance()) so that
+ * if the bundled better-sqlite3 binary is unavailable, the runtime installer
+ * can place it in ~/.omniroute/runtime/ without blocking a synchronous caller.
+ *
+ * Idempotent — safe to call multiple times.
+ */
+export async function ensureDbInitialized(): Promise<void> {
+  if (getDb()) return;
+
+  // Cloud/build: getDbInstance() cria in-memory, sem necessidade de pré-init
+  if (isCloud || isBuildPhase || !SQLITE_FILE) {
+    getDbInstance();
+    return;
+  }
+
+  // Tenta drivers síncronos primeiro
+  const sync = tryOpenSync(SQLITE_FILE);
+  if (sync) {
+    // Drivers síncronos disponíveis — fechar o probe, getDbInstance() vai abrir com setup completo
+    sync.close();
+    getDbInstance();
+    return;
+  }
+
+  // Nenhum driver síncrono — pré-inicializar sql.js (WASM, async)
+  console.warn("[DB] Pré-inicializando sql.js WASM (drivers síncronos indisponíveis)...");
+  await preInitSqlJs(SQLITE_FILE);
+  // Agora getSqlJsAdapter() retornará o adapter, e getDbInstance() vai usá-lo
+  getDbInstance();
 }
 
 // ──────────────── JSON → SQLite Migration ────────────────
@@ -1532,4 +1732,98 @@ function migrateFromJson(db: SqliteDatabase, jsonPath: string) {
   } catch (err) {
     console.error("[DB] Migration from db.json failed:", err.message);
   }
+}
+
+// ──────────────── Auto-Vacuum Management ────────────────
+
+export function setAutoVacuum(mode: "NONE" | "FULL" | "INCREMENTAL"): void {
+  const db = getDbInstance();
+
+  const currentMode = db.pragma("auto_vacuum", { simple: true }) as number;
+  const modeMap: Record<string, number> = {
+    NONE: 0,
+    FULL: 1,
+    INCREMENTAL: 2,
+  };
+
+  const targetMode = modeMap[mode];
+
+  if (currentMode === targetMode) {
+    console.log(`[DB] auto_vacuum already set to ${mode}`);
+    return;
+  }
+
+  console.log(`[DB] Changing auto_vacuum from ${currentMode} to ${mode} (${targetMode})`);
+
+  db.pragma(`auto_vacuum = ${targetMode}`);
+
+  db.exec("VACUUM");
+
+  const newMode = db.pragma("auto_vacuum", { simple: true }) as number;
+  console.log(`[DB] auto_vacuum changed to ${newMode}`);
+}
+
+export function getAutoVacuumMode(): "NONE" | "FULL" | "INCREMENTAL" {
+  const db = getDbInstance();
+  const mode = db.pragma("auto_vacuum", { simple: true }) as number;
+
+  const modeMap: Record<number, "NONE" | "FULL" | "INCREMENTAL"> = {
+    0: "NONE",
+    1: "FULL",
+    2: "INCREMENTAL",
+  };
+
+  return modeMap[mode] || "NONE";
+}
+
+export function runManualVacuum(): { success: boolean; duration: number; error?: string } {
+  const db = getDbInstance();
+  const startTime = Date.now();
+
+  try {
+    console.log("[DB] Starting manual VACUUM...");
+    db.exec("VACUUM");
+    const duration = Date.now() - startTime;
+    console.log(`[DB] Manual VACUUM completed in ${duration}ms`);
+    return { success: true, duration };
+  } catch (err: unknown) {
+    const duration = Date.now() - startTime;
+    console.error("[DB] Manual VACUUM failed:", err);
+    const message = err instanceof Error ? err.message : String(err);
+    return { success: false, duration, error: message };
+  }
+}
+
+export function setPageSize(pageSize: number): void {
+  const db = getDbInstance();
+  const currentPageSize = db.pragma("page_size", { simple: true }) as number;
+
+  if (currentPageSize === pageSize) {
+    console.log(`[DB] page_size already set to ${pageSize}`);
+    return;
+  }
+
+  console.log(`[DB] Changing page_size from ${currentPageSize} to ${pageSize}`);
+  db.pragma(`page_size = ${pageSize}`);
+  db.exec("VACUUM");
+
+  const newPageSize = db.pragma("page_size", { simple: true }) as number;
+  console.log(`[DB] page_size changed to ${newPageSize}`);
+}
+
+export function setCacheSize(cacheSizeKb: number): void {
+  const db = getDbInstance();
+  const currentCacheSize = db.pragma("cache_size", { simple: true }) as number;
+  const targetCacheSize = -cacheSizeKb;
+
+  if (currentCacheSize === targetCacheSize) {
+    console.log(`[DB] cache_size already set to ${cacheSizeKb}KB`);
+    return;
+  }
+
+  console.log(`[DB] Changing cache_size from ${Math.abs(currentCacheSize)}KB to ${cacheSizeKb}KB`);
+  db.pragma(`cache_size = ${targetCacheSize}`);
+
+  const newCacheSize = db.pragma("cache_size", { simple: true }) as number;
+  console.log(`[DB] cache_size changed to ${Math.abs(newCacheSize)}KB`);
 }

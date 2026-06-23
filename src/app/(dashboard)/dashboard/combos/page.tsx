@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import dynamic from "next/dynamic";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import Button from "@/shared/components/Button";
 import Card from "@/shared/components/Card";
@@ -11,8 +12,8 @@ import Input from "@/shared/components/Input";
 import Modal from "@/shared/components/Modal";
 import Toggle from "@/shared/components/Toggle";
 import Tooltip from "@/shared/components/Tooltip";
-import EmailPrivacyToggle from "@/shared/components/EmailPrivacyToggle";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
+import { FieldLabelWithHelp, WeightTotalBar } from "./parts";
 import { pickDisplayValue } from "@/shared/utils/maskEmail";
 import useEmailPrivacyStore from "@/store/emailPrivacyStore";
 import { useNotificationStore } from "@/store/notificationStore";
@@ -34,6 +35,7 @@ import {
   resolveComboBuilderProviderId,
 } from "@/lib/combos/builderDraft";
 import { normalizeComboConfigMode } from "@/shared/constants/comboConfigMode";
+import AutoComboCatalog from "./AutoComboCatalog";
 import BuilderIntelligentStep from "./BuilderIntelligentStep";
 import IntelligentComboPanel from "./IntelligentComboPanel";
 import {
@@ -52,8 +54,8 @@ const ProxyConfigModal = dynamic(() => import("@/shared/components/ProxyConfigMo
   ssr: false,
 });
 
-// Validate combo name: letters, numbers, -, _, /, .
-const VALID_NAME_REGEX = /^[a-zA-Z0-9_/.-]+$/;
+// Validate combo name: letters, numbers, spaces, -, _, /, ., [ and ].
+const VALID_NAME_REGEX = /^[a-zA-Z0-9_/.\-\[\] ]+$/;
 
 const STRATEGY_OPTIONS = ROUTING_STRATEGIES.map((strategy) => ({
   value: strategy.value,
@@ -64,11 +66,14 @@ const STRATEGY_OPTIONS = ROUTING_STRATEGIES.map((strategy) => ({
 
 const STRATEGY_LABEL_FALLBACK = {
   "context-relay": "Context Relay",
+  "reset-aware": "Reset-Aware RR",
 };
 
 const STRATEGY_DESC_FALLBACK = {
   "context-relay":
     "Priority-style routing with automatic context handoffs when account rotation happens.",
+  "reset-aware":
+    "Quota remaining and reset windows decide the order; similar scores rotate round-robin.",
 };
 
 const STRATEGY_GUIDANCE_FALLBACK = {
@@ -107,6 +112,11 @@ const STRATEGY_GUIDANCE_FALLBACK = {
     when: "Use when minimizing cost is the top priority.",
     avoid: "Avoid when pricing data is missing or outdated.",
     example: "Example: Batch or background jobs where lower cost matters most.",
+  },
+  "reset-aware": {
+    when: "Use when multiple accounts with quota telemetry have different reset windows.",
+    avoid: "Avoid when quota telemetry is unavailable for most accounts.",
+    example: "Example: Prefer a 60% weekly account resetting tomorrow over 80% that resets later.",
   },
   "fill-first": {
     when: "Use when you want to drain one provider's quota fully before moving to the next.",
@@ -147,6 +157,20 @@ const ADVANCED_FIELD_HELP_FALLBACK = {
     "Round-robin combo/model limit: max simultaneous requests sent to each model target. This is separate from any provider account-only cap.",
   queueTimeout:
     "How long a request can wait for a round-robin model slot before timing out. This queue is separate from any account-only concurrency cap.",
+  stickyLimit:
+    "Round-robin sticky batch size: consecutive successful requests sent to one target before rotating to the next. Empty inherits the global Sticky Limit setting; 1 disables batching (pure one-request rotation).",
+  stickyWeightedLimit:
+    "Weighted sticky batch size: consecutive successful requests sent to the selected weighted target before drawing again. Empty or 1 keeps the current per-request weighted draw.",
+  failoverBeforeRetry:
+    "When enabled, a 429 from the upstream triggers immediate target failover instead of retrying the same URL first.",
+  targetTimeoutMs:
+    "Optional combo target timeout. Empty inherits the current request timeout; larger values are capped to that timeout.",
+  maxSetRetries:
+    "Number of times to retry the full target set when every target fails. 0 = no set-level retry.",
+  setRetryDelayMs:
+    "Delay between set-level retry attempts, giving transient issues time to resolve.",
+  nestedComboMode:
+    "How references to other combos are handled. Flatten expands a combo ref into this combo's target list (legacy). Execute treats a combo ref as a black-box target: the parent strategy selects the child combo, then the child runs its own strategy and retries.",
 };
 
 const LEGACY_COMBO_RESILIENCE_KEYS = new Set([
@@ -154,6 +178,20 @@ const LEGACY_COMBO_RESILIENCE_KEYS = new Set([
   "healthCheckEnabled",
   "healthCheckTimeoutMs",
 ]);
+const MS_PER_SECOND = 1000;
+
+function msToOptionalSecondsInput(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  return String(Math.round(ms / MS_PER_SECOND));
+}
+
+function secondsInputToOptionalMs(value, maxSeconds = 86400) {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+  return Math.min(maxSeconds, Math.round(seconds)) * MS_PER_SECOND;
+}
 
 function sanitizeComboRuntimeConfig(config) {
   if (!config || typeof config !== "object") return {};
@@ -228,6 +266,15 @@ const STRATEGY_RECOMMENDATIONS_FALLBACK = {
       "Ensure pricing coverage for all selected models.",
       "Keep a quality fallback for hard prompts.",
       "Use for batch/background jobs where cost is the main KPI.",
+    ],
+  },
+  "reset-aware": {
+    title: "Reset-aware account rotation",
+    description: "Balances remaining provider quota against reset timing.",
+    tips: [
+      "Use explicit account steps or account-tag routing for providers with quota telemetry.",
+      "Tune session vs weekly weights when short-term exhaustion is more risky.",
+      "Keep the tie band small so equivalent accounts still rotate fairly.",
     ],
   },
   "fill-first": {
@@ -439,6 +486,7 @@ function getStrategyBadgeClass(strategy) {
   if (strategy === "random") return "bg-purple-500/15 text-purple-600 dark:text-purple-400";
   if (strategy === "least-used") return "bg-cyan-500/15 text-cyan-600 dark:text-cyan-400";
   if (strategy === "cost-optimized") return "bg-teal-500/15 text-teal-600 dark:text-teal-400";
+  if (strategy === "reset-aware") return "bg-lime-500/15 text-lime-700 dark:text-lime-300";
   if (strategy === "fill-first") return "bg-orange-500/15 text-orange-600 dark:text-orange-400";
   if (strategy === "p2c") return "bg-indigo-500/15 text-indigo-600 dark:text-indigo-400";
   return "bg-blue-500/15 text-blue-600 dark:text-blue-400";
@@ -606,6 +654,7 @@ export default function CombosPage() {
   const [comboDragOverIndex, setComboDragOverIndex] = useState(null);
   const [savingComboOrder, setSavingComboOrder] = useState(false);
   const [comboConfigMode, setComboConfigMode] = useState("guided");
+  const [promptCompressionEnabled, setPromptCompressionEnabled] = useState(false);
   const [selectedIntelligentComboId, setSelectedIntelligentComboId] = useState<string | null>(null);
   const comboDragIndexRef = useRef<number | null>(null);
   const activeFilter = normalizeIntelligentRoutingFilter(searchParams.get("filter"));
@@ -650,6 +699,10 @@ export default function CombosPage() {
       .then((r) => (r.ok ? r.json() : null))
       .then((settings) => setComboConfigMode(normalizeComboConfigMode(settings?.comboConfigMode)))
       .catch(() => setComboConfigMode("guided"));
+    fetch("/api/settings/compression")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((settings) => setPromptCompressionEnabled(settings?.enabled === true))
+      .catch(() => setPromptCompressionEnabled(false));
     fetch("/api/settings/proxy")
       .then((r) => (r.ok ? r.json() : null))
       .then((c) => setProxyConfig(c))
@@ -679,7 +732,7 @@ export default function CombosPage() {
       const metricsData = await metricsRes.json();
       const nodesData = nodesRes.ok ? await nodesRes.json() : { nodes: [] };
 
-      if (combosRes.ok) setCombos(combosData.combos || []);
+      if (combosRes.ok) setCombos((combosData.combos || []).filter((c) => !c.isHidden));
       if (providersRes.ok) {
         const active = (providersData.connections || []).filter(
           (c) => c.testStatus === "active" || c.testStatus === "success"
@@ -927,33 +980,8 @@ export default function CombosPage() {
           <h1 className="text-2xl font-semibold">{t("title")}</h1>
           <p className="text-sm text-text-muted mt-1">{t("description")}</p>
         </div>
+
         <div className="flex flex-wrap items-center gap-2">
-          <div className="inline-flex items-center gap-2 rounded-lg border border-black/8 dark:border-white/8 bg-black/[0.02] dark:bg-white/[0.02] px-2.5 py-1.5">
-            <span className="hidden lg:inline text-xs text-text-muted">
-              {getI18nOrFallback(
-                t,
-                "emailVisibilityHint",
-                "Account emails here follow the global privacy toggle."
-              )}
-            </span>
-            <Tooltip
-              position="bottom"
-              content={getI18nOrFallback(
-                t,
-                "emailVisibilityTooltip",
-                "Use the eye icon to reveal or hide account emails globally across combos, providers and quota screens."
-              )}
-            >
-              <span className="inline-flex">
-                <EmailPrivacyToggle size="md" />
-              </span>
-            </Tooltip>
-            <span className="text-[11px] text-text-muted">
-              {emailsVisible
-                ? getI18nOrFallback(t, "emailVisibilityStateOn", "Emails visible globally")
-                : getI18nOrFallback(t, "emailVisibilityStateOff", "Emails masked globally")}
-            </span>
-          </div>
           {!showUsageGuide && (
             <Button size="sm" variant="ghost" onClick={handleShowUsageGuide}>
               {getI18nOrFallback(t, "usageGuideShow", "Show guide")}
@@ -964,6 +992,8 @@ export default function CombosPage() {
           </Button>
         </div>
       </div>
+
+      <AutoComboCatalog />
 
       {showUsageGuide && (
         <ComboUsageGuide
@@ -1128,6 +1158,7 @@ export default function CombosPage() {
               <ComboCard
                 combo={combo}
                 metrics={metrics[combo.name]}
+                compressionEnabled={promptCompressionEnabled}
                 providerNodes={providerNodes}
                 copied={copied}
                 onCopy={copy}
@@ -1394,21 +1425,6 @@ function StrategyRecommendationsPanel({ strategy, onApply, showNudge }) {
   );
 }
 
-function FieldLabelWithHelp({ label, help, showHelp = true }) {
-  return (
-    <div className="flex items-center gap-1 mb-0.5">
-      <label className="text-[10px] text-text-muted">{label}</label>
-      {showHelp && (
-        <Tooltip content={help}>
-          <span className="material-symbols-outlined text-[12px] text-text-muted cursor-help">
-            help
-          </span>
-        </Tooltip>
-      )}
-    </div>
-  );
-}
-
 function ComboReadinessPanel({ checks, blockers, showDescription = true }) {
   const t = useTranslations("combos");
   const hasBlockers = blockers.length > 0;
@@ -1499,6 +1515,7 @@ function ComboReadinessPanel({ checks, blockers, showDescription = true }) {
 function ComboCard({
   combo,
   metrics,
+  compressionEnabled,
   copied,
   onCopy,
   onEdit,
@@ -1524,6 +1541,46 @@ function ComboCard({
   const tc = useTranslations("common");
   const emailsVisible = useEmailPrivacyStore((s) => s.emailsVisible);
   const strategyDescription = getStrategyDescription(t, strategy);
+  const hasRuntimeConfig = combo?.config && typeof combo.config === "object";
+  const initialCompressionMode =
+    typeof combo?.config?.compressionMode === "string"
+      ? combo.config.compressionMode
+      : hasRuntimeConfig
+        ? ""
+        : combo.compressionOverride || "";
+  const [compressionOverride, setCompressionOverride] = useState(initialCompressionMode);
+  const [isSavingCompression, setIsSavingCompression] = useState(false);
+
+  useEffect(() => {
+    setCompressionOverride(initialCompressionMode);
+  }, [initialCompressionMode]);
+
+  const handleCompressionOverrideChange = async (value) => {
+    setCompressionOverride(value);
+    setIsSavingCompression(true);
+    const nextConfig = { ...(combo.config || {}) };
+    if (value) {
+      nextConfig.compressionMode = value;
+    } else {
+      delete nextConfig.compressionMode;
+    }
+    try {
+      const response = await fetch(`/api/combos/${combo.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config: nextConfig }),
+      });
+      if (!response.ok) {
+        console.error("Failed to update compression override");
+        setCompressionOverride(initialCompressionMode);
+      }
+    } catch (error) {
+      console.error("Error updating compression override:", error);
+      setCompressionOverride(initialCompressionMode);
+    } finally {
+      setIsSavingCompression(false);
+    }
+  };
 
   return (
     <Card
@@ -1656,7 +1713,43 @@ function ComboCard({
               {isDisabled ? "Disabled" : "Active"}
             </span>
           </div>
-          <div className="flex items-center gap-1 transition-opacity">
+          <div className="flex items-center gap-1.5 transition-opacity">
+            {compressionEnabled && (
+              <select
+                value={compressionOverride}
+                onChange={(e) => handleCompressionOverrideChange(e.target.value)}
+                disabled={isSavingCompression}
+                className="text-xs py-1 px-2 rounded border border-black/10 dark:border-white/10 bg-surface text-text-main focus:border-primary focus:outline-none transition-colors disabled:opacity-50 max-w-[130px] md:max-w-none"
+                title={t("compressionOverride")}
+              >
+                <option value="" className="bg-surface text-text-main">
+                  Default
+                </option>
+                <option value="off" className="bg-surface text-text-main">
+                  Off
+                </option>
+                <option value="lite" className="bg-surface text-text-main">
+                  Lite
+                </option>
+                <option value="standard" className="bg-surface text-text-main">
+                  Standard
+                </option>
+                <option value="aggressive" className="bg-surface text-text-main">
+                  Aggressive
+                </option>
+                <option value="ultra" className="bg-surface text-text-main">
+                  Ultra
+                </option>
+              </select>
+            )}
+            <Link
+              href={`/dashboard/combos/${combo.id}`}
+              onClick={(e) => e.stopPropagation()}
+              className="p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary transition-colors"
+              title={getI18nOrFallback(t, "controlCenter", "Control Center")}
+            >
+              <span className="material-symbols-outlined text-[16px]">monitoring</span>
+            </Link>
             <button
               onClick={onTest}
               disabled={testing}
@@ -1806,6 +1899,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
     agentSystemMessage: string;
     agentToolFilter: string;
     agentContextCache: boolean;
+    contextLength: number | undefined;
   };
 
   const getEmptyCreateDraftSnapshot = useCallback(
@@ -1819,6 +1913,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
       agentSystemMessage: "",
       agentToolFilter: "",
       agentContextCache: false,
+      contextLength: undefined,
     }),
     []
   );
@@ -1847,6 +1942,9 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
   const [builderProviderId, setBuilderProviderId] = useState("");
   const [builderModelId, setBuilderModelId] = useState("");
   const [builderConnectionId, setBuilderConnectionId] = useState(COMBO_BUILDER_AUTO_CONNECTION);
+  // #3266: optional account allowlist — scopes an auto-selecting step's round-robin
+  // to a subset of the provider's connections. Empty = whole active pool.
+  const [builderAllowedConnectionIds, setBuilderAllowedConnectionIds] = useState<string[]>([]);
   const [manualModelInput, setManualModelInput] = useState("");
   const [manualModelError, setManualModelError] = useState("");
   const [builderComboRefName, setBuilderComboRefName] = useState("");
@@ -1862,6 +1960,10 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
   const [agentContextCache, setAgentContextCache] = useState<boolean>(
     !!combo?.context_cache_protection
   );
+  const [contextLength, setContextLength] = useState<number | undefined>(
+    combo?.context_length || undefined
+  );
+  const [contextLengthError, setContextLengthError] = useState<string>("");
   const comboBuilderStages = useMemo(() => getComboBuilderStages({ strategy }), [strategy]);
   const visibleStageMeta = useMemo(
     () => COMBO_FORM_STAGE_META.filter((stageMeta) => comboBuilderStages.includes(stageMeta.id)),
@@ -1892,11 +1994,13 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
       setConfig(nextConfig);
       setShowAdvanced(isExpertMode);
       setNameError("");
+      setContextLengthError("");
       setAgentSystemMessage(nextCombo?.system_message || "");
       setAgentToolFilter(nextCombo?.tool_filter_regex || "");
       setAgentContextCache(!!nextCombo?.context_cache_protection);
+      setContextLength(nextCombo?.context_length || undefined);
     },
-    [isExpertMode, setAgentContextCache]
+    [isExpertMode, setAgentContextCache, setContextLength]
   );
 
   useEffect(() => {
@@ -1910,6 +2014,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
       agentSystemMessage,
       agentToolFilter,
       agentContextCache,
+      contextLength,
     };
   }, [
     name,
@@ -1921,6 +2026,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
     agentSystemMessage,
     agentToolFilter,
     agentContextCache,
+    contextLength,
   ]);
 
   useEffect(() => {
@@ -1966,6 +2072,11 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
       ? selectedBuilderConnections.find((connection) => connection.id === builderConnectionId) ||
         null
       : null;
+  // Defensive: only carry allowlist ids that still belong to the selected provider's
+  // connections, so stale ids from a previous provider can never leak into a step.
+  const builderEffectiveAllowedConnectionIds = builderAllowedConnectionIds.filter((id) =>
+    selectedBuilderConnections.some((connection) => connection.id === id)
+  );
   const builderCandidateStep =
     selectedBuilderProvider && selectedBuilderModel
       ? buildPrecisionComboModelStep({
@@ -1974,6 +2085,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
           connectionId:
             builderConnectionId !== COMBO_BUILDER_AUTO_CONNECTION ? builderConnectionId : null,
           connectionLabel: selectedBuilderConnection?.label || null,
+          allowedConnectionIds: builderEffectiveAllowedConnectionIds,
         })
       : null;
   const builderHasDuplicate =
@@ -2034,6 +2146,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
   const saveBlocked =
     !name.trim() ||
     !!nameError ||
+    !!contextLengthError ||
     saving ||
     hasNoModels ||
     hasInvalidWeightedTotal ||
@@ -2140,6 +2253,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
     setBuilderProviderId("");
     setBuilderModelId("");
     setBuilderConnectionId(COMBO_BUILDER_AUTO_CONNECTION);
+    setBuilderAllowedConnectionIds([]);
     setManualModelInput("");
     setManualModelError("");
     setBuilderComboRefName("");
@@ -2176,7 +2290,8 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
           draft.nameError.length === 0 &&
           draft.agentSystemMessage.length === 0 &&
           draft.agentToolFilter.length === 0 &&
-          draft.agentContextCache === false;
+          draft.agentContextCache === false &&
+          draft.contextLength === undefined;
 
         if (!cancelled && isPristineDraft) {
           resetFormForCombo(null, data.comboDefaults || null);
@@ -2238,6 +2353,16 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
     setBuilderProviderId(nextProviderId);
     setBuilderModelId("");
     setBuilderConnectionId(COMBO_BUILDER_AUTO_CONNECTION);
+    setBuilderAllowedConnectionIds([]);
+    setBuilderError("");
+  };
+
+  const handleBuilderAllowedConnectionToggle = (connectionId: string) => {
+    setBuilderAllowedConnectionIds((prev) =>
+      prev.includes(connectionId)
+        ? prev.filter((id) => id !== connectionId)
+        : [...prev, connectionId]
+    );
     setBuilderError("");
   };
 
@@ -2285,6 +2410,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
       connectionId:
         builderConnectionId !== COMBO_BUILDER_AUTO_CONNECTION ? builderConnectionId : null,
       connectionLabel: selectedBuilderConnection?.label || null,
+      allowedConnectionIds: builderEffectiveAllowedConnectionIds,
     });
 
     if (hasExactModelStepDuplicate(models, nextStep)) {
@@ -2301,6 +2427,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
     const nextModels = [...models, nextStep];
     setModels(nextModels);
     setBuilderError("");
+    setBuilderAllowedConnectionIds([]);
     setBuilderConnectionId(
       findNextSuggestedConnectionId(
         nextModels,
@@ -2375,7 +2502,19 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
   };
 
   const handleAddModel = (model) => {
-    const nextEntry = { model: model.value, weight: 0 };
+    const qualifiedModel = typeof model?.value === "string" ? model.value : "";
+    const parsedModel = parseQualifiedModel(qualifiedModel);
+    const resolvedProviderId =
+      resolveComboBuilderProviderId(model?.providerId, builderProviders) ||
+      resolveComboBuilderProviderId(parsedModel?.providerId, builderProviders) ||
+      (typeof model?.providerId === "string" && model.providerId.trim()) ||
+      parsedModel?.providerId ||
+      null;
+    const nextEntry = {
+      model: qualifiedModel,
+      ...(resolvedProviderId ? { providerId: resolvedProviderId } : {}),
+      weight: 0,
+    };
     if (hasExactModelStepDuplicate(models, nextEntry)) {
       setBuilderError(
         getI18nOrFallback(
@@ -2392,6 +2531,24 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
 
   const handleRemoveModel = (index) => {
     setModels(models.filter((_, i) => i !== index));
+  };
+
+  // Upstream PR decolua/9router#889 (Fajar Hidayat): clicking a model that is
+  // already in the combo, inside ModelSelectModal, deselects it in place. We
+  // strip every step whose qualified model matches — duplicates with a
+  // different providerId/weight that point at the same model id are all
+  // removed (matches upstream JS semantics which filtered by a single-string
+  // identity).
+  const handleDeselectModel = (model) => {
+    const value =
+      typeof model?.value === "string"
+        ? model.value
+        : typeof model === "string"
+          ? model
+          : "";
+    if (!value) return;
+    setModels(models.filter((m) => m.model !== value));
+    setBuilderError("");
   };
 
   const handleWeightChange = (index, weight) => {
@@ -2452,7 +2609,7 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
       handleAutoBalance();
     }
 
-    if (strategy === "round-robin") {
+    if (strategy === "round-robin" || strategy === "weighted") {
       setShowAdvanced(true);
     }
 
@@ -2573,8 +2730,15 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
       if (config.concurrencyPerModel !== undefined)
         configToSave.concurrencyPerModel = config.concurrencyPerModel;
       if (config.queueTimeoutMs !== undefined) configToSave.queueTimeoutMs = config.queueTimeoutMs;
+      if (config.stickyRoundRobinLimit !== undefined)
+        configToSave.stickyRoundRobinLimit = config.stickyRoundRobinLimit;
     }
-    if (Object.keys(configToSave).length > 0) {
+    if (strategy === "weighted" && config.stickyWeightedLimit !== undefined) {
+      configToSave.stickyWeightedLimit = config.stickyWeightedLimit;
+    }
+    const hasConfigToSave = Object.keys(configToSave).length > 0;
+    const hadExistingConfig = Object.keys(sanitizeComboRuntimeConfig(combo?.config)).length > 0;
+    if (hasConfigToSave || (isEdit && hadExistingConfig)) {
       saveData.config = configToSave;
     }
 
@@ -2585,6 +2749,28 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
     else delete saveData.tool_filter_regex;
     if (agentContextCache) saveData.context_cache_protection = true;
     else delete saveData.context_cache_protection;
+
+    // Validate and save context_length
+    if (contextLength !== undefined && contextLength !== null) {
+      const ctxLen = Number(contextLength);
+      if (isNaN(ctxLen) || !Number.isInteger(ctxLen)) {
+        setContextLengthError(t("agentFeaturesContextLengthErrorInteger"));
+        setSaving(false);
+        return;
+      }
+      if (ctxLen >= 1000 && ctxLen <= 2000000) {
+        saveData.context_length = ctxLen;
+      } else {
+        setContextLengthError(t("agentFeaturesContextLengthErrorRange"));
+        setSaving(false);
+        return;
+      }
+    } else if (isEdit) {
+      // Editing: send null to explicitly clear context_length
+      saveData.context_length = null;
+    } else {
+      delete saveData.context_length;
+    }
 
     await onSave(saveData);
     setSaving(false);
@@ -3025,6 +3211,46 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
                   </div>
                 </div>
 
+                {builderConnectionId === COMBO_BUILDER_AUTO_CONNECTION &&
+                selectedBuilderConnections.length > 1 ? (
+                  <div className="mt-2 rounded-md border border-black/8 dark:border-white/8 bg-white/70 dark:bg-white/[0.03] px-2.5 py-2">
+                    <label className="text-[10px] font-medium uppercase tracking-wide text-text-muted block mb-1.5">
+                      {getI18nOrFallback(
+                        t,
+                        "builderRestrictAccounts",
+                        "Restrict to accounts (optional)"
+                      )}
+                    </label>
+                    <div className="flex flex-wrap gap-1.5" data-testid="combo-builder-allowlist">
+                      {selectedBuilderConnections.map((connection) => {
+                        const checked = builderAllowedConnectionIds.includes(connection.id);
+                        return (
+                          <button
+                            type="button"
+                            key={connection.id}
+                            onClick={() => handleBuilderAllowedConnectionToggle(connection.id)}
+                            aria-pressed={checked}
+                            className={`text-[11px] px-2 py-1 rounded border transition-colors ${
+                              checked
+                                ? "border-primary bg-primary/10 text-primary"
+                                : "border-black/10 dark:border-white/10 text-text-muted hover:border-primary/40"
+                            }`}
+                          >
+                            {pickDisplayValue([connection.label], emailsVisible, connection.label)}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[10px] text-text-muted mt-1.5">
+                      {getI18nOrFallback(
+                        t,
+                        "builderRestrictAccountsHint",
+                        "Leave empty to use the whole active pool. When selected, round-robin / weighted picks stay within this subset of accounts."
+                      )}
+                    </p>
+                  </div>
+                ) : null}
+
                 {isExpertMode ? (
                   <div className="mt-2 flex flex-wrap items-center gap-2">
                     <Button
@@ -3430,6 +3656,122 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
                         className="w-full text-xs py-1.5 px-2 rounded border border-black/10 dark:border-white/10 bg-transparent focus:border-primary focus:outline-none"
                       />
                     </div>
+                    <div>
+                      <FieldLabelWithHelp
+                        label={getI18nOrFallback(t, "targetTimeout", "Target timeout (seconds)")}
+                        help={getI18nOrFallback(
+                          t,
+                          "advancedHelp.targetTimeoutMs",
+                          ADVANCED_FIELD_HELP_FALLBACK.targetTimeoutMs
+                        )}
+                        showHelp={!isExpertMode}
+                        htmlFor="combo-target-timeout-ms"
+                      />
+                      <input
+                        id="combo-target-timeout-ms"
+                        type="number"
+                        min="1"
+                        max="86400"
+                        step="1"
+                        value={msToOptionalSecondsInput(config.targetTimeoutMs)}
+                        placeholder={getI18nOrFallback(t, "inheritRequestTimeout", "inherit")}
+                        onChange={(e) =>
+                          setConfig({
+                            ...config,
+                            targetTimeoutMs: secondsInputToOptionalMs(e.target.value),
+                          })
+                        }
+                        className="w-full text-xs py-1.5 px-2 rounded border border-black/10 dark:border-white/10 bg-transparent focus:border-primary focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                  {/* failoverBeforeRetry + maxSetRetries + setRetryDelayMs */}
+                  <div className="grid grid-cols-2 gap-2 pt-2 border-t border-black/5 dark:border-white/5">
+                    <div className="col-span-2">
+                      <div className="flex items-center gap-2 py-1">
+                        <input
+                          type="checkbox"
+                          id="failoverBeforeRetry"
+                          checked={!!config.failoverBeforeRetry}
+                          onChange={(e) =>
+                            setConfig({
+                              ...config,
+                              failoverBeforeRetry: e.target.checked || undefined,
+                            })
+                          }
+                          className="w-3.5 h-3.5 rounded border border-black/20 dark:border-white/20 accent-primary cursor-pointer"
+                        />
+                        <label
+                          htmlFor="failoverBeforeRetry"
+                          className="text-xs text-text-muted cursor-pointer select-none"
+                        >
+                          {t("failoverBeforeRetry")}
+                        </label>
+                        <Tooltip
+                          position="bottom"
+                          content={getI18nOrFallback(
+                            t,
+                            "advancedHelp.failoverBeforeRetry",
+                            ADVANCED_FIELD_HELP_FALLBACK.failoverBeforeRetry
+                          )}
+                        >
+                          <span className="material-symbols-outlined text-[12px] text-text-muted cursor-help">
+                            help
+                          </span>
+                        </Tooltip>
+                      </div>
+                    </div>
+                    <div>
+                      <FieldLabelWithHelp
+                        label={t("maxSetRetries")}
+                        help={getI18nOrFallback(
+                          t,
+                          "advancedHelp.maxSetRetries",
+                          ADVANCED_FIELD_HELP_FALLBACK.maxSetRetries
+                        )}
+                        showHelp={!isExpertMode}
+                      />
+                      <input
+                        type="number"
+                        min="0"
+                        max="10"
+                        value={config.maxSetRetries ?? ""}
+                        placeholder="0"
+                        onChange={(e) =>
+                          setConfig({
+                            ...config,
+                            maxSetRetries: e.target.value ? Number(e.target.value) : undefined,
+                          })
+                        }
+                        className="w-full text-xs py-1.5 px-2 rounded border border-black/10 dark:border-white/10 bg-transparent focus:border-primary focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <FieldLabelWithHelp
+                        label={t("setRetryDelayMs")}
+                        help={getI18nOrFallback(
+                          t,
+                          "advancedHelp.setRetryDelayMs",
+                          ADVANCED_FIELD_HELP_FALLBACK.setRetryDelayMs
+                        )}
+                        showHelp={!isExpertMode}
+                      />
+                      <input
+                        type="number"
+                        min="0"
+                        max="60000"
+                        step="500"
+                        value={config.setRetryDelayMs ?? ""}
+                        placeholder="2000"
+                        onChange={(e) =>
+                          setConfig({
+                            ...config,
+                            setRetryDelayMs: e.target.value ? Number(e.target.value) : undefined,
+                          })
+                        }
+                        className="w-full text-xs py-1.5 px-2 rounded border border-black/10 dark:border-white/10 bg-transparent focus:border-primary focus:outline-none"
+                      />
+                    </div>
                   </div>
                   {strategy === "round-robin" && (
                     <div className="grid grid-cols-2 gap-2 pt-2 border-t border-black/5 dark:border-white/5">
@@ -3486,8 +3828,96 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
                           className="w-full text-xs py-1.5 px-2 rounded border border-black/10 dark:border-white/10 bg-transparent focus:border-primary focus:outline-none"
                         />
                       </div>
+                      <div className="col-span-2">
+                        <FieldLabelWithHelp
+                          label={getI18nOrFallback(t, "stickyLimit", "Sticky Limit")}
+                          help={getI18nOrFallback(
+                            t,
+                            "advancedHelp.stickyLimit",
+                            ADVANCED_FIELD_HELP_FALLBACK.stickyLimit
+                          )}
+                          showHelp={!isExpertMode}
+                        />
+                        <input
+                          type="number"
+                          min="0"
+                          max="1000"
+                          value={config.stickyRoundRobinLimit ?? ""}
+                          placeholder={getI18nOrFallback(t, "stickyLimitInherit", "inherit")}
+                          onChange={(e) =>
+                            setConfig({
+                              ...config,
+                              stickyRoundRobinLimit: e.target.value
+                                ? Number(e.target.value)
+                                : undefined,
+                            })
+                          }
+                          className="w-full text-xs py-1.5 px-2 rounded border border-black/10 dark:border-white/10 bg-transparent focus:border-primary focus:outline-none"
+                        />
+                      </div>
                     </div>
                   )}
+                  {strategy === "weighted" && (
+                    <div className="grid grid-cols-1 gap-2 pt-2 border-t border-black/5 dark:border-white/5">
+                      <div>
+                        <FieldLabelWithHelp
+                          label={getI18nOrFallback(
+                            t,
+                            "stickyWeightedLimit",
+                            "Sticky Weighted Limit"
+                          )}
+                          help={getI18nOrFallback(
+                            t,
+                            "advancedHelp.stickyWeightedLimit",
+                            ADVANCED_FIELD_HELP_FALLBACK.stickyWeightedLimit
+                          )}
+                          showHelp={!isExpertMode}
+                        />
+                        <input
+                          type="number"
+                          min="0"
+                          max="1000"
+                          value={config.stickyWeightedLimit ?? ""}
+                          placeholder="1"
+                          onChange={(e) =>
+                            setConfig({
+                              ...config,
+                              stickyWeightedLimit: e.target.value
+                                ? Number(e.target.value)
+                                : undefined,
+                            })
+                          }
+                          className="w-full text-xs py-1.5 px-2 rounded border border-black/10 dark:border-white/10 bg-transparent focus:border-primary focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                  )}
+                  <div className="grid grid-cols-1 gap-2 pt-2 border-t border-black/5 dark:border-white/5">
+                    <div>
+                      <FieldLabelWithHelp
+                        label={getI18nOrFallback(t, "nestedComboMode", "Nested Combo Behavior")}
+                        help={getI18nOrFallback(
+                          t,
+                          "advancedHelp.nestedComboMode",
+                          ADVANCED_FIELD_HELP_FALLBACK.nestedComboMode
+                        )}
+                        showHelp={!isExpertMode}
+                      />
+                      <select
+                        value={config.nestedComboMode ?? "flatten"}
+                        onChange={(e) =>
+                          setConfig({
+                            ...config,
+                            nestedComboMode: e.target.value === "execute" ? "execute" : "flatten",
+                          })
+                        }
+                        className="w-full text-xs py-1.5 px-2 rounded border border-black/10 dark:border-white/10 bg-surface-1 focus:border-primary focus:outline-none"
+                      >
+                        <option value="flatten">Flatten nested combos</option>
+                        <option value="execute">Execute nested combos as targets</option>
+                      </select>
+                    </div>
+                  </div>
                   {strategy === "context-relay" && (
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-2 pt-2 border-t border-black/5 dark:border-white/5">
                       <div>
@@ -3696,6 +4126,56 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
                   onChange={(e) => setAgentContextCache(e.target.checked)}
                   className="accent-primary shrink-0"
                 />
+              </div>
+
+              {/* Context Length */}
+              <div>
+                <label className="text-[11px] font-medium text-text-muted block mb-0.5">
+                  {getI18nOrFallback(t, "agentFeaturesContextLength", "Context length")}
+                </label>
+                <input
+                  type="number"
+                  min="1000"
+                  max="2000000"
+                  step="1000"
+                  value={contextLength || ""}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setContextLengthError("");
+                    if (value === "") {
+                      setContextLength(undefined);
+                      return;
+                    }
+                    const num = Number(value);
+                    if (isNaN(num) || !Number.isInteger(num)) {
+                      setContextLengthError(t("agentFeaturesContextLengthErrorInteger"));
+                      // Keep the raw input value so the user can correct it
+                    } else if (num < 1000 || num > 2000000) {
+                      setContextLengthError(t("agentFeaturesContextLengthErrorRange"));
+                      setContextLength(num);
+                    } else {
+                      setContextLength(num);
+                    }
+                  }}
+                  placeholder={getI18nOrFallback(
+                    t,
+                    "agentFeaturesContextLengthPlaceholder",
+                    "e.g. 128000"
+                  )}
+                  className="w-full text-xs py-1.5 px-2 rounded border border-black/10 dark:border-white/10 bg-transparent focus:border-primary focus:outline-none"
+                />
+                {contextLengthError && (
+                  <p className="text-[10px] text-red-500 mt-0.5">{contextLengthError}</p>
+                )}
+                {!contextLengthError && !isExpertMode && (
+                  <p className="text-[10px] text-text-muted mt-0.5">
+                    {getI18nOrFallback(
+                      t,
+                      "agentFeaturesContextLengthHint",
+                      "Defines the context window for this combo in /v1/models."
+                    )}
+                  </p>
+                )}
               </div>
             </div>
           )}
@@ -3946,70 +4426,18 @@ function ComboFormModal({ isOpen, combo, onClose, onSave, activeProviders, combo
         isOpen={showModelSelect}
         onClose={() => setShowModelSelect(false)}
         onSelect={handleAddModel}
+        onDeselect={handleDeselectModel}
         activeProviders={activeProviders}
         modelAliases={modelAliases}
         title={t("addModelToCombo")}
         selectedModel={null}
         addedModelValues={models.map((m) => m.model)}
+        keepOpenOnSelect
       />
     </>
   );
 }
 
 // ─────────────────────────────────────────────
-// Weight Total Bar
-// ─────────────────────────────────────────────
-function WeightTotalBar({ models }) {
-  const total = models.reduce((sum, m) => sum + (m.weight || 0), 0);
-  const isValid = total === 100;
-  const colors = [
-    "bg-blue-500",
-    "bg-emerald-500",
-    "bg-amber-500",
-    "bg-purple-500",
-    "bg-rose-500",
-    "bg-cyan-500",
-    "bg-orange-500",
-    "bg-indigo-500",
-  ];
-
-  return (
-    <div className="mt-1.5">
-      {/* Visual bar */}
-      <div className="h-1.5 rounded-full bg-black/5 dark:bg-white/5 overflow-hidden flex">
-        {models.map((m, i) => {
-          if (!m.weight) return null;
-          return (
-            <div
-              key={i}
-              className={`${colors[i % colors.length]} transition-all duration-300`}
-              style={{ width: `${Math.min(m.weight, 100)}%` }}
-            />
-          );
-        })}
-      </div>
-      <div className="flex items-center justify-between mt-0.5">
-        <div className="flex gap-1">
-          {models.map(
-            (m, i) =>
-              m.weight > 0 && (
-                <span key={i} className="flex items-center gap-0.5 text-[9px] text-text-muted">
-                  <span
-                    className={`inline-block w-1.5 h-1.5 rounded-full ${colors[i % colors.length]}`}
-                  />
-                  {m.weight}%
-                </span>
-              )
-          )}
-        </div>
-        <span
-          className={`text-[10px] font-medium ${
-            isValid ? "text-emerald-500" : total > 100 ? "text-red-500" : "text-amber-500"
-          }`}
-        >
-          {total}%{!isValid && total > 0 && " ≠ 100%"}
-        </span>
-      </div>
-    </div>
-  );
-}
+// WeightTotalBar moved to ./WeightTotalBar.tsx (re-exported via ./parts).
+// PR-1 of diegosouzapw/OmniRoute#3932 — pure presentational component.

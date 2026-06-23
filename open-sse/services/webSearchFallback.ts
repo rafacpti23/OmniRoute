@@ -109,18 +109,37 @@ function buildFallbackParameters(tool: JsonRecord): JsonRecord {
   };
 }
 
-function buildFallbackTool(tool: JsonRecord): JsonRecord {
+function buildFallbackTool(tool: JsonRecord, targetFormat?: string | null): JsonRecord {
+  const name = OMNIROUTE_WEB_SEARCH_FALLBACK_TOOL_NAME;
+  const description = buildFallbackDescription(tool);
+  const parameters = buildFallbackParameters(tool);
+
+  // Responses API expects FLAT function tools ({ type, name, parameters }), whereas
+  // Chat Completions expects NESTED ({ type, function: { name, parameters } }). On the
+  // Responses→Responses passthrough path nothing flattens the injected tool, so a nested
+  // shape reaches the upstream as `tools[0].function.name` and is rejected with
+  // "Missing required parameter: 'tools[0].name'." (issue #2390).
+  if (targetFormat === FORMATS.OPENAI_RESPONSES) {
+    return { type: "function", name, description, parameters };
+  }
+
   return {
     type: "function",
-    function: {
-      name: OMNIROUTE_WEB_SEARCH_FALLBACK_TOOL_NAME,
-      description: buildFallbackDescription(tool),
-      parameters: buildFallbackParameters(tool),
-    },
+    function: { name, description, parameters },
   };
 }
 
+// Providers whose endpoint advertises Claude/Anthropic format but does NOT implement
+// Anthropic's typed server tools (web_search_20250305, …). For these the Claude -> Claude
+// bypass below must NOT apply: forwarding the native server tool makes the upstream 400
+// (MiniMax returns `invalid params, function name or parameters is empty (2013)`), so the
+// built-in web-search tool has to be converted to the omniroute_web_search function
+// fallback — which these models accept as a normal function tool (#4481).
+const CLAUDE_FORMAT_PROVIDERS_WITHOUT_SERVER_TOOLS = new Set(["minimax"]);
+
 export function supportsNativeWebSearchFallbackBypass({
+  provider,
+  sourceFormat,
   targetFormat,
   nativeCodexPassthrough,
 }: {
@@ -129,8 +148,20 @@ export function supportsNativeWebSearchFallbackBypass({
   targetFormat: string | null | undefined;
   nativeCodexPassthrough: boolean;
 }): boolean {
+  // Native Codex (OpenAI Responses) passthrough: the upstream runs web search itself.
   if (nativeCodexPassthrough) return true;
-  return targetFormat === FORMATS.GEMINI;
+  // Gemini target: the Gemini translator maps built-in web search to googleSearch natively.
+  if (targetFormat === FORMATS.GEMINI) return true;
+  // Claude -> Claude passthrough: the Anthropic Messages upstream (e.g. a Claude
+  // subscription driven by Claude Code) natively runs web_search_20250305. Forward the
+  // native tool untouched instead of rewriting it to omniroute_web_search. Mirrors the
+  // Codex/Gemini bypasses so every native-web-search provider is treated symmetrically.
+  if (sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.CLAUDE) {
+    // …except Anthropic-compatible providers that don't actually implement server tools.
+    if (provider && CLAUDE_FORMAT_PROVIDERS_WITHOUT_SERVER_TOOLS.has(provider)) return false;
+    return true;
+  }
+  return false;
 }
 
 export function prepareWebSearchFallbackBody<T extends JsonRecord>(
@@ -182,8 +213,12 @@ export function prepareWebSearchFallbackBody<T extends JsonRecord>(
     return true;
   });
 
+  const isResponsesTarget = options.targetFormat === FORMATS.OPENAI_RESPONSES;
+
   if (!toolNames.has(OMNIROUTE_WEB_SEARCH_FALLBACK_TOOL_NAME)) {
-    preservedTools.unshift(buildFallbackTool(toRecord(builtInSearchTools[0])));
+    preservedTools.unshift(
+      buildFallbackTool(toRecord(builtInSearchTools[0]), options.targetFormat)
+    );
   }
 
   const nextBody: T = {
@@ -192,10 +227,12 @@ export function prepareWebSearchFallbackBody<T extends JsonRecord>(
   };
 
   if (isBuiltInWebSearchToolChoice(body.tool_choice)) {
-    nextBody.tool_choice = {
-      type: "function",
-      function: { name: OMNIROUTE_WEB_SEARCH_FALLBACK_TOOL_NAME },
-    } as T["tool_choice"];
+    // Match the injected tool shape: flat for Responses API, nested for Chat Completions.
+    nextBody.tool_choice = (
+      isResponsesTarget
+        ? { type: "function", name: OMNIROUTE_WEB_SEARCH_FALLBACK_TOOL_NAME }
+        : { type: "function", function: { name: OMNIROUTE_WEB_SEARCH_FALLBACK_TOOL_NAME } }
+    ) as T["tool_choice"];
   }
 
   return {

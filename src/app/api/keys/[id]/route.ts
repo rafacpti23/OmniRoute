@@ -10,6 +10,7 @@ import { syncToCloud } from "@/lib/cloudSync";
 import { updateKeyPermissionsSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import * as log from "@/sse/utils/logger";
 
 // GET /api/keys/[id] - Get single API key
 export async function GET(request, { params }) {
@@ -31,7 +32,7 @@ export async function GET(request, { params }) {
       key: keyValue ? keyValue.slice(0, 8) + "****" + keyValue.slice(-4) : null,
     });
   } catch (error) {
-    console.log("Error fetching key:", error);
+    log.error("keys", "Error fetching key", error);
     return NextResponse.json({ error: "Failed to fetch key" }, { status: 500 });
   }
 }
@@ -65,23 +66,52 @@ export async function PATCH(request, { params }) {
     const {
       name,
       allowedModels,
+      blockedModels,
+      allowedCombos,
       allowedConnections,
       noLog,
       autoResolve,
       isActive,
+      throttleDelayMs,
+      isBanned,
+      expiresAt,
       maxSessions,
       accessSchedule,
+      rateLimits,
+      scopes,
+      allowedEndpoints,
+      streamDefaultMode,
+      disableNonPublicModels,
+      allowUsageCommand,
+      usageLimitEnabled,
+      dailyUsageLimitUsd,
+      weeklyUsageLimitUsd,
     } = validation.data;
 
     const payload: Parameters<typeof updateApiKeyPermissions>[1] = {};
     if (name !== undefined) payload.name = name;
     if (allowedModels !== undefined) payload.allowedModels = allowedModels;
+    if (blockedModels !== undefined) payload.blockedModels = blockedModels;
+    if (allowedCombos !== undefined) payload.allowedCombos = allowedCombos;
     if (allowedConnections !== undefined) payload.allowedConnections = allowedConnections;
     if (noLog !== undefined) payload.noLog = noLog;
     if (autoResolve !== undefined) payload.autoResolve = autoResolve;
     if (isActive !== undefined) payload.isActive = isActive;
+    if (throttleDelayMs !== undefined) payload.throttleDelayMs = throttleDelayMs;
+    if (isBanned !== undefined) payload.isBanned = isBanned;
+    if (expiresAt !== undefined) payload.expiresAt = expiresAt;
     if (maxSessions !== undefined) payload.maxSessions = maxSessions;
     if (accessSchedule !== undefined) payload.accessSchedule = accessSchedule;
+    if (rateLimits !== undefined) payload.rateLimits = rateLimits;
+    if (scopes !== undefined) payload.scopes = scopes;
+    if (allowedEndpoints !== undefined) payload.allowedEndpoints = allowedEndpoints;
+    if (streamDefaultMode !== undefined) payload.streamDefaultMode = streamDefaultMode;
+    if (disableNonPublicModels !== undefined)
+      payload.disableNonPublicModels = disableNonPublicModels;
+    if (allowUsageCommand !== undefined) payload.allowUsageCommand = allowUsageCommand;
+    if (usageLimitEnabled !== undefined) payload.usageLimitEnabled = usageLimitEnabled;
+    if (dailyUsageLimitUsd !== undefined) payload.dailyUsageLimitUsd = dailyUsageLimitUsd;
+    if (weeklyUsageLimitUsd !== undefined) payload.weeklyUsageLimitUsd = weeklyUsageLimitUsd;
 
     const updated = await updateApiKeyPermissions(id, payload);
     if (!updated) {
@@ -95,15 +125,29 @@ export async function PATCH(request, { params }) {
       message: "API key settings updated successfully",
       ...(name !== undefined && { name }),
       ...(allowedModels !== undefined && { allowedModels }),
+      ...(blockedModels !== undefined && { blockedModels }),
+      ...(allowedCombos !== undefined && { allowedCombos }),
       ...(allowedConnections !== undefined && { allowedConnections }),
       ...(noLog !== undefined && { noLog }),
       ...(autoResolve !== undefined && { autoResolve }),
       ...(isActive !== undefined && { isActive }),
+      ...(throttleDelayMs !== undefined && { throttleDelayMs }),
+      ...(isBanned !== undefined && { isBanned }),
+      ...(expiresAt !== undefined && { expiresAt }),
       ...(maxSessions !== undefined && { maxSessions }),
       ...(accessSchedule !== undefined && { accessSchedule }),
+      ...(rateLimits !== undefined && { rateLimits }),
+      ...(scopes !== undefined && { scopes }),
+      ...(allowedEndpoints !== undefined && { allowedEndpoints }),
+      ...(streamDefaultMode !== undefined && { streamDefaultMode }),
+      ...(disableNonPublicModels !== undefined && { disableNonPublicModels }),
+      ...(allowUsageCommand !== undefined && { allowUsageCommand }),
+      ...(usageLimitEnabled !== undefined && { usageLimitEnabled }),
+      ...(dailyUsageLimitUsd !== undefined && { dailyUsageLimitUsd }),
+      ...(weeklyUsageLimitUsd !== undefined && { weeklyUsageLimitUsd }),
     });
   } catch (error) {
-    console.log("Error updating key permissions:", error);
+    log.error("keys", "Error updating key permissions", error);
     return NextResponse.json({ error: "Failed to update permissions" }, { status: 500 });
   }
 }
@@ -126,7 +170,7 @@ export async function DELETE(request, { params }) {
 
     return NextResponse.json({ message: "Key deleted successfully" });
   } catch (error) {
-    console.log("Error deleting key:", error);
+    log.error("keys", "Error deleting key", error);
     return NextResponse.json({ error: "Failed to delete key" }, { status: 500 });
   }
 }
@@ -142,6 +186,6 @@ async function syncKeysToCloudIfEnabled() {
     const machineId = await getConsistentMachineId();
     await syncToCloud(machineId);
   } catch (error) {
-    console.log("Error syncing keys to cloud:", error);
+    log.error("keys", "Error syncing keys to cloud", error);
   }
 }

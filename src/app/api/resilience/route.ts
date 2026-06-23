@@ -9,6 +9,8 @@ import {
 } from "@/lib/resilience/settings";
 import { updateResilienceSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { resetAllCircuitBreakers } from "@/shared/utils/circuitBreaker";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -17,7 +19,7 @@ function asRecord(value: unknown): JsonRecord {
 }
 
 function getErrorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error && error.message ? error.message : fallback;
+  return sanitizeErrorMessage(error) || fallback;
 }
 
 function normalizeLegacyPatch(body: JsonRecord): ResilienceSettingsPatch {
@@ -131,6 +133,7 @@ export async function GET() {
         maxRetries: resilience.waitForCooldown.maxRetries,
         maxRetryWaitSec: resilience.waitForCooldown.maxRetryWaitSec,
       },
+      providerCooldown: resilience.providerCooldown,
       legacy: buildLegacyResilienceCompat(resilience),
     });
   } catch (err: unknown) {
@@ -186,6 +189,12 @@ export async function PATCH(request) {
       ...(body.waitForCooldown
         ? { waitForCooldown: body.waitForCooldown as ResilienceSettingsPatch["waitForCooldown"] }
         : {}),
+      ...(body.providerCooldown
+        ? {
+            providerCooldown:
+              body.providerCooldown as ResilienceSettingsPatch["providerCooldown"],
+          }
+        : {}),
       ...normalizeLegacyPatch(body),
     });
 
@@ -195,6 +204,20 @@ export async function PATCH(request) {
       maxRetryIntervalSec: nextResilience.waitForCooldown.maxRetryWaitSec,
     });
     await syncRuntimeSettings(nextResilience);
+
+    // Issue #2100 follow-up: detect transitions in useUpstream429BreakerHints
+    // and reset breakers so the registry stops serving cached options.
+    // Compared on STORED override transition (boolean | undefined) so that
+    // `null` (PATCH input) → undefined (stored) is correctly detected as
+    // "unset request" when the previous stored value was a boolean.
+    const breakerHintsChanged =
+      currentResilience.connectionCooldown.oauth.useUpstream429BreakerHints !==
+        nextResilience.connectionCooldown.oauth.useUpstream429BreakerHints ||
+      currentResilience.connectionCooldown.apikey.useUpstream429BreakerHints !==
+        nextResilience.connectionCooldown.apikey.useUpstream429BreakerHints;
+    if (breakerHintsChanged) {
+      resetAllCircuitBreakers();
+    }
 
     return NextResponse.json({
       ok: true,
@@ -206,6 +229,7 @@ export async function PATCH(request) {
         maxRetries: nextResilience.waitForCooldown.maxRetries,
         maxRetryWaitSec: nextResilience.waitForCooldown.maxRetryWaitSec,
       },
+      providerCooldown: nextResilience.providerCooldown,
       legacy: buildLegacyResilienceCompat(nextResilience),
     });
   } catch (err: unknown) {

@@ -1,4 +1,4 @@
-import { getCorsOrigin } from "../utils/cors.ts";
+import { CORS_HEADERS } from "../utils/cors.ts";
 /**
  * Responses API Handler for Workers
  * Converts Chat Completions to Codex Responses API format
@@ -7,7 +7,8 @@ import { getCorsOrigin } from "../utils/cors.ts";
 import { handleChatCore } from "./chatCore.ts";
 import { convertResponsesApiFormat } from "../translator/helpers/responsesApiHelper.ts";
 import { createResponsesApiTransformStream } from "../transformer/responsesTransformer.ts";
-import { createSseHeartbeatTransform } from "../utils/sseHeartbeat.ts";
+import { createSseHeartbeatTransform, HEARTBEAT_SHAPES } from "../utils/sseHeartbeat.ts";
+import { SSE_HEARTBEAT_INTERVAL_MS } from "../config/constants.ts";
 
 /**
  * Handle /v1/responses request
@@ -69,9 +70,13 @@ export async function handleResponsesCore({
 
   // Transform SSE stream to Responses API format (no logging in worker)
   const transformStream = createResponsesApiTransformStream(null);
-  const transformedBody = response.body
-    .pipeThrough(transformStream)
-    .pipeThrough(createSseHeartbeatTransform({ signal }));
+  const transformedBody = response.body.pipeThrough(transformStream).pipeThrough(
+    createSseHeartbeatTransform({
+      signal,
+      intervalMs: SSE_HEARTBEAT_INTERVAL_MS,
+      shape: HEARTBEAT_SHAPES.OPENAI_RESPONSES_IN_PROGRESS,
+    })
+  );
 
   return {
     success: true,
@@ -81,7 +86,6 @@ export async function handleResponsesCore({
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
-        "Access-Control-Allow-Origin": getCorsOrigin(),
       },
     }),
   };

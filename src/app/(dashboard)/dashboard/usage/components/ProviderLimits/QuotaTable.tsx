@@ -1,6 +1,6 @@
 "use client";
 
-import { formatResetTime, calculatePercentage } from "./utils";
+import { calculatePercentage, formatResetTime, shouldShowQuotaUsageCount } from "./utils";
 import { useLocale, useTranslations } from "next-intl";
 
 /**
@@ -131,8 +131,11 @@ export default function QuotaTable({ quotas = [] }) {
                     {/* Numbers */}
                     <div className="flex items-center justify-between text-xs">
                       <span className="text-text-muted">
-                        {quota.used.toLocaleString()} /{" "}
-                        {quota.total > 0 ? quota.total.toLocaleString() : "∞"}
+                        {shouldShowQuotaUsageCount(quota)
+                          ? `${quota.used.toLocaleString()} / ${
+                              quota.total > 0 ? quota.total.toLocaleString() : "∞"
+                            }`
+                          : null}
                       </span>
                       <span className={`font-medium ${colors.text}`}>{remaining}%</span>
                     </div>
@@ -142,7 +145,7 @@ export default function QuotaTable({ quotas = [] }) {
                 {/* Reset Time */}
                 <td className="py-2 px-3">
                   {staleAfterReset ? (
-                    <div className="text-xs text-text-muted">⟳ Refreshing...</div>
+                    <div className="text-xs text-text-muted">{t("quotaTableRefreshing")}</div>
                   ) : countdown !== t("notAvailableSymbol") || resetDisplay ? (
                     <div className="space-y-0.5">
                       {countdown !== t("notAvailableSymbol") && (

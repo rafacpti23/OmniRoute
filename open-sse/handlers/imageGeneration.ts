@@ -7,7 +7,7 @@ import { randomUUID } from "crypto";
  *
  * Request format (OpenAI-compatible):
  * {
- *   "model": "openai/dall-e-3",
+ *   "model": "openai/gpt-image-2",
  *   "prompt": "a beautiful sunset over mountains",
  *   "n": 1,
  *   "size": "1024x1024",
@@ -17,41 +17,179 @@ import { randomUUID } from "crypto";
  */
 
 import { getImageProvider, parseImageModel } from "../config/imageRegistry.ts";
+import { HTTP_STATUS } from "../config/constants.ts";
+import { applyAntigravityClientProfileHeaders } from "../services/antigravityClientProfile.ts";
+import { getAntigravityEnvelopeUserAgent } from "../services/antigravityIdentity.ts";
+import { kieExecutor } from "../executors/kie.ts";
 import { mapImageSize } from "../translator/image/sizeMapper.ts";
 import { getCodexClientVersion, getCodexUserAgent } from "../config/codexClient.ts";
 import { ChatGptWebExecutor } from "../executors/chatgpt-web.ts";
-import {
-  getChatGptImage,
-  findChatGptImageBySha256,
-} from "../services/chatgptImageCache.ts";
+import { getChatGptImage, findChatGptImageBySha256 } from "../services/chatgptImageCache.ts";
 import { createHash } from "node:crypto";
 import { saveCallLog } from "@/lib/usageDb";
+import { sleep } from "../utils/sleep.ts";
+import {
+  getKieErrorMessage,
+  getKieErrorStatus,
+  isJsonObject,
+  parseKieResultJson,
+} from "../utils/kieTask.ts";
 import {
   submitComfyWorkflow,
   pollComfyResult,
   fetchComfyOutput,
   extractComfyOutputFiles,
 } from "../utils/comfyuiClient.ts";
+import { fetchRemoteImage } from "@/shared/network/remoteImageFetch";
+import { FetchTimeoutError, fetchWithTimeout, getConfiguredTimeout } from "@/shared/utils/fetchTimeout";
+import { sanitizeErrorMessage, sanitizeUpstreamDetails } from "../utils/error.ts";
+
+// --- Per-provider handlers (extracted to co-located files in PR-#4582-batch) ---
+// Imported locally so internal callers (handleImageGeneration / handleImageEdit)
+// resolve to a real binding. extractMarkdownImageUrls + CHATGPT_WEB_IMAGE_ID_RE
+// are still used by handleImageEdit below, so they are imported (not re-defined).
+import { handleSDWebUIImageGeneration } from "./imageGeneration/providers/sdWebUI.ts";
+import { handleHyperbolicImageGeneration } from "./imageGeneration/providers/hyperbolic.ts";
+import { handleComfyUIImageGeneration } from "./imageGeneration/providers/comfyUI.ts";
+import { handleImagen3ImageGeneration } from "./imageGeneration/providers/imagen3.ts";
+import { handleIdeogramImageGeneration } from "./imageGeneration/providers/ideogram.ts";
+import { handleHaiperImageGeneration } from "./imageGeneration/providers/haiper.ts";
+import { handleLeonardoImageGeneration } from "./imageGeneration/providers/leonardo.ts";
+import {
+  handleChatGptWebImageGeneration,
+  extractMarkdownImageUrls,
+  CHATGPT_WEB_IMAGE_ID_RE,
+} from "./imageGeneration/providers/chatgptWeb.ts";
+
+
+interface KieImageOptions {
+  model: string;
+  provider: string;
+  providerConfig: {
+    baseUrl: string;
+    statusUrl?: string;
+  };
+  body: Record<string, unknown> & {
+    prompt?: unknown;
+    size?: unknown;
+    n?: unknown;
+    timeout_ms?: unknown;
+    poll_interval_ms?: unknown;
+  };
+  credentials?: {
+    apiKey?: string;
+    accessToken?: string;
+  } | null;
+  log?: {
+    info: (scope: string, message: string) => void;
+    error: (scope: string, message: string) => void;
+  } | null;
+}
 
 const OPENAI_IMAGE_TO_IMAGE_MODELS = new Set([
-  "black-forest-labs/FLUX.1-redux",
-  "black-forest-labs/FLUX.1-depth",
-  "black-forest-labs/FLUX.1-canny",
-  "black-forest-labs/FLUX.1.1-pro",
-  "FLUX.1-redux",
-  "FLUX.1-depth",
-  "FLUX.1-canny",
-  "FLUX.1.1-pro",
+  "black-forest-labs/FLUX.2-max",
+  "black-forest-labs/FLUX.2-pro",
+  "black-forest-labs/FLUX.2-flex",
+  "black-forest-labs/FLUX.2-dev",
+  "openai/gpt-image-1.5",
+  "Wan-AI/Wan2.6-image",
+  "Qwen/Qwen-Image-2.0-Pro",
+  "Qwen/Qwen-Image-2.0",
+  "google/flash-image-3.1",
+  "google/gemini-3-pro-image",
   "flux-kontext-max",
   "flux-kontext",
   "flux-kontext-pro",
+  "qwen-image",
 ]);
 
+const IMAGE_ASPECT_RATIO_PATTERN = /^\d+:\d+$/;
+
+/**
+ * Resolve the upstream images endpoint for a custom (OpenAI-compatible) image
+ * provider node (#3205).
+ *
+ * Custom provider nodes store their base URL the same way the chat path does:
+ * in `credentials.providerSpecificData.baseUrl` (e.g. `https://example.com/v1`),
+ * NOT as a top-level `credentials.baseUrl`. Older callers may still pass a
+ * top-level `baseUrl`, so we honor that as a secondary source. When neither is
+ * present we fall back to `fallback` (the built-in Gemini OpenAI endpoint).
+ *
+ * Resolution order: providerSpecificData.baseUrl → credentials.baseUrl → fallback.
+ *
+ * A node base URL like `https://example.com/v1` is normalized and the
+ * OpenAI-compatible `/images/generations` path appended (mirroring
+ * `buildOpenAICompatibleUrl` in services/provider.ts). A node URL that already
+ * ends in `/images/generations` is returned as-is (no double-append). The
+ * `fallback` value is assumed to already be a complete URL and is returned
+ * verbatim.
+ */
+export function resolveImageBaseUrl(
+  credentials:
+    | { baseUrl?: unknown; providerSpecificData?: { baseUrl?: unknown } | null }
+    | null
+    | undefined,
+  fallback: string,
+  endpoint: "generations" | "edits" = "generations"
+): string {
+  const psd = credentials?.providerSpecificData;
+  const psdBaseUrl =
+    psd && typeof psd === "object" && typeof psd.baseUrl === "string" && psd.baseUrl.trim()
+      ? psd.baseUrl.trim()
+      : null;
+  const topLevelBaseUrl =
+    typeof credentials?.baseUrl === "string" && credentials.baseUrl.trim()
+      ? credentials.baseUrl.trim()
+      : null;
+  const nodeBaseUrl = psdBaseUrl || topLevelBaseUrl;
+
+  if (!nodeBaseUrl) return fallback;
+
+  // A single configured node serves both image routes: honor a base URL that already
+  // points at the requested OpenAI image path, and rewrite one that points at the other
+  // image endpoint (e.g. `.../images/generations` requested for edits) (#3214/#3215).
+  const suffix = `/images/${endpoint}`;
+  // Trim trailing slashes without a backtracking-prone regex (`/\/+$/` is a
+  // polynomial-ReDoS pattern on long runs of "/" — CodeQL js/polynomial-redos).
+  let normalized = nodeBaseUrl;
+  while (normalized.endsWith("/")) normalized = normalized.slice(0, -1);
+  if (normalized.endsWith(suffix)) return normalized;
+  const stripped = normalized.replace(/\/images\/(?:generations|edits)$/, "");
+  return `${stripped}${suffix}`;
+}
+
+function normalizeImageAspectRatio(value: unknown, fallbackSize: unknown): string {
+  if (typeof value === "string") {
+    const trimmedValue = value.trim();
+    if (IMAGE_ASPECT_RATIO_PATTERN.test(trimmedValue)) return trimmedValue;
+  }
+  return mapImageSize(typeof fallbackSize === "string" ? fallbackSize : null);
+}
+
+function parseJsonOrNull(value: string): unknown | null {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeImageProviderError(errorText: string): unknown {
+  const parsed = parseJsonOrNull(errorText);
+  if (parsed !== null) {
+    return sanitizeUpstreamDetails(parsed) || sanitizeErrorMessage(errorText);
+  }
+  return sanitizeErrorMessage(errorText);
+}
+
 const BFL_MODEL_ENDPOINTS = {
+  "flux-2-max": "/v1/flux-2-max",
+  "flux-2-pro": "/v1/flux-2-pro",
+  "flux-2-flex": "/v1/flux-2-flex",
+  "flux-2-klein-9b": "/v1/flux-2-klein-9b",
+  "flux-2-klein-4b": "/v1/flux-2-klein-4b",
   "flux-kontext-pro": "/v1/flux-kontext-pro",
   "flux-kontext-max": "/v1/flux-kontext-max",
-  "flux-pro-1.0-fill": "/v1/flux-pro-1.0-fill",
-  "flux-pro-1.0-expand": "/v1/flux-pro-1.0-expand",
   "flux-pro-1.1": "/v1/flux-pro-1.1",
   "flux-pro-1.1-ultra": "/v1/flux-pro-1.1-ultra",
   "flux-dev": "/v1/flux-dev",
@@ -59,22 +197,26 @@ const BFL_MODEL_ENDPOINTS = {
 };
 
 const BFL_EDIT_MODELS = new Set([
+  "flux-2-max",
+  "flux-2-pro",
+  "flux-2-flex",
   "flux-kontext-pro",
   "flux-kontext-max",
-  "flux-pro-1.0-fill",
-  "flux-pro-1.0-expand",
 ]);
 
 const BFL_FAILURE_STATUSES = new Set(["Error", "Failed", "Content Moderated", "Request Moderated"]);
 
+function formatImageProviderError(err) {
+  const sanitized = sanitizeErrorMessage(err);
+  const message = (sanitized || "").replace(/^Error:\s*/i, "").trim();
+  return message ? `Image provider error: ${message}` : "Image provider error";
+}
+
 const STABILITY_GENERATION_ENDPOINTS = {
-  sd3: "/v2beta/stable-image/generate/sd3",
-  "sd3-large": "/v2beta/stable-image/generate/sd3",
-  "sd3-large-turbo": "/v2beta/stable-image/generate/sd3",
-  "sd3-medium": "/v2beta/stable-image/generate/sd3",
   "sd3.5-large": "/v2beta/stable-image/generate/sd3",
   "sd3.5-large-turbo": "/v2beta/stable-image/generate/sd3",
   "sd3.5-medium": "/v2beta/stable-image/generate/sd3",
+  "sd3.5-flash": "/v2beta/stable-image/generate/sd3",
   "stable-image-ultra": "/v2beta/stable-image/generate/ultra",
   "stable-image-core": "/v2beta/stable-image/generate/core",
 };
@@ -97,6 +239,21 @@ const STABILITY_EDIT_ENDPOINTS = {
 };
 
 const STABILITY_CONTROL_MODELS = new Set(["sketch", "structure", "style", "style-transfer"]);
+
+function appendOptionalFormValue(formData, key, value) {
+  if (value === undefined || value === null || value === "") return;
+  formData.append(key, String(value));
+}
+
+function appendImageFormValue(formData, key, source, filename) {
+  formData.append(
+    key,
+    new Blob([source.buffer], {
+      type: source.contentType || "application/octet-stream",
+    }),
+    filename
+  );
+}
 
 const FAL_PRESET_SIZES = {
   "1024x1024": "square_hd",
@@ -171,9 +328,16 @@ export async function handleImageGeneration({
 
     const syntheticConfig = {
       id: provider,
-      baseUrl:
-        credentials?.baseUrl ||
-        `https://generativelanguage.googleapis.com/v1beta/openai/images/generations`,
+      // #3205: custom OpenAI-compatible nodes store their base URL in
+      // credentials.providerSpecificData.baseUrl (same as the chat path —
+      // see executors/default.ts:buildUrl / services/provider.ts:buildProviderUrl).
+      // Previously only the (always-absent) top-level credentials.baseUrl was
+      // read, so every custom image node fell back to the Gemini endpoint and
+      // returned "Please pass a valid API key".
+      baseUrl: resolveImageBaseUrl(
+        credentials,
+        `https://generativelanguage.googleapis.com/v1beta/openai/images/generations`
+      ),
       authType: "apikey",
       authHeader: "bearer",
       format: "openai",
@@ -293,6 +457,17 @@ export async function handleImageGeneration({
     });
   }
 
+  if (providerConfig.format === "kie-image") {
+    return handleKieImageGeneration({
+      model,
+      provider,
+      providerConfig,
+      body,
+      credentials,
+      log,
+    });
+  }
+
   if (providerConfig.format === "sdwebui") {
     return handleSDWebUIImageGeneration({ model, provider, providerConfig, body, log });
   }
@@ -312,51 +487,304 @@ export async function handleImageGeneration({
     });
   }
 
+  if (providerConfig.format === "haiper-image") {
+    return handleHaiperImageGeneration({ model, provider, providerConfig, body, credentials, log });
+  }
+  if (providerConfig.format === "leonardo-image") {
+    return handleLeonardoImageGeneration({
+      model,
+      provider,
+      providerConfig,
+      body,
+      credentials,
+      log,
+    });
+  }
+  if (providerConfig.format === "ideogram-image") {
+    return handleIdeogramImageGeneration({
+      model,
+      provider,
+      providerConfig,
+      body,
+      credentials,
+      log,
+    });
+  }
+
   return handleOpenAIImageGeneration({ model, provider, providerConfig, body, credentials, log });
 }
 
+function normalizeKieImageResult(recordData: unknown): string[] {
+  const record = isJsonObject(recordData) ? recordData : {};
+  const data = isJsonObject(record.data) ? record.data : {};
+  const response = isJsonObject(data.response) ? data.response : {};
+  const resultJson = parseKieResultJson(recordData);
+  const urls = new Set<string>();
+
+  const add = (val: unknown) => {
+    if (typeof val === "string" && val.startsWith("http")) urls.add(val);
+    if (Array.isArray(val)) {
+      val.forEach((v) => {
+        if (typeof v === "string" && v.startsWith("http")) urls.add(v);
+      });
+    }
+  };
+
+  // Check resultJson (common in Market API)
+  add(resultJson?.resultUrls);
+  add(resultJson?.imageUrls);
+  add(resultJson?.resultUrl);
+  add(resultJson?.imageUrl);
+
+  // Check data.response (common in 4o-image API)
+  add(response.resultUrls);
+  add(response.resultUrl);
+
+  // Check direct data fields
+  add(data.resultImageUrls);
+  add(data.resultImageUrl);
+  add(data.url);
+
+  return Array.from(urls);
+}
+
+async function handleKieImageGeneration({
+  model,
+  provider,
+  providerConfig,
+  body,
+  credentials,
+  log,
+}: KieImageOptions) {
+  const startTime = Date.now();
+  const token = credentials?.apiKey || credentials?.accessToken;
+  const timeoutMs = normalizePositiveNumber(body.timeout_ms, 300000);
+  const pollIntervalMs = normalizePositiveNumber(body.poll_interval_ms, 2500);
+  const prompt = typeof body.prompt === "string" ? body.prompt : String(body.prompt ?? "");
+  const size = typeof body.size === "string" ? body.size : undefined;
+
+  if (!token) {
+    return saveImageErrorResult({
+      provider,
+      model,
+      status: 401,
+      startTime,
+      error: "KIE API key is required",
+    });
+  }
+
+  // Check if model is a Market model (unified API)
+  const fullRegistry = getImageProvider(provider);
+  const modelEntry = fullRegistry?.models?.find((m) => m.id === model);
+  const isMarket = modelEntry?.isMarket || model.includes("/");
+
+  const { imageUrl } = extractImageInputs(body);
+  let baseUrl = "";
+  let payload: Record<string, unknown> = {};
+
+  if (isMarket) {
+    // Unified Market API endpoint
+    baseUrl = `${providerConfig.baseUrl.replace(/\/$/, "")}/api/v1/jobs/createTask`;
+    const input: Record<string, unknown> = {
+      prompt,
+      aspect_ratio: mapImageSize(size, "1:1"),
+    };
+    if (imageUrl) {
+      input.image_url = imageUrl;
+    }
+    payload = {
+      model,
+      input,
+    };
+  } else {
+    // Legacy/Direct endpoint
+    const modelPath = model.replace("-t2i", "").replace("-i2i", "");
+    baseUrl = providerConfig.baseUrl.includes(model)
+      ? providerConfig.baseUrl
+      : `https://api.kie.ai/api/v1/${modelPath}/generate`;
+
+    payload = {
+      prompt,
+      size: mapImageSize(size, "1:1"),
+      nVariants: body.n || 1,
+    };
+  }
+
+  if (log) {
+    const promptPreview = String(body.prompt ?? "").slice(0, 60);
+    log.info(
+      "IMAGE",
+      `${provider}/${model} (${isMarket ? "market" : "direct"}) | prompt: "${promptPreview}..."`
+    );
+  }
+
+  try {
+    const endpoint = isMarket ? "/api/v1/jobs/createTask" : new URL(baseUrl).pathname;
+    const createBaseUrl = isMarket ? providerConfig.baseUrl : baseUrl.replace(endpoint, "");
+    const createData = await kieExecutor.createTask({
+      baseUrl: createBaseUrl,
+      token,
+      payload,
+      endpoint,
+    });
+    const taskId = createData?.data?.taskId || createData?.taskId;
+
+    if (!taskId) {
+      const errorMessage =
+        createData?.msg ||
+        createData?.message ||
+        createData?.error ||
+        "KIE image generation did not return taskId";
+      if (log) {
+        log.error("IMAGE", `KIE createTask failed: ${JSON.stringify(createData)}`);
+      }
+      return saveImageErrorResult({
+        provider,
+        model,
+        status: 502,
+        startTime,
+        error: errorMessage,
+        requestBody: payload,
+      });
+    }
+
+    // Use statusUrl from providerConfig if available, fallback to dynamic derivation
+    const statusUrl = isMarket
+      ? `${providerConfig.baseUrl.replace(/\/$/, "")}/api/v1/jobs/recordInfo`
+      : providerConfig.statusUrl && !providerConfig.statusUrl.includes("jobs/recordInfo")
+        ? providerConfig.statusUrl
+        : baseUrl.replace(/\/generate$/, "/record-info");
+
+    const { data: recordData, state } = await kieExecutor.pollTask({
+      statusUrl,
+      taskId: String(taskId),
+      token,
+      timeoutMs,
+      pollIntervalMs,
+    });
+
+    if (state === "success") {
+      if (log) {
+        log.info("IMAGE", `KIE poll success for task ${taskId}`);
+      }
+      const urls = normalizeKieImageResult(recordData);
+      const images = urls.map((url: string) => ({ url, revised_prompt: prompt }));
+
+      return saveImageSuccessResult({
+        provider,
+        model,
+        startTime,
+        requestBody: payload,
+        responseBody: { images_count: images.length },
+        images,
+      });
+    }
+
+    const record = isJsonObject(recordData) ? recordData : {};
+    const recordDataBody = isJsonObject(record.data) ? record.data : {};
+    const errorMessage =
+      recordDataBody.errorMessage ||
+      recordDataBody.failMsg ||
+      record.msg ||
+      "KIE image task failed";
+
+    if (log) {
+      log.error("IMAGE", `KIE poll failed for task ${taskId}: ${JSON.stringify(recordData)}`);
+    }
+
+    return saveImageErrorResult({
+      provider,
+      model,
+      status: 502,
+      startTime,
+      error: String(errorMessage),
+      requestBody: payload,
+    });
+  } catch (err: unknown) {
+    return saveImageErrorResult({
+      provider,
+      model,
+      status: getKieErrorStatus(err, 502),
+      startTime,
+      error: `Image provider error: ${getKieErrorMessage(err, "KIE image generation failed")}`,
+    });
+  }
+}
 /**
  * Handle Gemini-format image generation (Antigravity / Nano Banana)
  * Uses Gemini's generateContent API with responseModalities: ["TEXT", "IMAGE"]
  */
 async function handleGeminiImageGeneration({ model, providerConfig, body, credentials, log }) {
   const startTime = Date.now();
-  const url = `${providerConfig.baseUrl}/${model}:generateContent`;
+  const url = providerConfig.baseUrl;
   const provider = "antigravity";
+  const credentialRecord = credentials || {};
+  const token = credentialRecord.accessToken || credentialRecord.apiKey;
+  const providerSpecificData = credentialRecord.providerSpecificData;
+  const providerSpecificProjectId =
+    providerSpecificData && typeof providerSpecificData === "object"
+      ? (providerSpecificData as Record<string, unknown>).projectId
+      : null;
+  const credentialProjectId =
+    typeof credentialRecord.projectId === "string" ? credentialRecord.projectId.trim() : "";
+  const providerProjectId =
+    typeof providerSpecificProjectId === "string" ? providerSpecificProjectId.trim() : "";
+  const projectId = credentialProjectId || providerProjectId || null;
+  const candidateCount =
+    typeof body.n === "number" && Number.isFinite(body.n) && body.n > 0 ? Math.floor(body.n) : 1;
+  const promptText = typeof body.prompt === "string" ? body.prompt : String(body.prompt ?? "");
 
   // Summarized request for call log
   const logRequestBody = {
     model: body.model,
-    prompt:
-      typeof body.prompt === "string"
-        ? body.prompt.slice(0, 200)
-        : String(body.prompt ?? "").slice(0, 200),
+    prompt: promptText.slice(0, 200),
     size: body.size || "default",
-    n: body.n || 1,
+    n: candidateCount,
   };
 
-  const geminiBody = {
-    contents: [
-      {
-        parts: [{ text: body.prompt }],
+  if (!projectId || typeof projectId !== "string") {
+    return saveImageErrorResult({
+      provider,
+      model,
+      status: 400,
+      startTime,
+      error:
+        "Missing Google projectId for Antigravity account. Please reconnect OAuth in Providers so OmniRoute can fetch your Cloud Code project.",
+      requestBody: logRequestBody,
+    });
+  }
+
+  const antigravityBody = {
+    project: projectId,
+    requestId: `image_gen/${Date.now()}/${randomUUID()}/0`,
+    request: {
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: promptText }],
+        },
+      ],
+      generationConfig: {
+        candidateCount,
+        imageConfig: {
+          aspectRatio: normalizeImageAspectRatio(body.aspect_ratio, body.size),
+        },
       },
-    ],
-    generationConfig: {
-      responseModalities: ["TEXT", "IMAGE"],
     },
+    model,
+    userAgent: getAntigravityEnvelopeUserAgent(credentialRecord),
+    requestType: "image_gen",
   };
 
-  const token = credentials.accessToken || credentials.apiKey;
   const headers = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${token}`,
   };
+  applyAntigravityClientProfileHeaders(headers, credentialRecord, antigravityBody);
+  delete headers["x-goog-user-project"];
 
   if (log) {
-    const promptPreview =
-      typeof body.prompt === "string"
-        ? body.prompt.slice(0, 60)
-        : String(body.prompt ?? "").slice(0, 60);
+    const promptPreview = promptText.slice(0, 60);
     log.info(
       "IMAGE",
       `antigravity/${model} (gemini) | prompt: "${promptPreview}..." | format: gemini-image`
@@ -367,13 +795,16 @@ async function handleGeminiImageGeneration({ model, providerConfig, body, creden
     const response = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify(geminiBody),
+      body: JSON.stringify(antigravityBody),
     });
 
     if (!response.ok) {
       const errorText = await response.text();
+      const safeError = sanitizeImageProviderError(errorText);
+      const safeErrorLog =
+        typeof safeError === "string" ? safeError : JSON.stringify(safeError ?? {});
       if (log) {
-        log.error("IMAGE", `antigravity error ${response.status}: ${errorText.slice(0, 200)}`);
+        log.error("IMAGE", `antigravity error ${response.status}: ${safeErrorLog.slice(0, 200)}`);
       }
 
       saveCallLog({
@@ -383,25 +814,26 @@ async function handleGeminiImageGeneration({ model, providerConfig, body, creden
         model: `antigravity/${model}`,
         provider,
         duration: Date.now() - startTime,
-        error: errorText.slice(0, 500),
+        error: safeErrorLog.slice(0, 500),
         requestBody: logRequestBody,
       }).catch(() => {});
 
-      return { success: false, status: response.status, error: errorText };
+      return { success: false, status: response.status, error: safeError };
     }
 
     const data = await response.json();
+    const responseBody = data.response || data;
 
-    // Extract image data from Gemini response
+    // Extract image data from Antigravity's wrapped Gemini response.
     const images = [];
-    const candidates = data.candidates || [];
+    const candidates = responseBody.candidates || [];
     for (const candidate of candidates) {
       const parts = candidate.content?.parts || [];
       for (const part of parts) {
         if (part.inlineData) {
           images.push({
             b64_json: part.inlineData.data,
-            revised_prompt: parts.find((p) => p.text)?.text || body.prompt,
+            revised_prompt: parts.find((p) => p.text)?.text || promptText,
           });
         }
       }
@@ -442,7 +874,11 @@ async function handleGeminiImageGeneration({ model, providerConfig, body, creden
       requestBody: logRequestBody,
     }).catch(() => {});
 
-    return { success: false, status: 502, error: `Image provider error: ${err.message}` };
+    return {
+      success: false,
+      status: 502,
+      error: `Image provider error: ${sanitizeErrorMessage((err as Error).message || err)}`,
+    };
   }
 }
 
@@ -562,191 +998,122 @@ async function handleOpenAIImageGeneration({
   return result;
 }
 
-const CHATGPT_WEB_IMAGE_MARKDOWN_RE = /!\[[^\]]*\]\(([^)\s]+)\)/g;
-const CHATGPT_WEB_IMAGE_ID_RE = /\/v1\/chatgpt-web\/image\/([a-f0-9]{16,64})(?=[?\s"'<>)]|$)/i;
-
-function extractMarkdownImageUrls(text: string): string[] {
-  const urls: string[] = [];
-  // String.prototype.matchAll consumes a fresh iterator and ignores the
-  // regex's lastIndex, so no manual reset is required.
-  for (const match of text.matchAll(CHATGPT_WEB_IMAGE_MARKDOWN_RE)) {
-    if (match[1]) urls.push(match[1]);
-  }
-  return urls;
-}
-
-function buildChatGptWebImagePrompt(body): string {
-  const prompt = String(body.prompt || "").trim();
-  const details: string[] = [`Create an image for this prompt: ${prompt}`];
-  if (typeof body.size === "string" && body.size.trim()) {
-    details.push(`Requested size: ${body.size.trim()}.`);
-  }
-  if (typeof body.quality === "string" && body.quality.trim()) {
-    details.push(`Requested quality: ${body.quality.trim()}.`);
-  }
-  if (typeof body.style === "string" && body.style.trim()) {
-    details.push(`Requested style: ${body.style.trim()}.`);
-  }
-  return details.join("\n");
-}
-
-async function handleChatGptWebImageGeneration({
+/**
+ * OpenAI-compatible image *edit* forwarder for custom providers (#3214 / #3215).
+ *
+ * Mirrors `handleOpenAIImageGeneration` but posts multipart/form-data to the node's
+ * `/images/edits` endpoint and returns the upstream OpenAI-compatible response. Kept
+ * separate from the chatgpt-web edit flow, which continues a saved conversation node
+ * rather than forwarding a stateless edit. The fetch helper leaves Content-Type unset so
+ * `fetch` derives the multipart boundary from the FormData body.
+ */
+export async function handleOpenAIImageEdit({
   model,
   provider,
-  body,
   credentials,
+  prompt,
+  imageBytes,
+  imageMime,
+  size,
+  responseFormat,
+  n = 1,
   log,
-  signal,
-  clientHeaders,
+}: {
+  model: string;
+  provider: string;
+  credentials:
+    | {
+        apiKey?: string;
+        accessToken?: string;
+        baseUrl?: unknown;
+        providerSpecificData?: { baseUrl?: unknown } | null;
+      }
+    | null
+    | undefined;
+  prompt: string;
+  imageBytes: Buffer;
+  imageMime?: string | null;
+  size?: string | null;
+  responseFormat?: string | null;
+  n?: number;
+  log?: { info: (tag: string, message: string) => void } | null;
 }) {
   const startTime = Date.now();
-  const prompt = typeof body.prompt === "string" ? body.prompt.trim() : "";
-  if (!prompt) {
-    return saveImageErrorResult({
-      provider,
-      model,
-      status: 400,
-      startTime,
-      error: "Prompt is required for ChatGPT Web image generation",
-    });
-  }
+  const url = resolveImageBaseUrl(
+    credentials,
+    `https://generativelanguage.googleapis.com/v1beta/openai/images/edits`,
+    "edits"
+  );
 
-  if (!credentials?.apiKey) {
-    return saveImageErrorResult({
-      provider,
-      model,
-      status: 401,
-      startTime,
-      error: "ChatGPT Web credentials missing session cookie",
-    });
-  }
-
-  // Each image is one chatgpt.com chat turn (~30s). Cap at 4 (matches OpenAI's
-  // own limit for image-1 / dall-e-3) so a stray n=1000 doesn't pin the
-  // executor for hours before the upstream HTTP timeout fires.
-  const CHATGPT_WEB_IMAGE_N_MAX = 4;
-  const rawCount =
-    Number.isInteger(body.n) && (body.n as number) > 0 ? (body.n as number) : 1;
-  if (rawCount > CHATGPT_WEB_IMAGE_N_MAX) {
-    return saveImageErrorResult({
-      provider,
-      model,
-      status: 400,
-      startTime,
-      error: `ChatGPT Web image generation supports n=1..${CHATGPT_WEB_IMAGE_N_MAX} (got ${rawCount}); each n is a separate ~30s chat turn.`,
-    });
-  }
-  const requestedCount = rawCount;
-  if (log && requestedCount > 1) {
-    log.warn(
-      "IMAGE",
-      `ChatGPT Web returns one image per chat turn; requested n=${requestedCount} will run sequentially`
+  // Build the multipart body as a Buffer with an explicit boundary instead of a global
+  // `FormData`. In production `globalThis.fetch` is patched with node_modules/undici's fetch,
+  // whose `FormData` class differs from `globalThis.FormData` — passing a native FormData
+  // makes undici serialize it as the string "[object FormData]" (text/plain), dropping every
+  // field (including `model`, which reaches the upstream empty). A Buffer body is accepted
+  // verbatim by any fetch implementation. (#3273)
+  const boundary = `----OmniRouteImageEdit${randomUUID().replace(/-/g, "")}`;
+  const CRLF = "\r\n";
+  const partBuffers: Buffer[] = [];
+  const appendField = (name: string, value: string) => {
+    partBuffers.push(
+      Buffer.from(
+        `--${boundary}${CRLF}Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}${value}${CRLF}`
+      )
     );
-  }
-
-  const wantsBase64 = body.response_format === "b64_json";
-  const images: Array<{ url?: string; b64_json?: string }> = [];
-  const requestBody = {
-    model,
-    prompt: prompt.slice(0, 500),
-    size: body.size || undefined,
-    quality: body.quality || undefined,
   };
+  appendField("model", model);
+  appendField("prompt", prompt);
+  if (size) appendField("size", size);
+  if (responseFormat) appendField("response_format", responseFormat);
+  appendField("n", String(n || 1));
+  partBuffers.push(
+    Buffer.from(
+      `--${boundary}${CRLF}Content-Disposition: form-data; name="image"; filename="image.png"${CRLF}` +
+        `Content-Type: ${imageMime || "image/png"}${CRLF}${CRLF}`
+    )
+  );
+  partBuffers.push(imageBytes);
+  partBuffers.push(Buffer.from(`${CRLF}--${boundary}--${CRLF}`));
+  const multipartBody = Buffer.concat(partBuffers);
 
-  for (let i = 0; i < requestedCount; i++) {
-    const executor = new ChatGptWebExecutor();
-    const result = await executor.execute({
-      model,
-      body: {
-        messages: [{ role: "user", content: buildChatGptWebImagePrompt(body) }],
-      },
-      stream: false,
-      credentials,
-      signal,
-      log,
-      clientHeaders,
-    });
+  const headers: Record<string, string> = {
+    "Content-Type": `multipart/form-data; boundary=${boundary}`,
+  };
+  const token = credentials?.apiKey || credentials?.accessToken;
+  if (token) headers["Authorization"] = `Bearer ${token}`;
 
-    const responseText = await result.response.text();
-    if (result.response.status >= 400) {
-      return saveImageErrorResult({
-        provider,
-        model,
-        status: result.response.status,
-        startTime,
-        error: responseText,
-        requestBody,
-      });
-    }
-
-    let content = "";
-    try {
-      const json = JSON.parse(responseText);
-      content = String(json?.choices?.[0]?.message?.content || "");
-    } catch {
-      content = responseText;
-    }
-
-    const urls = extractMarkdownImageUrls(content);
-    if (urls.length === 0) {
-      return saveImageErrorResult({
-        provider,
-        model,
-        status: 502,
-        startTime,
-        error: `ChatGPT Web completed without returning image markdown: ${content.slice(0, 300)}`,
-        requestBody,
-      });
-    }
-
-    for (const url of urls) {
-      if (!wantsBase64) {
-        images.push({ url });
-        continue;
-      }
-      const id = url.match(CHATGPT_WEB_IMAGE_ID_RE)?.[1];
-      const cached = id ? getChatGptImage(id) : null;
-      if (!cached) {
-        return saveImageErrorResult({
-          provider,
-          model,
-          status: 502,
-          startTime,
-          error: "ChatGPT Web image bytes expired before b64_json conversion",
-          requestBody,
-        });
-      }
-      images.push({ b64_json: cached.bytes.toString("base64") });
-    }
+  if (log) {
+    log.info("IMAGE", `${provider}/${model} (edit) | prompt: "${prompt.slice(0, 60)}..." -> ${url}`);
   }
 
-  return saveImageSuccessResult({
+  const result = await fetchImageEndpoint(
+    url,
+    headers,
+    multipartBody as unknown as BodyInit,
     provider,
-    model,
-    startTime,
-    requestBody,
-    responseBody: { images_count: images.length },
-    images,
-  });
+    log
+  );
+
+  saveCallLog({
+    method: "POST",
+    path: "/v1/images/edits",
+    status: result.status || (result.success ? 200 : 502),
+    model: `${provider}/${model}`,
+    provider,
+    duration: Date.now() - startTime,
+    tokens: { prompt_tokens: 0, completion_tokens: 0 },
+    error: result.success
+      ? null
+      : typeof result.error === "string"
+        ? result.error.slice(0, 500)
+        : null,
+    requestBody: { model, prompt: prompt.slice(0, 200), size: size || "default", n: n || 1 },
+    responseBody: result.success ? { images_count: result.data?.data?.length || 0 } : null,
+  }).catch(() => {});
+
+  return result;
 }
 
-/**
- * Handle a multipart /v1/images/edits request for chatgpt-web. Open WebUI
- * uploads the prior image's bytes; we hash them and look up our cache.
- *
- * The hash match is reliable because Open WebUI's image-gen pipeline
- * downloads our /v1/chatgpt-web/image/<id> URL byte-for-byte and re-serves
- * those exact bytes through its own file store. When the user asks to edit
- * the image, OWUI uploads the same bytes back to us via multipart — same
- * hash, we find the conversation context, and drive the executor with a
- * synthetic chat thread that triggers continuation mode.
- *
- * No-match cases (cache evicted by TTL, or the user uploaded a foreign
- * image) get a clear 400. We can't actually edit an image we don't have a
- * conversation context for — chatgpt.com's image_gen tool needs the
- * original conversation node, and we don't have a path to upload bytes
- * directly.
- */
 export async function handleImageEdit({
   provider,
   model,
@@ -1022,7 +1389,7 @@ async function handleFalAIImageGeneration({
       model,
       status: 502,
       startTime,
-      error: `Image provider error: ${err.message}`,
+      error: `Image provider error: ${sanitizeErrorMessage((err as Error).message || err)}`,
     });
   }
 }
@@ -1054,52 +1421,107 @@ async function handleStabilityAIImageGeneration({
         ? normalizeRequestedImageFormat(body, "png", ["png", "webp"])
         : normalizeRequestedImageFormat(body, "png"),
   };
+  const formData = new FormData();
 
-  if (body.prompt) upstreamBody.prompt = body.prompt;
-  if (body.negative_prompt) upstreamBody.negative_prompt = body.negative_prompt;
-  if (body.seed !== undefined) upstreamBody.seed = body.seed;
+  appendOptionalFormValue(formData, "output_format", upstreamBody.output_format);
+  if (body.prompt) {
+    upstreamBody.prompt = body.prompt;
+    appendOptionalFormValue(formData, "prompt", body.prompt);
+  }
+  if (body.negative_prompt) {
+    upstreamBody.negative_prompt = body.negative_prompt;
+    appendOptionalFormValue(formData, "negative_prompt", body.negative_prompt);
+  }
+  if (body.seed !== undefined) {
+    upstreamBody.seed = body.seed;
+    appendOptionalFormValue(formData, "seed", body.seed);
+  }
 
   try {
     if (STABILITY_GENERATION_ENDPOINTS[model]) {
-      if (model.startsWith("sd3") && model !== "sd3") {
+      if (model.startsWith("sd3.5")) {
         upstreamBody.model = model;
+        appendOptionalFormValue(formData, "model", model);
       }
 
       if (imageUrl) {
+        const imageSource = await resolveImageSource(imageUrl);
         upstreamBody.mode = "image-to-image";
-        upstreamBody.image = (await resolveImageSource(imageUrl)).base64;
-        if (body.strength !== undefined) upstreamBody.strength = body.strength;
+        appendOptionalFormValue(formData, "mode", "image-to-image");
+        upstreamBody.image = imageSource.base64;
+        appendImageFormValue(formData, "image", imageSource, "image");
+        if (body.strength !== undefined) {
+          upstreamBody.strength = body.strength;
+          appendOptionalFormValue(formData, "strength", body.strength);
+        }
       } else {
         upstreamBody.mode = "text-to-image";
+        appendOptionalFormValue(formData, "mode", "text-to-image");
       }
 
-      if (!model.startsWith("sd3") || !imageUrl) {
-        upstreamBody.aspect_ratio = body.aspect_ratio || mapImageSize(body.size);
+      if (!model.startsWith("sd3.5") || !imageUrl) {
+        const aspectRatio = body.aspect_ratio || mapImageSize(body.size);
+        upstreamBody.aspect_ratio = aspectRatio;
+        appendOptionalFormValue(formData, "aspect_ratio", aspectRatio);
       }
 
-      if (body.style_preset) upstreamBody.style_preset = body.style_preset;
+      if (body.style_preset) {
+        upstreamBody.style_preset = body.style_preset;
+        appendOptionalFormValue(formData, "style_preset", body.style_preset);
+      }
     } else {
       if (imageUrl) {
-        upstreamBody.image = (await resolveImageSource(imageUrl)).base64;
+        const imageSource = await resolveImageSource(imageUrl);
+        upstreamBody.image = imageSource.base64;
+        appendImageFormValue(formData, "image", imageSource, "image");
       }
 
       if (maskUrl && shouldIncludeStabilityMask(model)) {
-        upstreamBody.mask = (await resolveImageSource(maskUrl)).base64;
+        const maskSource = await resolveImageSource(maskUrl);
+        upstreamBody.mask = maskSource.base64;
+        appendImageFormValue(formData, "mask", maskSource, "mask");
       }
 
-      if (body.search_prompt) upstreamBody.search_prompt = body.search_prompt;
-      if (body.grow_mask !== undefined) upstreamBody.grow_mask = body.grow_mask;
-      if (body.control_strength !== undefined)
+      if (body.search_prompt) {
+        upstreamBody.search_prompt = body.search_prompt;
+        appendOptionalFormValue(formData, "search_prompt", body.search_prompt);
+      }
+      if (body.grow_mask !== undefined) {
+        upstreamBody.grow_mask = body.grow_mask;
+        appendOptionalFormValue(formData, "grow_mask", body.grow_mask);
+      }
+      if (body.control_strength !== undefined) {
         upstreamBody.control_strength = body.control_strength;
-      if (body.creativity !== undefined) upstreamBody.creativity = body.creativity;
-      if (body.left !== undefined) upstreamBody.left = body.left;
-      if (body.right !== undefined) upstreamBody.right = body.right;
-      if (body.up !== undefined) upstreamBody.up = body.up;
-      if (body.down !== undefined) upstreamBody.down = body.down;
-      if (body.style_preset) upstreamBody.style_preset = body.style_preset;
+        appendOptionalFormValue(formData, "control_strength", body.control_strength);
+      }
+      if (body.creativity !== undefined) {
+        upstreamBody.creativity = body.creativity;
+        appendOptionalFormValue(formData, "creativity", body.creativity);
+      }
+      if (body.left !== undefined) {
+        upstreamBody.left = body.left;
+        appendOptionalFormValue(formData, "left", body.left);
+      }
+      if (body.right !== undefined) {
+        upstreamBody.right = body.right;
+        appendOptionalFormValue(formData, "right", body.right);
+      }
+      if (body.up !== undefined) {
+        upstreamBody.up = body.up;
+        appendOptionalFormValue(formData, "up", body.up);
+      }
+      if (body.down !== undefined) {
+        upstreamBody.down = body.down;
+        appendOptionalFormValue(formData, "down", body.down);
+      }
+      if (body.style_preset) {
+        upstreamBody.style_preset = body.style_preset;
+        appendOptionalFormValue(formData, "style_preset", body.style_preset);
+      }
 
       if (STABILITY_CONTROL_MODELS.has(model) && !upstreamBody.prompt) {
         upstreamBody.prompt = body.prompt || "";
+        appendOptionalFormValue(formData, "prompt", body.prompt || "");
       }
     }
 
@@ -1111,11 +1533,10 @@ async function handleStabilityAIImageGeneration({
     const response = await fetch(`${providerConfig.baseUrl.replace(/\/$/, "")}${endpoint}`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
         Accept: "application/json",
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify(upstreamBody),
+      body: formData,
     });
 
     if (!response.ok) {
@@ -1158,7 +1579,7 @@ async function handleStabilityAIImageGeneration({
       model,
       status: 502,
       startTime,
-      error: `Image provider error: ${err.message}`,
+      error: `Image provider error: ${sanitizeErrorMessage((err as Error).message || err)}`,
     });
   }
 }
@@ -1277,7 +1698,7 @@ async function handleBlackForestLabsImageGeneration({
       model,
       status: 502,
       startTime,
-      error: `Image provider error: ${err.message}`,
+      error: `Image provider error: ${sanitizeErrorMessage((err as Error).message || err)}`,
     });
   }
 }
@@ -1352,7 +1773,7 @@ async function handleRecraftImageGeneration({
       model,
       status: 502,
       startTime,
-      error: `Image provider error: ${err.message}`,
+      error: `Image provider error: ${sanitizeErrorMessage((err as Error).message || err)}`,
     });
   }
 }
@@ -1440,7 +1861,7 @@ async function handleTopazImageGeneration({
       model,
       status: 502,
       startTime,
-      error: `Image provider error: ${err.message}`,
+      error: `Image provider error: ${sanitizeErrorMessage((err as Error).message || err)}`,
     });
   }
 }
@@ -1547,15 +1968,11 @@ async function resolveImageSource(source) {
   }
 
   if (isHttpUrl(trimmed)) {
-    const response = await fetch(trimmed);
-    if (!response.ok) {
-      throw new Error(`Failed to fetch image source (${response.status})`);
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
+    const remoteImage = await fetchRemoteImage(trimmed);
     return {
-      buffer,
-      base64: buffer.toString("base64"),
-      contentType: response.headers.get("content-type") || "application/octet-stream",
+      buffer: remoteImage.buffer,
+      base64: remoteImage.buffer.toString("base64"),
+      contentType: remoteImage.contentType,
     };
   }
 
@@ -1723,7 +2140,7 @@ function isHttpUrl(value) {
 }
 
 /**
- * Codex image generation — translate DALL-E-style /v1/images/generations
+ * Codex image generation — translate GPT-Image-style /v1/images/generations
  * request into a /v1/responses call with the `image_generation` hosted tool,
  * parse the SSE stream, and return the base64 PNG in OpenAI image response shape.
  *
@@ -1759,9 +2176,9 @@ export function extractImageGenerationCalls(
 }
 
 // The image_generation hosted tool accepts { "auto" | "low" | "medium" | "high" }
-// for `quality`. DALL-E clients often send "standard" / "hd". Map legacy values
+// for `quality`. Legacy image clients often send "standard" / "hd". Map those values
 // so OpenWebUI's quality dropdown doesn't silently get rejected upstream.
-function mapDalleQualityToImageTool(value: string): string {
+function mapLegacyImageQualityToImageTool(value: string): string {
   const normalized = value.toLowerCase();
   if (normalized === "standard") return "medium";
   if (normalized === "hd") return "high";
@@ -1793,7 +2210,7 @@ async function handleCodexImageGeneration({
   if (log && requestedCount > 1) {
     log.warn(
       "IMAGE",
-      `Codex hosted image_generation returns one image per call; requested n=${requestedCount} will run sequentially`
+      `Codex hosted image_generation returns one image per call; requested n=${requestedCount} will fan out in parallel`
     );
   }
 
@@ -1815,7 +2232,7 @@ async function handleCodexImageGeneration({
       ? (credentials.providerSpecificData as Record<string, unknown>).workspaceId
       : undefined;
 
-  // Forward size/quality from the DALL-E-style body into the hosted tool so
+  // Forward size/quality from the GPT-Image-style body into the hosted tool so
   // OpenWebUI's size/quality selectors actually take effect. Everything else
   // (model, n, background, moderation, output_compression) is left to the
   // Codex backend's defaults — today that's `gpt-image-2`.
@@ -1824,7 +2241,7 @@ async function handleCodexImageGeneration({
     toolConfig.size = body.size.trim();
   }
   if (typeof body.quality === "string" && body.quality.trim()) {
-    toolConfig.quality = mapDalleQualityToImageTool(body.quality.trim());
+    toolConfig.quality = mapLegacyImageQualityToImageTool(body.quality.trim());
   }
 
   const upstreamBody: Record<string, unknown> = {
@@ -1862,8 +2279,7 @@ async function handleCodexImageGeneration({
     );
   }
 
-  const collected: Array<{ b64_json: string; revised_prompt?: string }> = [];
-  for (let i = 0; i < requestedCount; i++) {
+  const fetchOneImage = async () => {
     let response: Response;
     try {
       response = await fetch(providerConfig.baseUrl, {
@@ -1873,44 +2289,64 @@ async function handleCodexImageGeneration({
       });
     } catch (err) {
       if (log) log.error("IMAGE", `${provider} fetch error: ${(err as Error).message}`);
-      return saveImageErrorResult({
-        provider,
-        model,
-        status: 502,
-        startTime,
-        error: `Image provider error: ${(err as Error).message}`,
-        requestBody: upstreamBody,
-      });
+      return {
+        ok: false as const,
+        error: {
+          provider,
+          model,
+          status: 502,
+          startTime,
+          error: `Image provider error: ${(err as Error).message}`,
+          requestBody: upstreamBody,
+        },
+      };
     }
 
     if (!response.ok) {
       const errorText = await response.text();
       if (log)
         log.error("IMAGE", `${provider} error ${response.status}: ${errorText.slice(0, 200)}`);
-      return saveImageErrorResult({
-        provider,
-        model,
-        status: response.status,
-        startTime,
-        error: errorText,
-        requestBody: upstreamBody,
-      });
+      return {
+        ok: false as const,
+        error: {
+          provider,
+          model,
+          status: response.status,
+          startTime,
+          error: errorText,
+          requestBody: upstreamBody,
+        },
+      };
     }
 
     const rawSSE = await response.text();
     const items = extractImageGenerationCalls(rawSSE);
     if (items.length === 0) {
-      return saveImageErrorResult({
-        provider,
-        model,
-        status: 502,
-        startTime,
-        error:
-          "Codex completed without producing an image_generation_call — the model may have declined the tool",
-        requestBody: upstreamBody,
-      });
+      return {
+        ok: false as const,
+        error: {
+          provider,
+          model,
+          status: 502,
+          startTime,
+          error:
+            "Codex completed without producing an image_generation_call — the model may have declined the tool",
+          requestBody: upstreamBody,
+        },
+      };
     }
-    for (const item of items) {
+
+    return { ok: true as const, items };
+  };
+
+  const imageResults = await Promise.all(
+    Array.from({ length: requestedCount }, () => fetchOneImage())
+  );
+
+  const collected: Array<{ b64_json: string; revised_prompt?: string }> = [];
+  for (const imageResult of imageResults) {
+    if (!imageResult.ok) return saveImageErrorResult(imageResult.error);
+    for (const item of imageResult.items) {
       collected.push({
         b64_json: item.b64,
         ...(item.revisedPrompt ? { revised_prompt: item.revisedPrompt } : {}),
@@ -1936,7 +2372,7 @@ async function handleCodexImageGeneration({
   });
 }
 
-function saveImageSuccessResult({
+export function saveImageSuccessResult({
   provider,
   model,
   startTime,
@@ -1965,7 +2401,7 @@ function saveImageSuccessResult({
   };
 }
 
-function saveImageErrorResult({ provider, model, status, startTime, error, requestBody = null }) {
+export function saveImageErrorResult({ provider, model, status, startTime, error, requestBody = null }) {
   saveCallLog({
     method: "POST",
     path: "/v1/images/generations",
@@ -1989,11 +2425,33 @@ function saveImageErrorResult({ provider, model, status, startTime, error, reque
  */
 async function fetchImageEndpoint(url, headers, body, provider, log) {
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body,
-    });
+    let response;
+    try {
+      response = await fetchWithTimeout(url, {
+        method: "POST",
+        headers,
+        body,
+        timeoutMs: getConfiguredTimeout(),
+      });
+    } catch (err: unknown) {
+      const isAbortError =
+        typeof err === "object" &&
+        err !== null &&
+        "name" in err &&
+        (err as { name?: unknown }).name === "AbortError";
+      if (err instanceof FetchTimeoutError || isAbortError) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (log) {
+          log.error("IMAGE", `${provider} fetch error: ${message}`);
+        }
+        return {
+          success: false,
+          status: 504,
+          error: `Image provider error: ${sanitizeErrorMessage(message || err)}`,
+        };
+      }
+      throw err;
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -2017,14 +2475,15 @@ async function fetchImageEndpoint(url, headers, body, provider, log) {
         data: data.data || [],
       },
     };
-  } catch (err) {
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
     if (log) {
-      log.error("IMAGE", `${provider} fetch error: ${err.message}`);
+      log.error("IMAGE", `${provider} fetch error: ${message}`);
     }
     return {
       success: false,
       status: 502,
-      error: `Image provider error: ${err.message}`,
+      error: `Image provider error: ${sanitizeErrorMessage(message || err)}`,
     };
   }
 }
@@ -2032,100 +2491,6 @@ async function fetchImageEndpoint(url, headers, body, provider, log) {
 /**
  * Handle Hyperbolic image generation
  * Uses { model_name, prompt, height, width } and returns { images: [{ image: base64 }] }
- */
-async function handleHyperbolicImageGeneration({
-  model,
-  provider,
-  providerConfig,
-  body,
-  credentials,
-  log,
-}) {
-  const startTime = Date.now();
-  const token = credentials.apiKey || credentials.accessToken;
-
-  const [width, height] = (body.size || "1024x1024").split("x").map(Number);
-
-  const upstreamBody = {
-    model_name: model,
-    prompt: body.prompt,
-    height: height || 1024,
-    width: width || 1024,
-    backend: "auto",
-  };
-
-  if (log) {
-    const promptPreview = String(body.prompt ?? "").slice(0, 60);
-    log.info("IMAGE", `${provider}/${model} (hyperbolic) | prompt: "${promptPreview}..."`);
-  }
-
-  try {
-    const response = await fetch(providerConfig.baseUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(upstreamBody),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      if (log)
-        log.error("IMAGE", `${provider} error ${response.status}: ${errorText.slice(0, 200)}`);
-
-      saveCallLog({
-        method: "POST",
-        path: "/v1/images/generations",
-        status: response.status,
-        model: `${provider}/${model}`,
-        provider,
-        duration: Date.now() - startTime,
-        error: errorText.slice(0, 500),
-      }).catch(() => {});
-
-      return { success: false, status: response.status, error: errorText };
-    }
-
-    const data = await response.json();
-    // Transform { images: [{ image: base64 }] } → OpenAI format
-    const images = (data.images || []).map((img) => ({
-      b64_json: img.image,
-      revised_prompt: body.prompt,
-    }));
-
-    saveCallLog({
-      method: "POST",
-      path: "/v1/images/generations",
-      status: 200,
-      model: `${provider}/${model}`,
-      provider,
-      duration: Date.now() - startTime,
-      responseBody: { images_count: images.length },
-    }).catch(() => {});
-
-    return {
-      success: true,
-      data: { created: Math.floor(Date.now() / 1000), data: images },
-    };
-  } catch (err) {
-    if (log) log.error("IMAGE", `${provider} fetch error: ${err.message}`);
-    saveCallLog({
-      method: "POST",
-      path: "/v1/images/generations",
-      status: 502,
-      model: `${provider}/${model}`,
-      provider,
-      duration: Date.now() - startTime,
-      error: err.message,
-    }).catch(() => {});
-    return { success: false, status: 502, error: `Image provider error: ${err.message}` };
-  }
-}
-
-/**
- * Handle NanoBanana image generation
- * NanoBanana is async (submit task -> poll status -> return final image URL/base64)
  */
 async function handleNanoBananaImageGeneration({
   model,
@@ -2373,7 +2738,11 @@ async function handleNanoBananaImageGeneration({
       duration: Date.now() - startTime,
       error: err.message,
     }).catch(() => {});
-    return { success: false, status: 502, error: `Image provider error: ${err.message}` };
+    return {
+      success: false,
+      status: 502,
+      error: `Image provider error: ${sanitizeErrorMessage((err as Error).message || err)}`,
+    };
   }
 }
 
@@ -2437,12 +2806,8 @@ async function normalizeNanoBananaTaskResult(taskData, body, log) {
 
     if (urlCandidates.length > 0) {
       const firstUrl = urlCandidates[0];
-      const resp = await fetch(firstUrl);
-      if (!resp.ok) {
-        throw new Error(`Failed to fetch NanoBanana result image URL (${resp.status})`);
-      }
-      const arrayBuffer = await resp.arrayBuffer();
-      const base64 = Buffer.from(arrayBuffer).toString("base64");
+      const remoteImage = await fetchRemoteImage(firstUrl);
+      const base64 = remoteImage.buffer.toString("base64");
       return [{ b64_json: base64, revised_prompt: body.prompt }];
     }
   }
@@ -2484,326 +2849,8 @@ function normalizePositiveNumber(value, fallback) {
   return Math.floor(n);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /**
  * Handle SD WebUI image generation (local, no auth)
  * POST {baseUrl} with { prompt, negative_prompt, width, height, steps }
  * Response: { images: ["base64..."] }
  */
-async function handleSDWebUIImageGeneration({ model, provider, providerConfig, body, log }) {
-  const startTime = Date.now();
-  const [width, height] = (body.size || "512x512").split("x").map(Number);
-
-  const upstreamBody = {
-    prompt: body.prompt,
-    negative_prompt: body.negative_prompt || "",
-    width: width || 512,
-    height: height || 512,
-    steps: body.steps || 20,
-    cfg_scale: body.cfg_scale || 7,
-    sampler_name: body.sampler || "Euler a",
-    batch_size: body.n || 1,
-    override_settings: {
-      sd_model_checkpoint: model,
-    },
-  };
-
-  if (log) {
-    const promptPreview = String(body.prompt ?? "").slice(0, 60);
-    log.info("IMAGE", `${provider}/${model} (sdwebui) | prompt: "${promptPreview}..."`);
-  }
-
-  try {
-    const response = await fetch(providerConfig.baseUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(upstreamBody),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      if (log)
-        log.error("IMAGE", `${provider} error ${response.status}: ${errorText.slice(0, 200)}`);
-
-      saveCallLog({
-        method: "POST",
-        path: "/v1/images/generations",
-        status: response.status,
-        model: `${provider}/${model}`,
-        provider,
-        duration: Date.now() - startTime,
-        error: errorText.slice(0, 500),
-      }).catch(() => {});
-
-      return { success: false, status: response.status, error: errorText };
-    }
-
-    const data = await response.json();
-    // SD WebUI returns { images: ["base64...", ...] }
-    const images = (data.images || []).map((b64) => ({
-      b64_json: b64,
-      revised_prompt: body.prompt,
-    }));
-
-    saveCallLog({
-      method: "POST",
-      path: "/v1/images/generations",
-      status: 200,
-      model: `${provider}/${model}`,
-      provider,
-      duration: Date.now() - startTime,
-      responseBody: { images_count: images.length },
-    }).catch(() => {});
-
-    return {
-      success: true,
-      data: { created: Math.floor(Date.now() / 1000), data: images },
-    };
-  } catch (err) {
-    if (log) log.error("IMAGE", `${provider} sdwebui error: ${err.message}`);
-    saveCallLog({
-      method: "POST",
-      path: "/v1/images/generations",
-      status: 502,
-      model: `${provider}/${model}`,
-      provider,
-      duration: Date.now() - startTime,
-      error: err.message,
-    }).catch(() => {});
-    return { success: false, status: 502, error: `Image provider error: ${err.message}` };
-  }
-}
-
-/**
- * Handle ComfyUI image generation (local, no auth)
- * Submits a txt2img workflow, polls for completion, fetches output
- */
-async function handleComfyUIImageGeneration({ model, provider, providerConfig, body, log }) {
-  const startTime = Date.now();
-  const [width, height] = (body.size || "1024x1024").split("x").map(Number);
-
-  // Default txt2img workflow template for ComfyUI
-  const workflow = {
-    "3": {
-      class_type: "KSampler",
-      inputs: {
-        seed: parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % 2 ** 32,
-        steps: body.steps || 20,
-        cfg: body.cfg_scale || 7,
-        sampler_name: "euler",
-        scheduler: "normal",
-        denoise: 1,
-        model: ["4", 0],
-        positive: ["6", 0],
-        negative: ["7", 0],
-        latent_image: ["5", 0],
-      },
-    },
-    "4": {
-      class_type: "CheckpointLoaderSimple",
-      inputs: { ckpt_name: model },
-    },
-    "5": {
-      class_type: "EmptyLatentImage",
-      inputs: { width: width || 1024, height: height || 1024, batch_size: body.n || 1 },
-    },
-    "6": {
-      class_type: "CLIPTextEncode",
-      inputs: { text: body.prompt, clip: ["4", 1] },
-    },
-    "7": {
-      class_type: "CLIPTextEncode",
-      inputs: { text: body.negative_prompt || "", clip: ["4", 1] },
-    },
-    "8": {
-      class_type: "VAEDecode",
-      inputs: { samples: ["3", 0], vae: ["4", 2] },
-    },
-    "9": {
-      class_type: "SaveImage",
-      inputs: { filename_prefix: "omniroute", images: ["8", 0] },
-    },
-  };
-
-  if (log) {
-    const promptPreview = String(body.prompt ?? "").slice(0, 60);
-    log.info("IMAGE", `${provider}/${model} (comfyui) | prompt: "${promptPreview}..."`);
-  }
-
-  try {
-    const promptId = await submitComfyWorkflow(providerConfig.baseUrl, workflow);
-    const historyEntry = await pollComfyResult(providerConfig.baseUrl, promptId);
-    const outputFiles = extractComfyOutputFiles(historyEntry);
-
-    const images = [];
-    for (const file of outputFiles) {
-      const buffer = await fetchComfyOutput(
-        providerConfig.baseUrl,
-        file.filename,
-        file.subfolder,
-        file.type
-      );
-      const base64 = Buffer.from(buffer).toString("base64");
-      images.push({ b64_json: base64, revised_prompt: body.prompt });
-    }
-
-    saveCallLog({
-      method: "POST",
-      path: "/v1/images/generations",
-      status: 200,
-      model: `${provider}/${model}`,
-      provider,
-      duration: Date.now() - startTime,
-      responseBody: { images_count: images.length },
-    }).catch(() => {});
-
-    return {
-      success: true,
-      data: { created: Math.floor(Date.now() / 1000), data: images },
-    };
-  } catch (err) {
-    if (log) log.error("IMAGE", `${provider} comfyui error: ${err.message}`);
-    saveCallLog({
-      method: "POST",
-      path: "/v1/images/generations",
-      status: 502,
-      model: `${provider}/${model}`,
-      provider,
-      duration: Date.now() - startTime,
-      error: err.message,
-    }).catch(() => {});
-    return { success: false, status: 502, error: `Image provider error: ${err.message}` };
-  }
-}
-
-type Imagen3ImageGenArgs = {
-  model: string;
-  provider: string;
-  providerConfig: { baseUrl: string };
-  body: { prompt?: string; size?: string; n?: number };
-  credentials: { apiKey?: string; accessToken?: string };
-  log?: {
-    info?: (tag: string, msg: string) => void;
-    error?: (tag: string, msg: string) => void;
-  } | null;
-};
-
-type Imagen3NormalizedImage = {
-  b64_json?: unknown;
-  url?: unknown;
-  revised_prompt?: string;
-};
-
-/**
- * Handle Imagen 3 image generation
- */
-async function handleImagen3ImageGeneration({
-  model,
-  provider,
-  providerConfig,
-  body,
-  credentials,
-  log,
-}: Imagen3ImageGenArgs) {
-  const startTime = Date.now();
-  const token = credentials.apiKey || credentials.accessToken;
-  const aspectRatio = mapImageSize(body.size);
-
-  const upstreamBody = {
-    prompt: body.prompt,
-    aspect_ratio: aspectRatio,
-    number_of_images: body.n ?? 1,
-  };
-
-  if (log) {
-    const promptPreview = String(body.prompt ?? "").slice(0, 60);
-    log.info(
-      "IMAGE",
-      `${provider}/${model} (imagen3) | prompt: "${promptPreview}..." | aspect_ratio: ${aspectRatio}`
-    );
-  }
-
-  try {
-    const response = await fetch(providerConfig.baseUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(upstreamBody),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      if (log)
-        log.error("IMAGE", `${provider} error ${response.status}: ${errorText.slice(0, 200)}`);
-
-      saveCallLog({
-        method: "POST",
-        path: "/v1/images/generations",
-        status: response.status,
-        model: `${provider}/${model}`,
-        provider,
-        duration: Date.now() - startTime,
-        error: errorText.slice(0, 500),
-        requestBody: upstreamBody,
-      }).catch(() => {});
-
-      return { success: false, status: response.status, error: errorText };
-    }
-
-    const data = await response.json();
-
-    // Normalize response to OpenAI format
-    const images: Imagen3NormalizedImage[] = [];
-    if (Array.isArray(data.images)) {
-      images.push(
-        ...data.images.map((img: Record<string, unknown>) => ({
-          b64_json: img.image ?? img.b64_json ?? img.url ?? img,
-          revised_prompt: body.prompt,
-        }))
-      );
-    } else if (Array.isArray(data.data)) {
-      images.push(...data.data);
-    } else if (data.url || data.b64_json || data.image) {
-      images.push({
-        b64_json: data.image || data.b64_json || data.url,
-        url: data.url,
-        revised_prompt: body.prompt,
-      });
-    }
-
-    saveCallLog({
-      method: "POST",
-      path: "/v1/images/generations",
-      status: 200,
-      model: `${provider}/${model}`,
-      provider,
-      duration: Date.now() - startTime,
-      responseBody: { images_count: images.length },
-    }).catch(() => {});
-
-    return {
-      success: true,
-      data: { created: data.created || Math.floor(Date.now() / 1000), data: images },
-    };
-  } catch (err: unknown) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    if (log) log.error("IMAGE", `${provider} fetch error: ${errMsg}`);
-
-    saveCallLog({
-      method: "POST",
-      path: "/v1/images/generations",
-      status: 502,
-      model: `${provider}/${model}`,
-      provider,
-      duration: Date.now() - startTime,
-      error: errMsg,
-    }).catch(() => {});
-
-    return { success: false, status: 502, error: `Image provider error: ${errMsg}` };
-  }
-}

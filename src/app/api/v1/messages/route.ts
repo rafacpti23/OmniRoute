@@ -1,6 +1,6 @@
-import { CORS_ORIGIN } from "@/shared/utils/cors";
 import { handleChat } from "@/sse/handlers/chat";
 import { initTranslators } from "@omniroute/open-sse/translator/index.ts";
+import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 
 let initialized = false;
 
@@ -21,7 +21,6 @@ async function ensureInitialized() {
 export async function OPTIONS() {
   return new Response(null, {
     headers: {
-      "Access-Control-Allow-Origin": CORS_ORIGIN,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "*",
     },
@@ -31,7 +30,9 @@ export async function OPTIONS() {
 /**
  * POST /v1/messages - Claude format (auto convert via handleChat)
  */
-export async function POST(request) {
+async function postHandler(request, context) {
   await ensureInitialized();
   return await handleChat(request);
 }
+
+export const POST = withInjectionGuard(postHandler);

@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  BAILIAN_WINDOW_5H,
+  BAILIAN_WINDOW_MONTHLY,
+  BAILIAN_WINDOW_WEEKLY,
   fetchBailianQuota,
   invalidateBailianQuotaCache,
   registerBailianCodingPlanQuotaFetcher,
@@ -216,6 +219,9 @@ test("fetchBailianQuota parses triple-window and returns percentUsed = max(5h%, 
   assert.equal(quota?.window5h?.percentUsed, 0.6);
   assert.equal(quota?.windowWeekly?.percentUsed, 0.8);
   assert.equal(quota?.windowMonthly?.percentUsed, 0.4);
+  assert.equal(quota?.windows?.[BAILIAN_WINDOW_5H]?.percentUsed, 0.6);
+  assert.equal(quota?.windows?.[BAILIAN_WINDOW_WEEKLY]?.percentUsed, 0.8);
+  assert.equal(quota?.windows?.[BAILIAN_WINDOW_MONTHLY]?.percentUsed, 0.4);
 
   invalidateBailianQuotaCache(connectionId);
 });
@@ -511,6 +517,9 @@ test("registerBailianCodingPlanQuotaFetcher exposes Bailian quota to preflight a
 
   registerBailianCodingPlanQuotaFetcher();
 
+  // Use 100/100 (fully exhausted) to avoid floating-point boundary issues:
+  // (1 - 0.98) * 100 = 2.0000000000000018, which is > DEFAULT_MIN_REMAINING_PERCENT (2),
+  // so the preflight wouldn't block. 100% used → 0% remaining, clearly below 2%.
   globalThis.fetch = async () =>
     new Response(
       JSON.stringify({
@@ -520,7 +529,7 @@ test("registerBailianCodingPlanQuotaFetcher exposes Bailian quota to preflight a
             {
               planName: "Qwen3 Coder Next",
               codingPlanQuotaInfo: {
-                per5HourUsedQuota: 98,
+                per5HourUsedQuota: 100,
                 per5HourTotalQuota: 100,
                 per5HourQuotaNextRefreshTime: 1718304000,
                 perWeekUsedQuota: 90,

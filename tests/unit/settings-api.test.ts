@@ -58,7 +58,12 @@ after(() => {
   harness.cleanup();
 });
 
-describe("Settings API - debugMode and hiddenSidebarItems", () => {
+describe("Settings API - persisted preferences", () => {
+  test("getSettings defaults Responses previous_response_id handling to auto", async () => {
+    const settings = await harness.getSettings();
+    assert.strictEqual(settings.responsesPreviousResponseIdMode, "auto");
+  });
+
   describe("debugMode", () => {
     test("updateSettings with debugMode=true succeeds", async () => {
       const result = await harness.updateSettings({ debugMode: true });
@@ -103,6 +108,36 @@ describe("Settings API - debugMode and hiddenSidebarItems", () => {
     });
   });
 
+  describe("hiddenSidebarGroupLabels", () => {
+    test("updateSettings with hiddenSidebarGroupLabels=['logs','audit'] succeeds", async () => {
+      const result = await harness.updateSettings({ hiddenSidebarGroupLabels: ["logs", "audit"] });
+      assert.ok(result, "updateSettings should return truthy result");
+
+      const settings = await harness.getSettings();
+      assert.deepStrictEqual(
+        settings.hiddenSidebarGroupLabels,
+        ["logs", "audit"],
+        "hiddenSidebarGroupLabels should contain logs and audit"
+      );
+    });
+
+    test("PATCH /api/settings persists hiddenSidebarGroupLabels", async () => {
+      const response = await harness.settingsRoute.PATCH(
+        await makeManagementSessionRequest("http://localhost/api/settings", {
+          method: "PATCH",
+          body: { hiddenSidebarGroupLabels: ["system"] },
+        })
+      );
+      const body = (await response.json()) as Record<string, unknown>;
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(body.hiddenSidebarGroupLabels, ["system"]);
+
+      const settings = await harness.getSettings();
+      assert.deepEqual(settings.hiddenSidebarGroupLabels, ["system"]);
+    });
+  });
+
   describe("combined updates", () => {
     test("updateSettings with both debugMode and hiddenSidebarItems succeeds", async () => {
       const result = await harness.updateSettings({
@@ -134,6 +169,75 @@ describe("Settings API - debugMode and hiddenSidebarItems", () => {
       );
     });
 
+    test("PATCH /api/settings persists endpoint tunnel visibility", async () => {
+      const response = await harness.settingsRoute.PATCH(
+        await makeManagementSessionRequest("http://localhost/api/settings", {
+          method: "PATCH",
+          body: {
+            hideEndpointCloudflaredTunnel: true,
+            hideEndpointTailscaleFunnel: true,
+            hideEndpointNgrokTunnel: true,
+          },
+        })
+      );
+      const body = (await response.json()) as Record<string, unknown>;
+
+      assert.equal(response.status, 200);
+      assert.equal(body.hideEndpointCloudflaredTunnel, true);
+      assert.equal(body.hideEndpointTailscaleFunnel, true);
+      assert.equal(body.hideEndpointNgrokTunnel, true);
+
+      const settings = await harness.getSettings();
+      assert.equal(settings.hideEndpointCloudflaredTunnel, true);
+      assert.equal(settings.hideEndpointTailscaleFunnel, true);
+      assert.equal(settings.hideEndpointNgrokTunnel, true);
+    });
+
+    test("PATCH /api/settings persists Responses previous_response_id handling", async () => {
+      const response = await harness.settingsRoute.PATCH(
+        await makeManagementSessionRequest("http://localhost/api/settings", {
+          method: "PATCH",
+          body: { responsesPreviousResponseIdMode: "strip" },
+        })
+      );
+      const body = (await response.json()) as Record<string, unknown>;
+
+      assert.equal(response.status, 200);
+      assert.equal(body.responsesPreviousResponseIdMode, "strip");
+
+      const settings = await harness.getSettings();
+      assert.equal(settings.responsesPreviousResponseIdMode, "strip");
+    });
+
+    test("GET /api/settings returns Cache-Control: no-store (ported from upstream #951)", async () => {
+      const response = await harness.settingsRoute.GET(
+        await makeManagementSessionRequest("http://localhost/api/settings", {
+          method: "GET",
+        })
+      );
+      assert.equal(response.status, 200);
+      assert.equal(
+        response.headers.get("Cache-Control"),
+        "no-store",
+        "GET /api/settings must return Cache-Control: no-store so persisted settings stay fresh after refresh/restart"
+      );
+    });
+
+    test("PATCH /api/settings returns Cache-Control: no-store (ported from upstream #951)", async () => {
+      const response = await harness.settingsRoute.PATCH(
+        await makeManagementSessionRequest("http://localhost/api/settings", {
+          method: "PATCH",
+          body: { debugMode: true },
+        })
+      );
+      assert.equal(response.status, 200);
+      assert.equal(
+        response.headers.get("Cache-Control"),
+        "no-store",
+        "PATCH /api/settings must return Cache-Control: no-store"
+      );
+    });
+
     test("PUT /api/settings reuses the PATCH update flow", async () => {
       const response = await harness.settingsRoute.PUT(
         await makeManagementSessionRequest("http://localhost/api/settings", {
@@ -141,7 +245,7 @@ describe("Settings API - debugMode and hiddenSidebarItems", () => {
           body: { antigravitySignatureCacheMode: "bypass" },
         })
       );
-      const body = (await response.json()) as any;
+      const body = (await response.json()) as Record<string, unknown>;
 
       assert.equal(response.status, 200);
       assert.equal(body.antigravitySignatureCacheMode, "bypass");

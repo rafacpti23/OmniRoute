@@ -29,6 +29,10 @@ export const PROVIDER_ENDPOINTS = {
   minimax: "https://api.minimax.io/anthropic/v1/messages",
   "minimax-cn": "https://api.minimaxi.com/anthropic/v1/messages",
   crof: "https://crof.ai/v1/chat/completions",
+  zenmux: "https://zenmux.ai/api/v1/chat/completions",
+  openadapter: "https://api.openadapter.in/v1/chat/completions",
+  dit: "https://api.dit.ai/v1/chat/completions",
+  tokenrouter: "https://api.tokenrouter.com/v1/chat/completions",
   openai: "https://api.openai.com/v1/chat/completions",
   anthropic: "https://api.anthropic.com/v1/messages",
   gemini: "https://generativelanguage.googleapis.com/v1beta/models",
@@ -36,7 +40,7 @@ export const PROVIDER_ENDPOINTS = {
 
 // Re-export from providers.js for backward compatibility
 export {
-  FREE_PROVIDERS,
+  NOAUTH_PROVIDERS,
   OAUTH_PROVIDERS,
   APIKEY_PROVIDERS,
   WEB_COOKIE_PROVIDERS,

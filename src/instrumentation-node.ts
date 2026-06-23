@@ -83,6 +83,25 @@ export async function registerNodejs(): Promise<void> {
   const { initConsoleInterceptor } = await import("@/lib/consoleInterceptor");
   initConsoleInterceptor();
 
+  // Clear stale transient connection cooldowns persisted from an unclean crash.
+  // A crash mid-burst can leave far-future `rate_limited_until` values in the DB
+  // that cause every connection to be skipped by getProviderCredentials(), making
+  // all subsequent requests time out at Bottleneck's maxWaitMs (120 s default).
+  // Terminal states (banned / expired / credits_exhausted) are intentionally kept.
+  // See: https://github.com/diegosouzapw/OmniRoute/issues/3625 (Part A)
+  try {
+    const { clearStaleCrashCooldowns } = await import("@/lib/db/providers");
+    const { cleared } = clearStaleCrashCooldowns();
+    if (cleared > 0) {
+      console.log(
+        `[STARTUP] Cleared ${cleared} stale transient connection cooldown(s) from prior crash (#3625)`
+      );
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn("[STARTUP] Could not clear stale crash cooldowns (non-fatal):", msg);
+  }
+
   const [
     { initGracefulShutdown },
     { initApiBridgeServer },
@@ -136,11 +155,15 @@ export async function registerNodejs(): Promise<void> {
   }
 
   try {
-    const [{ migrateCodexConnectionDefaultsFromLegacySettings }, { seedDefaultModelAliases }] =
-      await Promise.all([
-        import("@/lib/providers/codexConnectionDefaults"),
-        import("@/lib/modelAliasSeed"),
-      ]);
+    const [
+      { migrateCodexConnectionDefaultsFromLegacySettings },
+      { startSessionAccountAffinityCleanup },
+      { seedDefaultModelAliases },
+    ] = await Promise.all([
+      import("@/lib/providers/codexConnectionDefaults"),
+      import("@/lib/db/sessionAccountAffinity"),
+      import("@/lib/modelAliasSeed"),
+    ]);
     let settings = await getSettings();
     const passwordState = await ensurePersistentManagementPasswordHash({
       logger: console,
@@ -157,10 +180,19 @@ export async function registerNodejs(): Promise<void> {
       );
     }
 
+    // Restore Global System Prompt into in-memory config (#2468/#2470)
+    if (settings.systemPrompt) {
+      const { setSystemPromptConfig } =
+        await import("@omniroute/open-sse/services/systemPrompt.ts");
+      setSystemPromptConfig(settings.systemPrompt);
+      console.log("[STARTUP] Global System Prompt restored from settings");
+    }
+
     const seededModelAliases = await seedDefaultModelAliases();
     console.log(
       `[STARTUP] Model alias seed: applied=${seededModelAliases.applied.length}, skipped=${seededModelAliases.skipped.length}, failed=${seededModelAliases.failed.length}`
     );
+    startSessionAccountAffinityCleanup();
 
     const migration = await migrateCodexConnectionDefaultsFromLegacySettings();
     if (migration.migrated) {
@@ -189,7 +221,7 @@ export async function registerNodejs(): Promise<void> {
     initAuditLog();
     console.log("[COMPLIANCE] Audit log table initialized");
 
-    const cleanup = cleanupExpiredLogs();
+    const cleanup = await cleanupExpiredLogs();
     if (
       cleanup.deletedUsage ||
       cleanup.deletedCallLogs ||
@@ -203,5 +235,83 @@ export async function registerNodejs(): Promise<void> {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn("[COMPLIANCE] Could not initialize audit log:", msg);
+  }
+
+  await import("@/lib/db/core").then(({ ensureDbInitialized }) => ensureDbInitialized());
+
+  // Scheduled VACUUM (#4437): the previous compressionScheduler.ts was orphaned
+  // (read the wrong settings namespace, never imported anywhere). This call wires
+  // the new vacuumScheduler into the lifecycle: registers the timer and persists
+  // lastVacuumAt to the key_value table so the UI's "Last vacuum" card can read it.
+  try {
+    const { initVacuumScheduler } = await import("@/lib/db/vacuumScheduler");
+    initVacuumScheduler();
+    console.log("[STARTUP] Scheduled VACUUM initialized (#4437)");
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn("[STARTUP] Could not initialize vacuum scheduler (non-fatal):", msg);
+  }
+
+  if (!isBackgroundServicesDisabled()) {
+    try {
+      const { bootstrapEmbeddedServices } = await import("@/lib/services/bootstrap");
+      await bootstrapEmbeddedServices();
+      console.log("[STARTUP] Embedded services bootstrap complete");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] Embedded services bootstrap failed (non-fatal):", msg);
+    }
+
+    try {
+      const { initEmbedWsProxy } = await import("@/lib/services/embedWsProxy");
+      initEmbedWsProxy();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] Embed WS proxy failed to start (non-fatal):", msg);
+    }
+
+    try {
+      const { autoRefreshDaemon } = await import("@omniroute/open-sse/services/autoRefreshDaemon");
+      autoRefreshDaemon.start();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] Auto-refresh daemon failed to start (non-fatal):", msg);
+    }
+
+    try {
+      // Arena ELO sync: model intelligence from the Arena AI leaderboard, powering the
+      // Free Provider Rankings page. On by default; configurable from Dashboard Feature Flags.
+      // Non-blocking — the initial sync is fire-and-forget and never fatal.
+      const { initArenaEloSync } = await import("@/lib/arenaEloSync");
+      const started = await initArenaEloSync();
+      if (started) {
+        console.log("[STARTUP] Arena ELO sync initialized");
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] Arena ELO sync failed to start (non-fatal):", msg);
+    }
+
+    // Pricing sync: opt-in external pricing data (self-gated by PRICING_SYNC_ENABLED inside
+    // initPricingSync). Was only wired into the unused server-init.ts, so it never ran in the
+    // standalone runtime even when enabled. Non-blocking, never fatal.
+    try {
+      const { initPricingSync } = await import("@/lib/pricingSync");
+      await initPricingSync();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] Pricing sync failed to start (non-fatal):", msg);
+    }
+
+    // models.dev capability sync: opt-in via Settings > AI (self-gated by
+    // settings.modelsDevSyncEnabled inside initModelsDevSync). Previously had no caller at all,
+    // so the toggle was inert. Non-blocking, never fatal.
+    try {
+      const { initModelsDevSync } = await import("@/lib/modelsDevSync");
+      await initModelsDevSync();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("[STARTUP] models.dev sync failed to start (non-fatal):", msg);
+    }
   }
 }

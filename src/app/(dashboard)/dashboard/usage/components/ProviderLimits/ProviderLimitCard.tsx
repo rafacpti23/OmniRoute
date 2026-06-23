@@ -6,11 +6,12 @@ import { useTranslations } from "next-intl";
 import Card from "@/shared/components/Card";
 import Badge from "@/shared/components/Badge";
 import QuotaProgressBar from "./QuotaProgressBar";
-import { calculatePercentage } from "./utils";
+import { calculatePercentage, shouldShowQuotaUsageCount } from "./utils";
 import ProviderIcon from "@/shared/components/ProviderIcon";
 
 const planVariants = {
   free: "default",
+  lite: "primary",
   pro: "primary",
   ultra: "success",
   enterprise: "info",
@@ -159,6 +160,7 @@ export default function ProviderLimitCard({
                 unlimited={unlimited}
                 resetTime={quota.resetAt}
                 staleAfterReset={quota.staleAfterReset === true}
+                showUsageCount={shouldShowQuotaUsageCount(quota)}
               />
             );
           })}

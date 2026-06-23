@@ -6,7 +6,10 @@ import { getDbInstance } from "./core";
 import { backupDbFile } from "./backup";
 import { PROVIDER_ID_TO_ALIAS } from "@omniroute/open-sse/config/providerModels.ts";
 import { invalidateDbCache } from "./readCache";
-import { resolveProxyForConnectionFromRegistry } from "./proxies";
+import { getProxyRegistryGeneration, resolveProxyForScopeFromRegistry } from "./proxies";
+import { getComboModelProvider as getComboEntryProvider } from "@/lib/combos/steps";
+import { requestBodyLimitMbFromEnv } from "@/shared/constants/bodySize";
+import { DEFAULT_RESPONSES_PREVIOUS_RESPONSE_ID_MODE } from "@/shared/constants/responsesPreviousResponseId";
 
 type JsonRecord = Record<string, unknown>;
 type PricingModels = Record<string, JsonRecord>;
@@ -14,6 +17,46 @@ type PricingByProvider = Record<string, PricingModels>;
 export type PricingSource = "default" | "litellm" | "modelsDev" | "user";
 export type PricingSourceMap = Record<string, Record<string, PricingSource>>;
 type ProxyValue = JsonRecord | string | null;
+type ProxyResolutionResult = {
+  proxy: ProxyValue;
+  level: string;
+  levelId: string | null;
+  source?: string;
+};
+type ProxyResolutionCacheEntry = {
+  generation: number;
+  registryGeneration: number;
+  result: ProxyResolutionResult;
+};
+
+const PROXY_RESOLUTION_CACHE_MAX_ENTRIES = 100;
+
+function isTruthyEnvFlag(value: string | undefined): boolean {
+  return typeof value === "string" && /^(1|true|yes|on)$/i.test(value.trim());
+}
+
+let proxyConfigGeneration = 0;
+const proxyResolutionCache = new Map<string, ProxyResolutionCacheEntry>();
+
+export function bumpProxyConfigGeneration() {
+  proxyConfigGeneration++;
+  proxyResolutionCache.clear();
+}
+
+function cacheProxyResolution(
+  connectionId: string,
+  generation: number,
+  registryGeneration: number,
+  result: ProxyResolutionResult
+) {
+  if (generation !== proxyConfigGeneration) return;
+  if (registryGeneration !== getProxyRegistryGeneration()) return;
+  if (proxyResolutionCache.size >= PROXY_RESOLUTION_CACHE_MAX_ENTRIES) {
+    const oldestKey = proxyResolutionCache.keys().next().value;
+    if (oldestKey) proxyResolutionCache.delete(oldestKey);
+  }
+  proxyResolutionCache.set(connectionId, { generation, registryGeneration, result });
+}
 type ProxyMap = Record<string, ProxyValue>;
 
 interface ProxyConfig {
@@ -38,28 +81,72 @@ function toProxyValue(value: unknown): ProxyValue {
   return null;
 }
 
+// Legacy proxyConfig store (key_value namespace 'proxyConfig') predates the
+// IPv6-only `family` directive, so its object configs have no family field.
+// Default to "auto" so the family marker rides along the cascade end-to-end
+// (consumed by proxyConfigToUrl). String configs are returned unchanged.
+function withFamilyDefault(value: ProxyValue): ProxyValue {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as JsonRecord;
+    if (typeof record.family === "string") return record;
+    return { ...record, family: "auto" };
+  }
+  return value;
+}
+
 // ──────────────── Settings ────────────────
 
 export async function getSettings() {
   const db = getDbInstance();
   const rows = db.prepare("SELECT key, value FROM key_value WHERE namespace = 'settings'").all();
   const settings: Record<string, unknown> = {
-    cloudEnabled: false,
+    cloudEnabled: true,
     tailscaleEnabled: false,
     tailscaleUrl: "",
     stickyRoundRobinLimit: 3,
+    requestRetry: 3,
+    maxRetryIntervalSec: 30,
+    antigravitySignatureCacheMode: "enabled",
     requireLogin: true,
+    mcpEnabled: false,
+    a2aEnabled: false,
     hiddenSidebarItems: [],
+    hiddenSidebarGroupLabels: [],
+    sidebarSectionOrder: [],
+    sidebarItemOrder: {},
+    sidebarActivePreset: null,
+    hideEndpointCloudflaredTunnel: false,
+    hideEndpointTailscaleFunnel: false,
+    hideEndpointNgrokTunnel: false,
+    preferClaudeCodeForUnprefixedClaudeModels: isTruthyEnvFlag(
+      process.env.OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS
+    ),
+    autoRefreshProviderQuota: false,
+    autoRefreshProviderQuotaInterval: 180,
     comboConfigMode: "guided",
+    codexServiceTier: { enabled: false },
+    claudeFastMode: {
+      enabled: false,
+      supportedModels: ["claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6"],
+    },
+    codexSessionAffinityTtlMs: 0,
+    responsesPreviousResponseIdMode: DEFAULT_RESPONSES_PREVIOUS_RESPONSE_ID_MODE,
     alwaysPreserveClientCache: "auto",
     idempotencyWindowMs: 5000,
-    globalRandomRoutingEnabled: false,
-    globalRandomRoutingMode: "strict",
-    globalRandomRoutingPool: [],
-    globalRandomRoutingProviders: [],
-    globalRandomRoutingBlockedModels: [],
-    globalRandomRoutingExcludeCombos: true,
-    globalRandomRoutingWeights: {},
+    wsAuth: false,
+    maxBodySizeMb: requestBodyLimitMbFromEnv(process.env.MAX_BODY_SIZE_BYTES),
+    debugMode: true,
+    // LOCAL_ONLY manage-scope bypass policy defaults (T-011 / spec §Data Model).
+    // Preserves PR #2473 behaviour on migration — the bypass starts ENABLED
+    // for `/api/mcp/` so existing manage-scope Bearer clients keep working.
+    // Operators flip the kill-switch to false (or drop the prefix) via the
+    // Settings UI; the change hot-reloads through `applyRuntimeSettings` →
+    // `applyAuthzBypassSection` → `getAuthzBypassSnapshot()`.
+    localOnlyManageScopeBypassEnabled: true,
+    localOnlyManageScopeBypassPrefixes: ["/api/mcp/"],
+    customBannedSignals: [],
+    proxyEnabled: true,
+    perKeyProxyEnabled: false,
   };
   for (const row of rows) {
     const record = toRecord(row);
@@ -98,7 +185,26 @@ export async function updateSettings(updates: Record<string, unknown>) {
   tx();
   backupDbFile("pre-write");
   invalidateDbCache("settings"); // Bust the read cache immediately
-  return getSettings();
+
+  // Bust proxy resolution cache when proxy toggle settings change
+  const PROXY_TOGGLE_KEYS = ["proxyEnabled", "perKeyProxyEnabled"];
+  if (Object.keys(updates).some((k) => PROXY_TOGGLE_KEYS.includes(k))) {
+    bumpProxyConfigGeneration();
+  }
+
+  const nextSettings = await getSettings();
+
+  try {
+    const { applyRuntimeSettings } = await import("@/lib/config/runtimeSettings");
+    await applyRuntimeSettings(nextSettings, { source: "settings:update" });
+  } catch (error) {
+    console.warn(
+      "[HOT_RELOAD] Failed to apply runtime settings after update:",
+      error instanceof Error ? error.message : error
+    );
+  }
+
+  return nextSettings;
 }
 
 export async function isCloudEnabled() {
@@ -217,16 +323,54 @@ export async function getPricingWithSources(): Promise<{
 
 export async function getPricingForModel(provider: string, model: string) {
   const pricing = await getPricing();
-  if (pricing[provider]?.[model]) return pricing[provider][model];
 
-  const { PROVIDER_ID_TO_ALIAS } = await import("@omniroute/open-sse/config/providerModels");
-  const alias = PROVIDER_ID_TO_ALIAS[provider];
-  if (alias && pricing[alias]) return pricing[alias][model] || null;
+  const findKeyInsensitive = <T>(
+    obj: Record<string, T> | undefined | null,
+    key: string
+  ): T | undefined => {
+    if (!obj || !key) return undefined;
+    const lowerKey = key.toLowerCase();
+    for (const [k, v] of Object.entries(obj)) {
+      if (k.toLowerCase() === lowerKey) return v;
+    }
+    return undefined;
+  };
 
-  const np = provider?.replace(/-cn$/, "");
-  if (np && np !== provider && pricing[np]) return pricing[np][model] || null;
+  const pLower = (provider || "").toLowerCase();
+  let providerPricing = findKeyInsensitive<PricingModels>(pricing, pLower);
 
-  return null;
+  if (!providerPricing) {
+    const alias = findKeyInsensitive<string>(PROVIDER_ID_TO_ALIAS, pLower);
+    if (alias) providerPricing = findKeyInsensitive(pricing, alias);
+  }
+
+  if (!providerPricing) {
+    for (const [id, mappedAlias] of Object.entries(PROVIDER_ID_TO_ALIAS)) {
+      if (typeof mappedAlias === "string" && mappedAlias.toLowerCase() === pLower) {
+        providerPricing = findKeyInsensitive(pricing, id);
+        if (providerPricing) break;
+      }
+    }
+  }
+
+  if (!providerPricing) {
+    const np = pLower.replace(/-cn$/, "");
+    if (np && np !== pLower) {
+      providerPricing = findKeyInsensitive(pricing, np);
+    }
+  }
+
+  if (!providerPricing) return null;
+
+  const mLower = (model || "").toLowerCase();
+  let modelPricing = findKeyInsensitive<JsonRecord>(providerPricing, mLower);
+
+  if (!modelPricing) {
+    const hyphenModel = mLower.replace(/\./g, "-");
+    modelPricing = findKeyInsensitive(providerPricing, hyphenModel);
+  }
+
+  return modelPricing || null;
 }
 
 export async function updatePricing(pricingData: PricingByProvider) {
@@ -312,7 +456,12 @@ export async function resetAllPricing() {
 
 // ──────────────── LKGP (Last Known Good Provider) ────────────────
 
-export async function getLKGP(comboName: string, modelId: string): Promise<string | null> {
+export interface LKGPRecord {
+  provider: string;
+  connectionId?: string;
+}
+
+export async function getLKGP(comboName: string, modelId: string): Promise<LKGPRecord | null> {
   const db = getDbInstance();
   const key = `${comboName}:${modelId}`;
   const row = db
@@ -320,18 +469,29 @@ export async function getLKGP(comboName: string, modelId: string): Promise<strin
     .get(key) as { value?: string } | undefined;
   if (!row?.value) return null;
   try {
-    return JSON.parse(row.value);
+    const parsed = JSON.parse(row.value);
+    if (typeof parsed === "object" && parsed !== null && "provider" in parsed) {
+      return parsed as LKGPRecord;
+    }
+    return { provider: String(parsed) };
   } catch {
-    return row.value;
+    return { provider: row.value };
   }
 }
 
-export async function setLKGP(comboName: string, modelId: string, providerId: string) {
+export async function setLKGP(
+  comboName: string,
+  modelId: string,
+  providerId: string,
+  connectionId?: string
+) {
   const db = getDbInstance();
   const key = `${comboName}:${modelId}`;
+  const value: LKGPRecord = { provider: providerId };
+  if (connectionId) value.connectionId = connectionId;
   db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('lkgp', ?, ?)").run(
     key,
-    JSON.stringify(providerId)
+    JSON.stringify(value)
   );
 }
 
@@ -358,23 +518,8 @@ function resolveProviderAliasOrId(providerOrAlias: string): string {
 }
 
 function getComboModelProvider(modelEntry: unknown): string | null {
-  const record = toRecord(modelEntry);
-  if (typeof record.provider === "string") {
-    return resolveProviderAliasOrId(record.provider);
-  }
-
-  const modelValue =
-    typeof modelEntry === "string"
-      ? modelEntry
-      : typeof record.model === "string"
-        ? record.model
-        : null;
-
-  if (!modelValue) return null;
-
-  const [providerOrAlias] = modelValue.split("/", 1);
-  if (!providerOrAlias) return null;
-  return resolveProviderAliasOrId(providerOrAlias);
+  const providerOrAlias = getComboEntryProvider(modelEntry);
+  return providerOrAlias ? resolveProviderAliasOrId(providerOrAlias) : null;
 }
 
 function migrateProxyEntry(value: unknown): JsonRecord | null {
@@ -477,6 +622,7 @@ export async function setProxyForLevel(level: string, id: string | null, proxy: 
   }
 
   backupDbFile("pre-write");
+  bumpProxyConfigGeneration();
   return config;
 }
 
@@ -484,28 +630,169 @@ export async function deleteProxyForLevel(level: string, id: string | null) {
   return setProxyForLevel(level, id, null);
 }
 
-export async function resolveProxyForConnection(connectionId: string) {
-  const registryResolved = await resolveProxyForConnectionFromRegistry(connectionId);
-  if (registryResolved?.proxy) {
-    return registryResolved;
+export async function resolveProxyForConnection(connectionId: string, apiKeyId?: string) {
+  const cacheKey = apiKeyId ? `${connectionId}:${apiKeyId}` : connectionId;
+  const startGeneration = proxyConfigGeneration;
+  const startRegistryGeneration = getProxyRegistryGeneration();
+  const cached = proxyResolutionCache.get(cacheKey);
+  if (
+    cached &&
+    cached.generation === startGeneration &&
+    cached.registryGeneration === startRegistryGeneration
+  ) {
+    return cached.result;
+  }
+
+  const db = getDbInstance();
+
+  // Step 1: Check global proxyEnabled setting
+  // Read only the proxyEnabled key for performance instead of loading all settings.
+  let globalProxyEnabled = true;
+  try {
+    const proxyEnabledRow = db
+      .prepare("SELECT value FROM key_value WHERE namespace = 'settings' AND key = 'proxyEnabled'")
+      .get() as { value?: string } | undefined;
+    if (proxyEnabledRow?.value) {
+      globalProxyEnabled = JSON.parse(proxyEnabledRow.value) !== false;
+    }
+  } catch {
+    // Default to true on read error
+  }
+
+  if (!globalProxyEnabled) {
+    const result: ProxyResolutionResult = { proxy: null, level: "direct", levelId: null };
+    // Do not cache the "direct" result when global toggle is off so that
+    // toggling it back on takes effect immediately without a generation bump.
+    return result;
+  }
+
+  let connectionRecord: JsonRecord | null = null;
+  let connectionProvider: string | null = null;
+  let connectionProxyEnabled = true;
+  let connectionPerKeyProxyEnabled = false;
+
+  const row = db
+    .prepare(
+      "SELECT provider, proxy_enabled, per_key_proxy_enabled FROM provider_connections WHERE id = ?"
+    )
+    .get(connectionId);
+  if (row) {
+    connectionRecord = toRecord(row);
+    connectionProvider =
+      typeof connectionRecord.provider === "string" ? connectionRecord.provider : null;
+    connectionProxyEnabled = connectionRecord.proxy_enabled !== 0;
+    connectionPerKeyProxyEnabled = connectionRecord.per_key_proxy_enabled === 1;
+  }
+
+  // A connection-level Proxy Off is explicit: it must bypass every stored proxy
+  // source for this connection, including account, provider, global, and automatic
+  // fallback candidates from the proxy pool.
+  if (connectionRecord && !connectionProxyEnabled) {
+    const result: ProxyResolutionResult = { proxy: null, level: "direct", levelId: null };
+    cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+    return result;
+  }
+
+  // Step 1.5: Check global perKeyProxyEnabled setting
+  let globalPerKeyProxyEnabled = false;
+  try {
+    const perKeyRow = db
+      .prepare(
+        "SELECT value FROM key_value WHERE namespace = 'settings' AND key = 'perKeyProxyEnabled'"
+      )
+      .get() as { value?: string } | undefined;
+    if (perKeyRow?.value) {
+      globalPerKeyProxyEnabled = JSON.parse(perKeyRow.value) !== false;
+    }
+  } catch {
+    // Default to false on read error
   }
 
   const config = await getProxyConfig();
 
-  if (connectionId && config.keys?.[connectionId]) {
-    return { proxy: config.keys[connectionId], level: "key", levelId: connectionId };
+  // Step 2: API key-level proxy (only if per-key proxy is enabled globally or per-connection)
+  if (apiKeyId) {
+    // Check if per-key proxy is allowed: globally OR per-connection
+    const perKeyEnabled = globalPerKeyProxyEnabled || connectionPerKeyProxyEnabled;
+
+    if (perKeyEnabled) {
+      try {
+        const apiKeyRow = db.prepare("SELECT proxy_id FROM api_keys WHERE id = ?").get(apiKeyId) as
+          | { proxy_id?: string | null }
+          | undefined;
+        if (apiKeyRow?.proxy_id) {
+          const proxyRow = db
+            .prepare(
+              "SELECT p.type, p.host, p.port, p.username, p.password, p.family FROM proxy_registry p WHERE p.id = ?"
+            )
+            .get(apiKeyRow.proxy_id) as
+            | {
+                type: string;
+                host: string;
+                port: number;
+                username: string;
+                password: string;
+                family?: string;
+              }
+            | undefined;
+          if (proxyRow) {
+            const result = {
+              proxy: {
+                type: proxyRow.type,
+                host: proxyRow.host,
+                port: proxyRow.port,
+                username: proxyRow.username,
+                password: proxyRow.password,
+                family: typeof proxyRow.family === "string" ? proxyRow.family : "auto",
+              },
+              level: "apiKey" as const,
+              levelId: apiKeyId,
+              source: "api_key" as const,
+            };
+            cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+            return result;
+          }
+        }
+      } catch {
+        // Fall through to existing resolution
+      }
+    }
   }
 
-  const db = getDbInstance();
-  const connection = db
-    .prepare("SELECT provider FROM provider_connections WHERE id = ?")
-    .get(connectionId);
+  // Step 3: Account-level registry
+  const registryAccount = await resolveProxyForScopeFromRegistry("account", connectionId);
+  if (registryAccount?.proxy) {
+    cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, registryAccount);
+    return registryAccount;
+  }
 
-  if (connection) {
-    const connectionRecord = toRecord(connection);
-    const provider =
-      typeof connectionRecord.provider === "string" ? connectionRecord.provider : null;
-    if (config.combos && Object.keys(config.combos).length > 0) {
+  // Step 4: Legacy key-level
+  if (connectionId && config.keys?.[connectionId]) {
+    const result = {
+      proxy: withFamilyDefault(config.keys[connectionId]),
+      level: "key",
+      levelId: connectionId,
+    };
+    cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+    return result;
+  }
+
+  // Step 5: Use the connection's provider for provider/combo scoped proxies.
+  if (connectionRecord) {
+    // Step 6: Provider-level registry (only if proxy_enabled)
+    if (connectionProvider && connectionProxyEnabled) {
+      const registryProvider = await resolveProxyForScopeFromRegistry(
+        "provider",
+        connectionProvider
+      );
+      if (registryProvider?.proxy) {
+        cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, registryProvider);
+        return registryProvider;
+      }
+    }
+
+    // Step 7: Legacy combo-level (only if proxy_enabled)
+    if (connectionProxyEnabled && config.combos && Object.keys(config.combos).length > 0) {
       const combos = db.prepare("SELECT id, data FROM combos").all();
       for (const comboRow of combos) {
         const comboRecord = toRecord(comboRow);
@@ -517,10 +804,16 @@ export async function resolveProxyForConnection(connectionId: string) {
             const combo = toRecord(JSON.parse(comboRaw));
             const comboModels = Array.isArray(combo.models) ? combo.models : [];
             const usesProvider = comboModels.some(
-              (entry) => getComboModelProvider(entry) === provider
+              (entry) => getComboModelProvider(entry) === connectionProvider
             );
             if (usesProvider) {
-              return { proxy: config.combos[comboId], level: "combo", levelId: comboId };
+              const result = {
+                proxy: withFamilyDefault(config.combos[comboId]),
+                level: "combo",
+                levelId: comboId,
+              };
+              cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+              return result;
             }
           } catch {
             // Ignore malformed combo records during proxy resolution.
@@ -529,19 +822,57 @@ export async function resolveProxyForConnection(connectionId: string) {
       }
     }
 
-    if (provider && config.providers?.[provider]) {
-      return {
-        proxy: config.providers[provider],
+    // Step 8: Legacy provider-level (only if proxy_enabled)
+    if (connectionProvider && connectionProxyEnabled && config.providers?.[connectionProvider]) {
+      const result = {
+        proxy: withFamilyDefault(config.providers[connectionProvider]),
         level: "provider",
-        levelId: provider,
+        levelId: connectionProvider,
       };
+      cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+      return result;
     }
   }
 
-  if (config.global) {
-    return { proxy: config.global, level: "global", levelId: null };
+  // Step 9: Global registry
+  const registryGlobal = await resolveProxyForScopeFromRegistry("global");
+  if (registryGlobal?.proxy) {
+    cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, registryGlobal);
+    return registryGlobal;
   }
 
+  // Step 10: Legacy global
+  if (config.global) {
+    const result = { proxy: withFamilyDefault(config.global), level: "global", levelId: null };
+    cacheProxyResolution(cacheKey, startGeneration, startRegistryGeneration, result);
+    return result;
+  }
+
+  // Step 11: Auto-selection fallback (only when global proxy is enabled)
+  try {
+    const { selectWorkingProxyFallback } = await import("@omniroute/open-sse/utils/proxyFallback");
+    const fallback = await selectWorkingProxyFallback(connectionId);
+    if (fallback) {
+      // Auto-selected proxies are probed via a URL roundtrip that drops any
+      // per-registry family policy, so default the family marker to "auto"
+      // (no IPv6-only enforcement) when the fallback object omits it.
+      const normalizedFallback =
+        fallback.proxy && typeof fallback.proxy === "object"
+          ? { ...fallback, proxy: withFamilyDefault(fallback.proxy as ProxyValue) }
+          : fallback;
+      cacheProxyResolution(
+        cacheKey,
+        startGeneration,
+        startRegistryGeneration,
+        normalizedFallback as ProxyResolutionResult
+      );
+      return normalizedFallback;
+    }
+  } catch (err) {
+    console.warn({ err, connectionId }, "Proxy fallback auto-selection failed");
+  }
+
+  // Step 12: Return direct
   return { proxy: null, level: "direct", levelId: null };
 }
 
@@ -578,6 +909,7 @@ export async function setProxyConfig(config: Record<string, unknown>) {
   tx();
 
   backupDbFile("pre-write");
+  bumpProxyConfigGeneration();
   return current;
 }
 
@@ -627,39 +959,39 @@ export async function getCacheMetrics() {
         `
       SELECT
         provider,
-        COUNT(*) as requests,
-        SUM(tokens_input) as inputTokens,
+        COUNT(*) as totalRequests,
+        SUM(CASE WHEN tokens_cache_read > 0 OR tokens_cache_creation > 0 THEN 1 ELSE 0 END) as cachedRequests,
+        SUM(CASE WHEN tokens_cache_read > 0 OR tokens_cache_creation > 0 THEN tokens_input ELSE 0 END) as inputTokens,
         SUM(tokens_cache_read) as cachedTokens,
         SUM(tokens_cache_creation) as cacheCreationTokens
       FROM usage_history
-      WHERE (tokens_cache_read > 0 OR tokens_cache_creation > 0)
-        AND provider IS NOT NULL
+      WHERE provider IS NOT NULL
       GROUP BY provider
+      HAVING cachedRequests > 0
     `
       )
       .all() as Array<{
       provider: string;
-      requests: number;
+      totalRequests: number;
+      cachedRequests: number;
       inputTokens: number | null;
       cachedTokens: number | null;
       cacheCreationTokens: number | null;
     }>;
 
-    // Aggregate by strategy
-    // Since combo_strategy isn't tracked in usage_history yet, we use 'direct' for all requests
-    // TODO: Add combo_strategy column to usage_history for proper strategy tracking
+    // Aggregate by combo strategy (direct requests stored as 'direct')
     const byStrategyRows = db
       .prepare(
         `
       SELECT
-        'direct' as strategy,
+        COALESCE(combo_strategy, 'direct') as strategy,
         COUNT(*) as requests,
         SUM(tokens_input) as inputTokens,
         SUM(tokens_cache_read) as cachedTokens,
         SUM(tokens_cache_creation) as cacheCreationTokens
       FROM usage_history
       WHERE (tokens_cache_read > 0 OR tokens_cache_creation > 0)
-      GROUP BY 'direct'
+      GROUP BY combo_strategy
     `
       )
       .all() as Array<{
@@ -683,6 +1015,8 @@ export async function getCacheMetrics() {
       string,
       {
         requests: number;
+        totalRequests: number;
+        cachedRequests: number;
         inputTokens: number;
         cachedTokens: number;
         cacheCreationTokens: number;
@@ -690,7 +1024,9 @@ export async function getCacheMetrics() {
     > = {};
     for (const row of byProviderRows) {
       byProvider[row.provider] = {
-        requests: row.requests,
+        requests: row.cachedRequests,
+        totalRequests: row.totalRequests,
+        cachedRequests: row.cachedRequests,
         inputTokens: row.inputTokens || 0,
         cachedTokens: row.cachedTokens || 0,
         cacheCreationTokens: row.cacheCreationTokens || 0,
@@ -804,8 +1140,7 @@ export async function getCacheTrend(hours = 24): Promise<CacheTrendPoint[]> {
 }
 
 export async function resetCacheMetrics() {
-  // No-op: cannot delete historical usage data
-  // Cache metrics are computed from usage_history, so they reflect actual request history
+  // No-op: cache metrics are computed from usage_history.
   console.warn(
     "resetCacheMetrics is deprecated - cache metrics are now computed from usage_history"
   );

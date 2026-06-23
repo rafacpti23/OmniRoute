@@ -1,6 +1,7 @@
-import { BaseExecutor } from "./base.ts";
-import { PROVIDERS, OAUTH_ENDPOINTS } from "../config/constants.ts";
-import { geminiCLIUserAgent, googApiClientHeader } from "../services/antigravityHeaders.ts";
+import { BaseExecutor, mergeUpstreamExtraHeaders, mergeAbortSignals } from "./base.ts";
+import { randomUUID } from "crypto";
+import { PROVIDERS, OAUTH_ENDPOINTS, FETCH_TIMEOUT_MS } from "../config/constants.ts";
+import { getGeminiCliHeaders } from "../services/geminiCliHeaders.ts";
 import { scrubProxyAndFingerprintHeaders } from "../services/antigravityHeaderScrub.ts";
 import { obfuscateSensitiveWords } from "../services/antigravityObfuscation.ts";
 import {
@@ -19,15 +20,13 @@ const ONBOARD_DELAY_MS = 5_000;
 const DEFAULT_PROJECT_ID = "default-project";
 const DEFAULT_ONBOARD_TIER = "free-tier";
 const LOAD_CODE_ASSIST_METADATA = Object.freeze({
-  ideType: "ANTIGRAVITY",
+  ideType: "IDE_UNSPECIFIED",
   platform: "PLATFORM_UNSPECIFIED",
   pluginType: "GEMINI",
-  duetProject: DEFAULT_PROJECT_ID,
 });
 const ONBOARD_METADATA = Object.freeze({
-  ideType: "ANTIGRAVITY",
+  ideType: "IDE_UNSPECIFIED",
   pluginType: "GEMINI",
-  duetProject: DEFAULT_PROJECT_ID,
 });
 
 // Per-account cache: accessToken -> { projectId, expiresAt }
@@ -51,6 +50,22 @@ function normalizeGeminiModel(model: string): string {
     : "unknown";
 }
 
+function generateGeminiCliRequestId(): string {
+  return `agent-${randomUUID()}`;
+}
+
+function generateGeminiCliSessionId(): string {
+  return `-${Date.now()}`;
+}
+
+function cloneGeminiCliRecord(value: Record<string, any>): Record<string, any> {
+  if (typeof structuredClone === "function") {
+    return structuredClone(value);
+  }
+
+  return JSON.parse(JSON.stringify(value));
+}
+
 function extractProjectId(payload: unknown): string {
   if (!payload || typeof payload !== "object") return "";
   const data = payload as LoadCodeAssistResponse;
@@ -61,6 +76,17 @@ function extractProjectId(payload: unknown): string {
     return data.cloudaicompanionProject.id.trim();
   }
   return "";
+}
+
+function resolveGeminiCliProjectId(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const normalized = trimmed.toLowerCase();
+  if (normalized === DEFAULT_PROJECT_ID || normalized === `projects/${DEFAULT_PROJECT_ID}`) {
+    return "";
+  }
+  return trimmed;
 }
 
 function extractDefaultTierId(payload: unknown): string {
@@ -105,31 +131,46 @@ export class GeminiCLIExecutor extends BaseExecutor {
   }
 
   buildUrl(model, stream, urlIndex = 0) {
-    this._currentModel = normalizeGeminiModel(model);
+    void model;
+    void urlIndex;
     const action = stream ? "streamGenerateContent?alt=sse" : "generateContent";
     return `${this.config.baseUrl}:${action}`;
   }
 
-  buildHeaders(credentials, stream = true) {
-    const raw = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${credentials.accessToken}`,
-      // Dynamic headers matching native GeminiCLI client
-      "User-Agent": geminiCLIUserAgent(this._currentModel || "unknown"),
-      "X-Goog-Api-Client": googApiClientHeader(),
-      ...(stream && { Accept: "text/event-stream" }),
-    };
+  buildHeaders(
+    credentials,
+    stream = true,
+    clientHeaders?: Record<string, string> | null,
+    model?: string
+  ) {
+    void clientHeaders;
+
+    const activeModel = model || "unknown";
+
+    const raw = getGeminiCliHeaders(
+      normalizeGeminiModel(activeModel),
+      credentials.accessToken,
+      stream ? "*/*" : "application/json"
+    );
+
+    if (credentials.apiKey) {
+      raw["x-goog-api-key"] = credentials.apiKey;
+      // getGeminiCliHeaders adds Authorization: Bearer undefined if accessToken is empty, so we clean it up
+      if (!credentials.accessToken) {
+        delete raw["Authorization"];
+      }
+    }
+
     return scrubProxyAndFingerprintHeaders(raw);
   }
-
-  // Track current model for dynamic UA. BaseExecutor calls buildUrl before buildHeaders.
-  private _currentModel = "unknown";
 
   async onboardManagedProject(
     accessToken: string,
     tierId = DEFAULT_ONBOARD_TIER,
-    options: OnboardOptions = {}
+    options: OnboardOptions = {},
+    model = "unknown"
   ): Promise<string | null> {
+    const currentModel = normalizeGeminiModel(model);
     const attempts =
       Number.isInteger(options.attempts) && options.attempts! > 0
         ? Number(options.attempts)
@@ -151,15 +192,11 @@ export class GeminiCLIExecutor extends BaseExecutor {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), ONBOARD_TIMEOUT_MS);
 
-        let response;
+        let response: Response;
         try {
           response = await fetch(ONBOARD_USER_URL, {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${accessToken}`,
-              "User-Agent": "GeminiCLI/1.0.0",
-            },
+            headers: getGeminiCliHeaders(currentModel, accessToken, "application/json"),
             body: JSON.stringify(requestBody),
             signal: controller.signal,
           });
@@ -176,7 +213,7 @@ export class GeminiCLIExecutor extends BaseExecutor {
           }
 
           if (payload?.done === true) {
-            return DEFAULT_PROJECT_ID;
+            return null;
           }
         } else {
           console.warn(
@@ -201,7 +238,7 @@ export class GeminiCLIExecutor extends BaseExecutor {
    * Native Gemini CLI refreshes this every 30 seconds — OmniRoute stores it once
    * at OAuth connection time, so it goes stale. This method keeps it fresh.
    */
-  async refreshProject(accessToken: string): Promise<string | null> {
+  async refreshProject(accessToken: string, model = "unknown"): Promise<string | null> {
     // Check cache
     const cached = projectCache.get(accessToken);
     if (cached && cached.expiresAt > Date.now()) {
@@ -212,7 +249,7 @@ export class GeminiCLIExecutor extends BaseExecutor {
     const inflight = inflightRefresh.get(accessToken);
     if (inflight) return inflight;
 
-    const promise = this._doRefresh(accessToken);
+    const promise = this._doRefresh(accessToken, model);
     inflightRefresh.set(accessToken, promise);
     try {
       return await promise;
@@ -221,21 +258,18 @@ export class GeminiCLIExecutor extends BaseExecutor {
     }
   }
 
-  async _doRefresh(accessToken: string): Promise<string | null> {
+  async _doRefresh(accessToken: string, model = "unknown"): Promise<string | null> {
+    const currentModel = normalizeGeminiModel(model);
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), LOAD_CODE_ASSIST_TIMEOUT_MS);
 
-      let response;
+      let response: Response;
       try {
         response = await fetch(LOAD_CODE_ASSIST_URL, {
           method: "POST",
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-          },
+          headers: getGeminiCliHeaders(currentModel, accessToken, "application/json"),
           body: JSON.stringify({
-            cloudaicompanionProject: DEFAULT_PROJECT_ID,
             metadata: { ...LOAD_CODE_ASSIST_METADATA },
           }),
           signal: controller.signal,
@@ -252,13 +286,18 @@ export class GeminiCLIExecutor extends BaseExecutor {
       }
 
       const data = (await response.json()) as LoadCodeAssistResponse;
-      let projectId = extractProjectId(data);
+      let projectId = resolveGeminiCliProjectId(extractProjectId(data));
 
       if (!projectId) {
         console.warn(
           "[OmniRoute] loadCodeAssist returned no project — attempting managed project onboarding"
         );
-        projectId = await this.onboardManagedProject(accessToken, extractDefaultTierId(data));
+        projectId = await this.onboardManagedProject(
+          accessToken,
+          extractDefaultTierId(data),
+          {},
+          currentModel
+        );
       }
 
       if (!projectId) {
@@ -279,25 +318,59 @@ export class GeminiCLIExecutor extends BaseExecutor {
   }
 
   async transformRequest(model, body, stream, credentials) {
-    this._currentModel = normalizeGeminiModel(model);
+    const currentModel = normalizeGeminiModel(model);
     const normalizedBody =
-      shouldStripCloudCodeThinking(this.provider, this._currentModel) &&
-      body &&
-      typeof body === "object"
+      shouldStripCloudCodeThinking(this.provider, currentModel) && body && typeof body === "object"
         ? stripCloudCodeThinkingConfig(body)
         : body;
 
-    // Refresh the project ID via loadCodeAssist (cached for 30s).
-    if (normalizedBody && typeof normalizedBody === "object" && normalizedBody.request) {
-      if (credentials.accessToken) {
-        const freshProject = await this.refreshProject(credentials.accessToken);
-        if (freshProject) {
-          normalizedBody.project = freshProject;
-        }
-      }
+    const bodyRecord =
+      normalizedBody && typeof normalizedBody === "object"
+        ? (normalizedBody as Record<string, any>)
+        : { request: {} };
+    const requestRecord =
+      bodyRecord.request && typeof bodyRecord.request === "object"
+        ? cloneGeminiCliRecord(bodyRecord.request as Record<string, any>)
+        : {};
 
+    const providerSpecificData = credentials.providerSpecificData as Record<string, unknown>;
+    const storedProject =
+      resolveGeminiCliProjectId(providerSpecificData?.projectId) ||
+      resolveGeminiCliProjectId(credentials.projectId) ||
+      resolveGeminiCliProjectId(bodyRecord.project) ||
+      "";
+
+    const envelope: Record<string, any> = {
+      model: currentModel,
+      user_prompt_id: bodyRecord.user_prompt_id || generateGeminiCliRequestId(),
+      request: {
+        ...requestRecord,
+        session_id: requestRecord.session_id || generateGeminiCliSessionId(),
+      },
+    };
+
+    if (typeof storedProject === "string" ? storedProject.trim() : storedProject) {
+      envelope.project = storedProject;
+    }
+
+    for (const [key, value] of Object.entries(bodyRecord)) {
+      if (!(key in envelope) && key !== "request" && key !== "project") {
+        envelope[key] = value;
+      }
+    }
+
+    // Native Gemini CLI refreshes the Cloud Code project periodically because
+    // stored project IDs can go stale. Keep the stored value as a fallback.
+    if (credentials.accessToken) {
+      const freshProject = await this.refreshProject(credentials.accessToken, currentModel);
+      if (resolveGeminiCliProjectId(freshProject)) {
+        envelope.project = freshProject;
+      }
+    }
+
+    if (envelope.request) {
       // Obfuscate sensitive client names in user content
-      const contents = normalizedBody.request?.contents;
+      const contents = envelope.request?.contents;
       if (Array.isArray(contents)) {
         for (const msg of contents) {
           if (Array.isArray(msg.parts)) {
@@ -310,7 +383,98 @@ export class GeminiCLIExecutor extends BaseExecutor {
         }
       }
     }
-    return normalizedBody;
+    return envelope;
+  }
+
+  async execute({
+    model,
+    body,
+    stream,
+    credentials,
+    signal,
+    log,
+    upstreamExtraHeaders,
+  }: ExecuteInput) {
+    const fallbackCount = this.getFallbackCount();
+    let lastError = null;
+    let lastStatus = 0;
+    const MAX_AUTO_RETRIES = 3;
+    const retryAttemptsByUrl: Record<number, number> = {};
+
+    for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
+      const url = this.buildUrl(model, stream, urlIndex);
+      const headers = this.buildHeaders(credentials, stream, null, model);
+      mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
+
+      const transformed = await this.transformRequest(model, body, stream, credentials);
+      if (transformed instanceof Response) {
+        return { response: transformed, url, headers, transformedBody: body };
+      }
+      const transformedBody = transformed;
+
+      if (!retryAttemptsByUrl[urlIndex]) {
+        retryAttemptsByUrl[urlIndex] = 0;
+      }
+
+      try {
+        log?.debug?.(
+          "TELEMETRY",
+          `[Gemini CLI] Execute - URL: ${url}, Model: ${model}, Retry: ${retryAttemptsByUrl[urlIndex]}`
+        );
+
+        const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+        const mergedSignal = signal ? mergeAbortSignals(signal, timeoutSignal) : timeoutSignal;
+        const response = await fetch(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(transformedBody),
+          signal: mergedSignal,
+        });
+
+        if (!response.ok) {
+          log?.warn?.(
+            "TELEMETRY",
+            `[Gemini CLI] Error Response - URL: ${url}, Status: ${response.status}`
+          );
+
+          let retryMs: number | null = null;
+          if (response.status === 429 || response.status === 503) {
+            try {
+              const errorBody = await response.clone().text();
+              retryMs = this.parseRetryFromErrorMessage(errorBody);
+            } catch {
+              /* ignore parse error */
+            }
+
+            if ((!retryMs || retryMs <= 60000) && retryAttemptsByUrl[urlIndex] < MAX_AUTO_RETRIES) {
+              retryAttemptsByUrl[urlIndex]++;
+              const backoffMs =
+                retryMs || Math.min(1000 * 2 ** retryAttemptsByUrl[urlIndex], 30000);
+              log?.debug?.(
+                "RETRY",
+                `Gemini CLI 429 retry ${retryAttemptsByUrl[urlIndex]} after ${backoffMs}ms`
+              );
+              await sleep(backoffMs);
+              urlIndex--;
+              continue;
+            }
+          }
+        }
+
+        if (this.shouldRetry(response.status, urlIndex)) {
+          lastStatus = response.status;
+          continue;
+        }
+
+        return { response, url, headers, transformedBody };
+      } catch (error) {
+        lastError = error;
+        if (urlIndex + 1 < fallbackCount) continue;
+        throw error;
+      }
+    }
+
+    throw lastError || new Error(`All ${fallbackCount} URLs failed with status ${lastStatus}`);
   }
 
   async refreshCredentials(credentials, log) {
@@ -331,21 +495,59 @@ export class GeminiCLIExecutor extends BaseExecutor {
         }),
       });
 
-      if (!response.ok) return null;
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        log?.error?.("TOKEN", "Gemini CLI refresh failed", {
+          status: response.status,
+          error: errorText.slice(0, 200),
+        });
+        // Match refreshGoogleToken's pattern: invalid_grant means the refresh
+        // token was revoked / replaced — surface as unrecoverable so the caller
+        // marks the account expired instead of retrying forever with a dead token.
+        try {
+          const errorBody = JSON.parse(errorText);
+          if (errorBody?.error === "invalid_grant") {
+            return { error: "unrecoverable_refresh_error", code: "invalid_grant" } as never;
+          }
+        } catch {
+          // not JSON — fall through
+        }
+        return null;
+      }
 
       const tokens = await response.json();
       log?.info?.("TOKEN", "Gemini CLI refreshed");
 
-      return {
+      const refreshed: Record<string, unknown> = {
         accessToken: tokens.access_token,
         refreshToken: tokens.refresh_token || credentials.refreshToken,
         expiresIn: tokens.expires_in,
         projectId: credentials.projectId,
       };
+      if (credentials.providerSpecificData !== undefined) {
+        refreshed.providerSpecificData = credentials.providerSpecificData;
+      }
+      return refreshed as never;
     } catch (error) {
       log?.error?.("TOKEN", `Gemini CLI refresh error: ${error.message}`);
       return null;
     }
+  }
+
+  // Parse retry time from Gemini error message body
+  // Format: "Your quota will reset after 2h7m23s"
+  parseRetryFromErrorMessage(errorMessage: unknown): number | null {
+    if (!errorMessage || typeof errorMessage !== "string") return null;
+
+    const match = errorMessage.match(/reset (?:after|in) (\d+h)?(\d+m)?(\d+s)?/i);
+    if (!match) return null;
+
+    let totalMs = 0;
+    if (match[1]) totalMs += parseInt(match[1]) * 3600 * 1000;
+    if (match[2]) totalMs += parseInt(match[2]) * 60 * 1000;
+    if (match[3]) totalMs += parseInt(match[3]) * 1000;
+
+    return totalMs || 2_000;
   }
 }
 

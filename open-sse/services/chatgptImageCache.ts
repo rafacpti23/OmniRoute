@@ -33,12 +33,12 @@ interface CachedImage {
 const cache = new Map<string, CachedImage>();
 let cacheBytes = 0;
 const DEFAULT_TTL_MS = 30 * 60 * 1000;
-const MAX_ENTRIES = 200;
-// Per-entry images cap at 8 MB (enforced upstream in the executor) so 32 MB
-// covers ~4 large images. The byte cap matters more than entry count: a hot
+const MAX_ENTRIES = 25;
+// Per-entry images cap at 8 MB (enforced upstream in the executor) so 10 MB
+// covers ~1 large image. The byte cap matters more than entry count: a hot
 // loop of 8 MB images would otherwise pin 1.6 GB of RSS before count
 // eviction kicked in. Tune via OMNIROUTE_CGPT_WEB_IMAGE_CACHE_MAX_MB.
-const DEFAULT_MAX_BYTES = 256 * 1024 * 1024;
+const DEFAULT_MAX_BYTES = 10 * 1024 * 1024;
 
 function configuredMaxBytes(): number {
   const raw = Number(process.env.OMNIROUTE_CGPT_WEB_IMAGE_CACHE_MAX_MB);
@@ -67,10 +67,7 @@ function evictExpired(now = Date.now()): void {
 function evictUntilWithinLimits(maxBytes: number, incomingBytes: number): void {
   // Drop oldest until both the entry-count and total-byte caps are satisfied.
   // Map iteration is insertion-ordered so the first key is the oldest entry.
-  while (
-    (cache.size >= MAX_ENTRIES || cacheBytes + incomingBytes > maxBytes) &&
-    cache.size > 0
-  ) {
+  while ((cache.size >= MAX_ENTRIES || cacheBytes + incomingBytes > maxBytes) && cache.size > 0) {
     const firstKey = cache.keys().next().value;
     if (!firstKey) break;
     deleteEntry(firstKey);
@@ -122,9 +119,7 @@ export function getChatGptImageConversationContext(
  * saved chatgpt.com conversation node and actually edit the image instead
  * of generating an unrelated one from scratch.
  */
-export function findChatGptImageBySha256(
-  hash: string
-): { id: string; entry: CachedImage } | null {
+export function findChatGptImageBySha256(hash: string): { id: string; entry: CachedImage } | null {
   evictExpired();
   const target = hash.toLowerCase();
   for (const [id, entry] of cache.entries()) {

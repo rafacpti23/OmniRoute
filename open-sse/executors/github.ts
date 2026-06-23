@@ -1,15 +1,13 @@
-import { BaseExecutor, ExecuteInput } from "./base.ts";
+import { BaseExecutor, ExecuteInput, type ProviderCredentials } from "./base.ts";
 import { PROVIDERS, OAUTH_ENDPOINTS } from "../config/constants.ts";
 import { getModelTargetFormat } from "../config/providerModels.ts";
 import {
   getGitHubCopilotChatHeaders,
   getGitHubCopilotRefreshHeaders,
 } from "../config/providerHeaderProfiles.ts";
+import { sanitizeResponsesInputItems } from "../services/responsesInputSanitizer.ts";
 
 export class GithubExecutor extends BaseExecutor {
-  /** Stashed per-request so buildHeaders() can read the client's x-initiator value. */
-  private _clientHeaders: Record<string, string> | null = null;
-
   constructor() {
     super("github", PROVIDERS.github);
   }
@@ -66,83 +64,124 @@ export class GithubExecutor extends BaseExecutor {
   }
 
   transformRequest(model: string, body: any, stream: boolean, credentials: any): any {
-    const modifiedBody = JSON.parse(JSON.stringify(body));
+    void stream;
+    void credentials;
+
+    const sourceBody = body && typeof body === "object" ? body : {};
+    const modifiedBody = { ...sourceBody };
+
+    if (Array.isArray(sourceBody.input)) {
+      modifiedBody.input = sanitizeResponsesInputItems(sourceBody.input, false);
+    }
+
+    if (Array.isArray(sourceBody.messages)) {
+      modifiedBody.messages = sourceBody.messages.map((msg) => {
+        if (!msg || typeof msg !== "object") return msg;
+        const role = typeof msg.role === "string" ? msg.role.toLowerCase() : "";
+        if (role !== "assistant") return msg;
+        if (msg.reasoning_text === undefined && msg.reasoning_content === undefined) return msg;
+        const next = { ...msg };
+        delete next.reasoning_text;
+        delete next.reasoning_content;
+        return next;
+      });
+    }
+
     if (modifiedBody.response_format && model.toLowerCase().includes("claude")) {
       modifiedBody.messages = this.injectResponseFormat(
-        modifiedBody.messages,
+        Array.isArray(modifiedBody.messages) ? modifiedBody.messages : [],
         modifiedBody.response_format
       );
       delete modifiedBody.response_format;
     }
 
-    // Strip reasoning_text / reasoning_content from assistant messages.
-    // GitHub Copilot converts these into Anthropic thinking blocks but cannot
-    // supply a valid `signature`, causing upstream 400 errors.
+    if (Array.isArray(modifiedBody.tools) && modifiedBody.tools.length > 128) {
+      modifiedBody.tools = modifiedBody.tools.slice(0, 128);
+    }
+
+    // GitHub Copilot's gpt-5.4 family rejects requests carrying `temperature` with HTTP 400:
+    //   "Unsupported parameter: 'temperature' is not supported with this model."
+    // OmniRoute's existing `stripGpt5SamplingWhenReasoning` guard only fires for
+    // provider==="openai" (raw api.openai.com Chat Completions), so GitHub Copilot routes
+    // never hit it. Strip temperature here unconditionally for gpt-5.4 so the 400 cannot
+    // reach the user. Port from 9router#612 (closes upstream #536).
+    if (
+      typeof model === "string" &&
+      /gpt-5\.4/i.test(model) &&
+      modifiedBody.temperature !== undefined
+    ) {
+      delete modifiedBody.temperature;
+    }
+
+    // GitHub Copilot /chat/completions only accepts {type:'text'} or {type:'image_url'}
+    // content parts. Clients like Cursor IDE pass through Anthropic-shape parts
+    // (tool_use, tool_result, thinking) untouched when using Claude models, which makes
+    // the endpoint return: "type has to be either 'image_url' or 'text'" (HTTP 400).
+    // Serialize unknown part types as text, drop empty parts, and collapse to null when
+    // every part is stripped (assistant messages whose only content was tool_calls).
+    // Port from 9router#220 (fixes 9router#219).
     if (Array.isArray(modifiedBody.messages)) {
-      for (const msg of modifiedBody.messages) {
-        if (msg.role === "assistant") {
-          delete msg.reasoning_text;
-          delete msg.reasoning_content;
-        }
-      }
+      modifiedBody.messages = modifiedBody.messages.map((msg: any) =>
+        this.sanitizeChatCompletionsMessage(msg)
+      );
     }
 
     return modifiedBody;
   }
 
-  async execute(input: ExecuteInput) {
-    this._clientHeaders = input.clientHeaders ?? null;
-    try {
-      const result = await super.execute(input);
-      if (!result || !result.response) return result;
+  private sanitizeChatCompletionsMessage(msg: any): any {
+    if (!msg || typeof msg !== "object") return msg;
+    // String content and missing content (e.g. assistant w/ only tool_calls) pass through.
+    if (typeof msg.content === "string" || msg.content == null) return msg;
+    if (!Array.isArray(msg.content)) return msg;
 
-      if (!input.stream) {
-        // wreq-js clone/text semantics consume the original response body. Materialize
-        // non-streaming responses immediately so downstream code always sees a native
-        // fetch Response with a readable body.
-        const status = result.response.status;
-        const statusText = result.response.statusText;
-        const headers = new Headers(result.response.headers);
-        const payload = await result.response.text();
-        result.response = new Response(payload, { status, statusText, headers });
-        return result;
-      }
+    const cleanContent = msg.content
+      .map((part: any) => {
+        if (!part || typeof part !== "object") return part;
+        if (part.type === "text") return part;
+        if (part.type === "image_url") return part;
+        // Serialize any unsupported part (tool_use, tool_result, thinking, etc.) as text.
+        // Try common text-carrying fields first; fall back to a JSON dump so nothing is
+        // silently dropped from the model's context.
+        const raw =
+          (typeof part.text === "string" && part.text) ||
+          (typeof part.thinking === "string" && part.thinking) ||
+          (typeof part.content === "string" && part.content) ||
+          (part.content != null && JSON.stringify(part.content)) ||
+          JSON.stringify(part);
+        return { type: "text", text: typeof raw === "string" ? raw : JSON.stringify(raw) };
+      })
+      .filter((part: any) => !(part && part.type === "text" && part.text === ""));
 
-      if (!result.response.body) return result;
-
-      const isStreaming = input.stream === true;
-      const contentType = (result.response.headers.get("content-type") || "").toLowerCase();
-      if (isStreaming && result.response.ok && contentType.includes("text/event-stream")) {
-        // Preserve the original response body for downstream error handling.
-        const sourceResponse = result.response.clone();
-        if (!sourceResponse.body) return result;
-
-        const decoder = new TextDecoder();
-        const transformStream = new TransformStream({
-          transform(chunk, controller) {
-            const text = decoder.decode(chunk, { stream: true });
-            if (text.includes("data: [DONE]")) {
-              return;
-            }
-            controller.enqueue(chunk);
-          },
-        });
-
-        const newResponse = new Response(sourceResponse.body.pipeThrough(transformStream), {
-          status: sourceResponse.status,
-          statusText: sourceResponse.statusText,
-          headers: new Headers(sourceResponse.headers),
-        });
-        result.response = newResponse;
-      }
-
-      return result;
-    } finally {
-      this._clientHeaders = null;
-    }
+    // If every part stripped to empty (e.g. tool_use with no text), collapse to null so
+    // GitHub does not reject an empty-array body. tool_calls ride alongside content.
+    return { ...msg, content: cleanContent.length > 0 ? cleanContent : null };
   }
 
-  buildHeaders(credentials, stream = true) {
+  async execute(input: ExecuteInput) {
+    const result = await super.execute(input);
+    if (!result || !result.response) return result;
+
+    if (!input.stream) {
+      // wreq-js clone/text semantics consume the original response body. Materialize
+      // non-streaming responses immediately so downstream code always sees a native
+      // fetch Response with a readable body.
+      const status = result.response.status;
+      const statusText = result.response.statusText;
+      const headers = new Headers(result.response.headers);
+      const payload = await result.response.text();
+      result.response = new Response(payload, { status, statusText, headers });
+      return result;
+    }
+
+    return result;
+  }
+
+  buildHeaders(
+    credentials: ProviderCredentials,
+    stream = true,
+    clientHeaders?: Record<string, string> | null
+  ): Record<string, string> {
     const token = this.getCopilotToken(credentials) || credentials.accessToken;
 
     // Forward the client's x-initiator header when present. OpenCode and other
@@ -152,8 +191,15 @@ export class GithubExecutor extends BaseExecutor {
     // free, so forwarding the value avoids burning a premium request on every
     // tool-call round-trip.  Fall back to "user" when the header is absent to
     // preserve the existing default behaviour.
-    const ch = this._clientHeaders;
-    const clientInitiator = ch?.["x-initiator"] || ch?.["X-Initiator"];
+    let clientInitiator = clientHeaders?.["x-initiator"] || clientHeaders?.["X-Initiator"];
+    if (!clientInitiator && clientHeaders) {
+      for (const key in clientHeaders) {
+        if (key.toLowerCase() === "x-initiator") {
+          clientInitiator = clientHeaders[key];
+          break;
+        }
+      }
+    }
     const initiator =
       clientInitiator === "agent" || clientInitiator === "user" ? clientInitiator : "user";
 
@@ -182,18 +228,24 @@ export class GithubExecutor extends BaseExecutor {
 
   async refreshGitHubToken(refreshToken, log) {
     try {
+      // GitHub Copilot is a public device-flow client: send the public client_id, and
+      // only attach client_secret when one is actually configured — never the literal
+      // "undefined" that new URLSearchParams produces for a missing value (9router#442).
+      const params = new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: this.config.clientId,
+      });
+      if (this.config.clientSecret) {
+        params.set("client_secret", this.config.clientSecret);
+      }
       const response = await fetch(OAUTH_ENDPOINTS.github.token, {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
           Accept: "application/json",
         },
-        body: new URLSearchParams({
-          grant_type: "refresh_token",
-          refresh_token: refreshToken,
-          client_id: this.config.clientId,
-          client_secret: this.config.clientSecret,
-        }),
+        body: params,
       });
       if (!response.ok) return null;
       const tokens = await response.json();

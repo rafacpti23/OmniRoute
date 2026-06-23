@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Card, Button, Badge } from "@/shared/components";
 import { useLocale, useTranslations } from "next-intl";
+import DatabaseBackupRetentionCard from "./DatabaseBackupRetentionCard";
 
 export default function SystemStorageTab() {
   const [backups, setBackups] = useState([]);
@@ -22,8 +23,21 @@ export default function SystemStorageTab() {
   const [clearCacheStatus, setClearCacheStatus] = useState({ type: "", message: "" });
   const [purgeLogsLoading, setPurgeLogsLoading] = useState(false);
   const [purgeLogsStatus, setPurgeLogsStatus] = useState({ type: "", message: "" });
+  const [manualVacuumLoading, setManualVacuumLoading] = useState(false);
+  const [manualVacuumStatus, setManualVacuumStatus] = useState({ type: "", message: "" });
   const [cleanupBackupsLoading, setCleanupBackupsLoading] = useState(false);
   const [cleanupBackupsStatus, setCleanupBackupsStatus] = useState({ type: "", message: "" });
+  const [saveBackupRetentionLoading, setSaveBackupRetentionLoading] = useState(false);
+  const [backupRetentionStatus, setBackupRetentionStatus] = useState({ type: "", message: "" });
+  const [purgeQuotaSnapshotsLoading, setPurgeQuotaSnapshotsLoading] = useState(false);
+  const [purgeQuotaSnapshotsStatus, setPurgeQuotaSnapshotsStatus] = useState({
+    type: "",
+    message: "",
+  });
+  const [purgeCallLogsLoading, setPurgeCallLogsLoading] = useState(false);
+  const [purgeCallLogsStatus, setPurgeCallLogsStatus] = useState({ type: "", message: "" });
+  const [purgeDetailedLogsLoading, setPurgeDetailedLogsLoading] = useState(false);
+  const [purgeDetailedLogsStatus, setPurgeDetailedLogsStatus] = useState({ type: "", message: "" });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
   const locale = useLocale();
@@ -53,6 +67,12 @@ export default function SystemStorageTab() {
     retentionDays: 0,
   });
 
+  // Database settings state (tasks 23-26)
+  const [dbSettings, setDbSettings] = useState<any>(null);
+  const [dbSettingsLoading, setDbSettingsLoading] = useState(true);
+  const [dbSettingsSaving, setDbSettingsSaving] = useState(false);
+  const [dbStatsRefreshing, setDbStatsRefreshing] = useState(false);
+
   const loadBackups = async () => {
     setBackupsLoading(true);
     try {
@@ -78,6 +98,82 @@ export default function SystemStorageTab() {
       });
     } catch (err) {
       console.error("Failed to fetch storage health:", err);
+    }
+  };
+
+  const loadDatabaseSettings = async () => {
+    setDbSettingsLoading(true);
+    try {
+      const res = await fetch("/api/settings/database");
+      if (res.ok) {
+        const data = await res.json();
+        setDbSettings(data);
+      }
+    } catch (err) {
+      console.error("Failed to load database settings:", err);
+    } finally {
+      setDbSettingsLoading(false);
+    }
+  };
+
+  const saveDatabaseSettings = async () => {
+    if (!dbSettings) return;
+    setDbSettingsSaving(true);
+    try {
+      const { logs, backup, cache, retention, aggregation, optimization } = dbSettings;
+      const res = await fetch("/api/settings/database", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ logs, backup, cache, retention, aggregation, optimization }),
+      });
+      if (res.ok) {
+        await loadDatabaseSettings();
+      }
+    } catch (err) {
+      console.error("Failed to save database settings:", err);
+    } finally {
+      setDbSettingsSaving(false);
+    }
+  };
+
+  const refreshDatabaseStats = async () => {
+    setDbStatsRefreshing(true);
+    try {
+      await fetch("/api/settings/database/refresh-stats", { method: "POST" });
+      await loadDatabaseSettings();
+    } catch (err) {
+      console.error("Failed to refresh database stats:", err);
+    } finally {
+      setDbStatsRefreshing(false);
+    }
+  };
+
+  const handleSaveBackupRetention = async () => {
+    setSaveBackupRetentionLoading(true);
+    setBackupRetentionStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/db-backups", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(backupCleanupOptions),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setBackupRetentionStatus({
+          type: "success",
+          message: "Backup retention saved.",
+        });
+        await loadStorageHealth();
+      } else {
+        setBackupRetentionStatus({
+          type: "error",
+          message: data.error || "Failed to save backup retention",
+        });
+      }
+    } catch {
+      setBackupRetentionStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setSaveBackupRetentionLoading(false);
     }
   };
 
@@ -108,6 +204,153 @@ export default function SystemStorageTab() {
       setCleanupBackupsStatus({ type: "error", message: t("errorOccurred") });
     } finally {
       setCleanupBackupsLoading(false);
+    }
+  };
+
+  const handleClearCache = async () => {
+    setClearCacheLoading(true);
+    setClearCacheStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/cache", { method: "DELETE" });
+      const data = await res.json().catch(() => null);
+      if (res.ok) {
+        setClearCacheStatus({
+          type: "success",
+          message: t("cacheCleared") || "Cache cleared successfully",
+        });
+      } else {
+        setClearCacheStatus({
+          type: "error",
+          message: data?.error || t("clearCacheFailed") || "Failed to clear cache",
+        });
+      }
+    } catch {
+      setClearCacheStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setClearCacheLoading(false);
+    }
+  };
+
+  const handlePurgeExpiredLogs = async () => {
+    setPurgeLogsLoading(true);
+    setPurgeLogsStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/purge-logs", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (res.ok) {
+        const deleted = data?.deleted ?? 0;
+        setPurgeLogsStatus({
+          type: "success",
+          message: t("logsDeleted", { count: deleted }) || `Purged ${deleted} expired log(s)`,
+        });
+      } else {
+        setPurgeLogsStatus({
+          type: "error",
+          message: data?.error || t("purgeLogsFailed") || "Failed to purge logs",
+        });
+      }
+    } catch {
+      setPurgeLogsStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setPurgeLogsLoading(false);
+    }
+  };
+
+  const handlePurgeQuotaSnapshots = async () => {
+    setPurgeQuotaSnapshotsLoading(true);
+    setPurgeQuotaSnapshotsStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/purge-quota-snapshots", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setPurgeQuotaSnapshotsStatus({
+          type: "success",
+          message: `Purged ${data.deleted} quota snapshots`,
+        });
+      } else {
+        setPurgeQuotaSnapshotsStatus({
+          type: "error",
+          message: data.error || "Failed to purge quota snapshots",
+        });
+      }
+    } catch {
+      setPurgeQuotaSnapshotsStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setPurgeQuotaSnapshotsLoading(false);
+    }
+  };
+
+  const handlePurgeCallLogs = async () => {
+    setPurgeCallLogsLoading(true);
+    setPurgeCallLogsStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/purge-call-logs", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setPurgeCallLogsStatus({
+          type: "success",
+          message: `Purged ${data.deleted} call logs`,
+        });
+      } else {
+        setPurgeCallLogsStatus({
+          type: "error",
+          message: data.error || "Failed to purge call logs",
+        });
+      }
+    } catch {
+      setPurgeCallLogsStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setPurgeCallLogsLoading(false);
+    }
+  };
+
+  const handlePurgeDetailedLogs = async () => {
+    setPurgeDetailedLogsLoading(true);
+    setPurgeDetailedLogsStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/purge-detailed-logs", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        setPurgeDetailedLogsStatus({
+          type: "success",
+          message: `Purged ${data.deleted} detailed logs`,
+        });
+      } else {
+        setPurgeDetailedLogsStatus({
+          type: "error",
+          message: data.error || "Failed to purge detailed logs",
+        });
+      }
+    } catch {
+      setPurgeDetailedLogsStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setPurgeDetailedLogsLoading(false);
+    }
+  };
+
+  const handleManualVacuum = async () => {
+    setManualVacuumLoading(true);
+    setManualVacuumStatus({ type: "", message: "" });
+    try {
+      const res = await fetch("/api/settings/database/vacuum", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success !== false) {
+        setManualVacuumStatus({
+          type: "success",
+          message: data?.message || "VACUUM completed",
+        });
+        await loadDatabaseSettings();
+        await loadStorageHealth();
+      } else {
+        setManualVacuumStatus({
+          type: "error",
+          message: data?.error || "VACUUM failed",
+        });
+      }
+    } catch {
+      setManualVacuumStatus({ type: "error", message: t("errorOccurred") });
+    } finally {
+      setManualVacuumLoading(false);
     }
   };
 
@@ -176,6 +419,7 @@ export default function SystemStorageTab() {
 
   useEffect(() => {
     loadStorageHealth();
+    loadDatabaseSettings();
   }, []);
 
   /** Triggers a browser file download from an existing Blob. */
@@ -381,6 +625,552 @@ export default function SystemStorageTab() {
     return reason;
   };
 
+  const renderStatusAlert = (status, index) => {
+    if (!status.message) return null;
+    const isInfo = status.type === "info";
+    const isSuccess = status.type === "success";
+    const className =
+      "p-3 rounded-lg text-sm " +
+      (isSuccess
+        ? "bg-green-500/10 text-green-500 border border-green-500/20"
+        : isInfo
+          ? "bg-blue-500/10 text-blue-500 border border-blue-500/20"
+          : "bg-red-500/10 text-red-500 border border-red-500/20");
+
+    return (
+      <div key={index} className={className} role="alert">
+        <div className="flex items-center gap-2">
+          <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
+            {isSuccess ? "check_circle" : isInfo ? "info" : "error"}
+          </span>
+          {status.message}
+        </div>
+      </div>
+    );
+  };
+
+  const renderDatabaseStatistics = () => {
+    if (dbSettingsLoading || !dbSettings?.stats) return null;
+
+    return (
+      <div className="mb-4 p-4 rounded-lg border border-border bg-bg">
+        <div className="flex items-center justify-between gap-3 mb-3">
+          <h4 className="text-sm font-semibold flex items-center gap-2">
+            <span className="material-symbols-outlined text-[18px]" aria-hidden="true">
+              analytics
+            </span>
+            Database Statistics
+          </h4>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={refreshDatabaseStats}
+            loading={dbStatsRefreshing}
+          >
+            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
+              refresh
+            </span>
+            Refresh
+          </Button>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
+            <p className="text-xs text-text-muted mb-1">{t("storageDatabaseSize")}</p>
+            <p className="text-sm font-semibold">
+              {formatBytes(dbSettings.stats.databaseSizeBytes)}
+            </p>
+          </div>
+          <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
+            <p className="text-xs text-text-muted mb-1">{t("storagePageCount")}</p>
+            <p className="text-sm font-semibold">{dbSettings.stats.pageCount.toLocaleString()}</p>
+          </div>
+          <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
+            <p className="text-xs text-text-muted mb-1">{t("storageFreelistCount")}</p>
+            <p className="text-sm font-semibold">
+              {dbSettings.stats.freelistCount.toLocaleString()}
+            </p>
+          </div>
+          <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
+            <p className="text-xs text-text-muted mb-1">{t("storageLastVacuum")}</p>
+            <p className="text-sm font-semibold">
+              {dbSettings.stats.lastVacuumAt
+                ? new Date(dbSettings.stats.lastVacuumAt).toLocaleString(locale)
+                : "Never"}
+            </p>
+          </div>
+          <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
+            <p className="text-xs text-text-muted mb-1">{t("storageLastOptimization")}</p>
+            <p className="text-sm font-semibold">
+              {dbSettings.stats.lastOptimizationAt
+                ? new Date(dbSettings.stats.lastOptimizationAt).toLocaleString(locale)
+                : "Never"}
+            </p>
+          </div>
+          <div className="p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02]">
+            <p className="text-xs text-text-muted mb-1">{t("storageIntegrityCheck")}</p>
+            <p className="text-sm font-semibold">
+              {dbSettings.stats.integrityCheck === "ok" ? (
+                <span className="text-green-500">{t("storageIntegrityOk")}</span>
+              ) : dbSettings.stats.integrityCheck === "error" ? (
+                <span className="text-red-500">{t("storageIntegrityError")}</span>
+              ) : (
+                "Not checked"
+              )}
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderBackupList = () => {
+    if (!backupsExpanded) return null;
+
+    return (
+      <div className="flex flex-col gap-2 mt-3">
+        {backupsLoading ? (
+          <div className="flex items-center justify-center py-6 text-text-muted">
+            <span
+              className="material-symbols-outlined animate-spin text-[20px] mr-2"
+              aria-hidden="true"
+            >
+              progress_activity
+            </span>
+            {t("loadingBackups")}
+          </div>
+        ) : backups.length === 0 ? (
+          <div className="text-center py-6 text-text-muted text-sm">
+            <span
+              className="material-symbols-outlined text-[32px] mb-2 block opacity-40"
+              aria-hidden="true"
+            >
+              folder_off
+            </span>
+            {t("noBackupsYet")}
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs text-text-muted">
+                {t("backupsAvailable", { count: backups.length })}
+              </span>
+              <button
+                onClick={loadBackups}
+                className="text-xs text-primary hover:underline flex items-center gap-1"
+              >
+                <span className="material-symbols-outlined text-[14px]" aria-hidden="true">
+                  refresh
+                </span>
+                {t("refresh")}
+              </button>
+            </div>
+            {backups.map((backup) => (
+              <div
+                key={backup.id}
+                className="flex items-center justify-between p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02] border border-border/50 hover:border-border transition-colors"
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span
+                      className="material-symbols-outlined text-[16px] text-amber-500"
+                      aria-hidden="true"
+                    >
+                      description
+                    </span>
+                    <span className="text-sm font-medium truncate">
+                      {new Date(backup.createdAt).toLocaleString(locale)}
+                    </span>
+                    <Badge
+                      variant={
+                        backup.reason === "pre-restore"
+                          ? "warning"
+                          : backup.reason === "manual"
+                            ? "success"
+                            : "default"
+                      }
+                      size="sm"
+                    >
+                      {formatBackupReason(backup.reason)}
+                    </Badge>
+                  </div>
+                  <div className="flex items-center gap-3 text-xs text-text-muted ml-6">
+                    <span>{t("connectionsCount", { count: backup.connectionCount })}</span>
+                    <span>•</span>
+                    <span>{formatBytes(backup.size)}</span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 ml-3">
+                  {confirmRestoreId === backup.id ? (
+                    <>
+                      <span className="text-xs text-amber-500 font-medium">{t("confirm")}</span>
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => handleRestore(backup.id)}
+                        loading={restoringId === backup.id}
+                        className="!bg-amber-500 hover:!bg-amber-600"
+                      >
+                        {t("yes")}
+                      </Button>
+                      <Button variant="outline" size="sm" onClick={() => setConfirmRestoreId(null)}>
+                        {t("no")}
+                      </Button>
+                    </>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setConfirmRestoreId(backup.id)}
+                    >
+                      <span
+                        className="material-symbols-outlined text-[14px] mr-1"
+                        aria-hidden="true"
+                      >
+                        restore
+                      </span>
+                      {t("restore")}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+    );
+  };
+
+  const renderRetentionSettings = () => {
+    if (dbSettingsLoading || !dbSettings) return null;
+
+    const retentionFields = [
+      ["quotaSnapshots", t("retentionQuotaSnapshots"), 7],
+      ["compressionAnalytics", t("retentionCompressionAnalytics"), 30],
+      ["mcpAudit", t("retentionMcpAudit"), 30],
+      ["a2aEvents", t("retentionA2aEvents"), 30],
+      ["callLogs", t("retentionCallLogs"), 30],
+      ["usageHistory", t("retentionUsageHistory"), 30],
+      ["memoryEntries", t("retentionMemoryEntries"), 30],
+    ];
+
+    return (
+      <div className="mt-6 p-4 rounded-lg border border-border bg-bg">
+        <div className="flex items-start justify-between gap-3 flex-wrap mb-3">
+          <div>
+            <h4 className="text-sm font-semibold flex items-center gap-2">
+              <span className="material-symbols-outlined text-[18px]" aria-hidden="true">
+                schedule
+              </span>
+              {t("storageRetentionCleanup")}
+            </h4>
+            <p className="mt-1 text-xs text-text-muted">{t("storageRetentionCleanupDesc")}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Badge variant="default" size="sm">
+              {t("retentionCallDays", { count: storageHealth.retentionDays.call })}
+            </Badge>
+            <Badge variant="default" size="sm">
+              {t("retentionAppDays", { count: storageHealth.retentionDays.app })}
+            </Badge>
+            <Badge variant="default" size="sm">
+              {t("retentionRows", {
+                count: (storageHealth.tableMaxRows?.callLogs ?? 100000).toLocaleString(),
+              })}
+            </Badge>
+          </div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {retentionFields.map(([key, label, fallback]) => (
+            <div key={String(key)}>
+              <label className="block text-xs text-text-muted mb-1">{label}</label>
+              <input
+                type="number"
+                min="1"
+                max="365"
+                value={dbSettings.retention[key]}
+                onChange={(e) =>
+                  setDbSettings({
+                    ...dbSettings,
+                    retention: {
+                      ...dbSettings.retention,
+                      [key]: parseInt(e.target.value) || fallback,
+                    },
+                  })
+                }
+                className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-bg focus:outline-none focus:ring-2 focus:ring-primary"
+              />
+            </div>
+          ))}
+        </div>
+        <div className="mt-3">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={saveDatabaseSettings}
+            loading={dbSettingsSaving}
+          >
+            {t("saveRetentionSettings")}
+          </Button>
+        </div>
+        <div className="mt-5 border-t border-border/50 pt-4">
+          <DatabaseBackupRetentionCard
+            title={t("storageDatabaseBackups")}
+            className="mb-0"
+            storageHealth={storageHealth}
+            backupCleanupOptions={backupCleanupOptions}
+            setBackupCleanupOptions={setBackupCleanupOptions}
+            saveBackupRetentionLoading={saveBackupRetentionLoading}
+            backupRetentionStatus={backupRetentionStatus}
+            setBackupRetentionStatus={setBackupRetentionStatus}
+            cleanupBackupsLoading={cleanupBackupsLoading}
+            cleanupBackupsStatus={cleanupBackupsStatus}
+            onSaveRetention={handleSaveBackupRetention}
+            onCleanupBackups={handleCleanupBackups}
+          />
+        </div>
+      </div>
+    );
+  };
+
+  const renderOptimizationSettings = () => {
+    if (dbSettingsLoading || !dbSettings) return null;
+
+    return (
+      <div className="mt-6 p-4 rounded-lg border border-border bg-bg">
+        <h4 className="text-sm font-semibold mb-3 flex items-center gap-2">
+          <span className="material-symbols-outlined text-[18px]" aria-hidden="true">
+            tune
+          </span>
+          Optimization Settings
+        </h4>
+        <div className="space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-text-muted mb-1">
+                {t("storageAutoVacuumMode")}
+              </label>
+              <select
+                value={dbSettings.optimization.autoVacuumMode}
+                onChange={(e) =>
+                  setDbSettings({
+                    ...dbSettings,
+                    optimization: {
+                      ...dbSettings.optimization,
+                      autoVacuumMode: e.target.value as "NONE" | "FULL" | "INCREMENTAL",
+                    },
+                  })
+                }
+                className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-bg focus:outline-none focus:ring-2 focus:ring-primary"
+              >
+                <option value="NONE">None</option>
+                <option value="FULL">Full</option>
+                <option value="INCREMENTAL">Incremental</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-text-muted mb-1">
+                {t("storageScheduledVacuum")}
+              </label>
+              <select
+                value={dbSettings.optimization.scheduledVacuum}
+                onChange={(e) =>
+                  setDbSettings({
+                    ...dbSettings,
+                    optimization: {
+                      ...dbSettings.optimization,
+                      scheduledVacuum: e.target.value as "never" | "daily" | "weekly" | "monthly",
+                    },
+                  })
+                }
+                className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-bg focus:outline-none focus:ring-2 focus:ring-primary"
+              >
+                <option value="never">Never</option>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-text-muted mb-1">{t("storageVacuumHour")}</label>
+              <input
+                type="number"
+                min="0"
+                max="23"
+                value={dbSettings.optimization.vacuumHour}
+                onChange={(e) =>
+                  setDbSettings({
+                    ...dbSettings,
+                    optimization: {
+                      ...dbSettings.optimization,
+                      vacuumHour: parseInt(e.target.value) || 2,
+                    },
+                  })
+                }
+                className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-bg focus:outline-none focus:ring-2 focus:ring-primary"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-text-muted mb-1">{t("storagePageSize")}</label>
+              <input
+                type="number"
+                min="512"
+                max="65536"
+                step="512"
+                value={dbSettings.optimization.pageSize}
+                onChange={(e) =>
+                  setDbSettings({
+                    ...dbSettings,
+                    optimization: {
+                      ...dbSettings.optimization,
+                      pageSize: parseInt(e.target.value) || 4096,
+                    },
+                  })
+                }
+                className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-bg focus:outline-none focus:ring-2 focus:ring-primary"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-text-muted mb-1">
+                Cache Size (KB, negative = % of RAM)
+              </label>
+              <input
+                type="number"
+                value={dbSettings.optimization.cacheSize}
+                onChange={(e) =>
+                  setDbSettings({
+                    ...dbSettings,
+                    optimization: {
+                      ...dbSettings.optimization,
+                      cacheSize: parseInt(e.target.value) || -2000,
+                    },
+                  })
+                }
+                className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-bg focus:outline-none focus:ring-2 focus:ring-primary"
+              />
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <input
+              type="checkbox"
+              id="optimize-on-startup"
+              checked={dbSettings.optimization.optimizeOnStartup}
+              onChange={(e) =>
+                setDbSettings({
+                  ...dbSettings,
+                  optimization: {
+                    ...dbSettings.optimization,
+                    optimizeOnStartup: e.target.checked,
+                  },
+                })
+              }
+              className="w-4 h-4 rounded border-border text-primary focus:ring-2 focus:ring-primary"
+            />
+            <label htmlFor="optimize-on-startup" className="text-sm">
+              Optimize on Startup
+            </label>
+          </div>
+        </div>
+        <div className="mt-3">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={saveDatabaseSettings}
+            loading={dbSettingsSaving}
+          >
+            Save Optimization Settings
+          </Button>
+        </div>
+      </div>
+    );
+  };
+
+  const renderCompressionAggregationSettings = () => {
+    if (dbSettingsLoading || !dbSettings) return null;
+
+    return (
+      <div className="mt-6 p-4 rounded-lg border border-border bg-bg">
+        <h4 className="text-sm font-semibold mb-3 flex items-center gap-2">
+          <span className="material-symbols-outlined text-[18px]" aria-hidden="true">
+            compress
+          </span>
+          Compression & Aggregation Settings
+        </h4>
+        <div className="space-y-4">
+          <div className="flex items-center gap-3">
+            <input
+              type="checkbox"
+              id="aggregation-enabled"
+              checked={dbSettings.aggregation.enabled}
+              onChange={(e) =>
+                setDbSettings({
+                  ...dbSettings,
+                  aggregation: { ...dbSettings.aggregation, enabled: e.target.checked },
+                })
+              }
+              className="w-4 h-4 rounded border-border text-primary focus:ring-2 focus:ring-primary"
+            />
+            <label htmlFor="aggregation-enabled" className="text-sm">
+              Enable Data Aggregation
+            </label>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs text-text-muted mb-1">
+                Raw Data Retention (days)
+              </label>
+              <input
+                type="number"
+                min="1"
+                max="365"
+                value={dbSettings.aggregation.rawDataRetentionDays}
+                onChange={(e) =>
+                  setDbSettings({
+                    ...dbSettings,
+                    aggregation: {
+                      ...dbSettings.aggregation,
+                      rawDataRetentionDays: parseInt(e.target.value) || 30,
+                    },
+                  })
+                }
+                className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-bg focus:outline-none focus:ring-2 focus:ring-primary"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-text-muted mb-1">Granularity</label>
+              <select
+                value={dbSettings.aggregation.granularity}
+                onChange={(e) =>
+                  setDbSettings({
+                    ...dbSettings,
+                    aggregation: {
+                      ...dbSettings.aggregation,
+                      granularity: e.target.value as "hourly" | "daily" | "weekly",
+                    },
+                  })
+                }
+                className="w-full px-3 py-2 text-sm rounded-lg border border-border bg-bg focus:outline-none focus:ring-2 focus:ring-primary"
+              >
+                <option value="hourly">Hourly</option>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div className="mt-3">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={saveDatabaseSettings}
+            loading={dbSettingsSaving}
+          >
+            Save Aggregation Settings
+          </Button>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <Card>
       <div className="flex items-center gap-3 mb-4">
@@ -398,8 +1188,7 @@ export default function SystemStorageTab() {
         </Badge>
       </div>
 
-      {/* Storage info grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+      <div className="grid grid-cols-1 gap-3 mb-4">
         <div className="p-3 rounded-lg bg-bg border border-border">
           <p className="text-[11px] text-text-muted uppercase tracking-wide mb-1">
             {t("databasePath")}
@@ -408,299 +1197,128 @@ export default function SystemStorageTab() {
             {storageHealth.dbPath || "~/.omniroute/storage.sqlite"}
           </p>
         </div>
-        <div className="p-3 rounded-lg bg-bg border border-border">
-          <p className="text-[11px] text-text-muted uppercase tracking-wide mb-1">
-            {t("databaseSize")}
-          </p>
-          <p className="text-sm font-mono text-text-main">{formatBytes(storageHealth.sizeBytes)}</p>
-        </div>
       </div>
 
-      <div className="p-3 rounded-lg bg-bg border border-border mb-4">
-        <div className="flex items-start justify-between gap-3 flex-wrap">
-          <div>
-            <p className="text-sm font-medium text-text-main">Log retention policy</p>
-            <p className="text-xs text-text-muted">
-              Request logs retain up to <code>CALL_LOGS_TABLE_MAX_ROWS</code> rows (default:
-              100,000). Proxy logs retain up to <code>PROXY_LOGS_TABLE_MAX_ROWS</code> rows. Older
-              entries auto-deleted.
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <Badge variant="default" size="sm">
-              Call {storageHealth.retentionDays.call}d
-            </Badge>
-            <Badge variant="default" size="sm">
-              App {storageHealth.retentionDays.app}d
-            </Badge>
-            <Badge variant="default" size="sm">
-              {storageHealth.tableMaxRows?.callLogs?.toLocaleString() || "100K"} rows
-            </Badge>
-          </div>
-        </div>
-      </div>
+      {renderDatabaseStatistics()}
 
-      <div className="p-3 rounded-lg bg-bg border border-border mb-4">
-        <div className="flex items-start justify-between gap-3 flex-wrap mb-3">
-          <div>
-            <p className="text-sm font-medium text-text-main">Database backup retention</p>
-            <p className="text-xs text-text-muted">
-              Automatic SQLite backups are stored in <code>db_backups</code>. Configure how many
-              snapshots to keep and optionally delete backups older than N days.
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <Badge variant="default" size="sm">
-              {storageHealth.backupCount || 0} backups
-            </Badge>
-            <Badge variant="default" size="sm">
-              Max {storageHealth.backupRetention.maxFiles}
-            </Badge>
-            <Badge variant="default" size="sm">
-              {storageHealth.backupRetention.days > 0
-                ? `${storageHealth.backupRetention.days}d retention`
-                : "Age retention off"}
-            </Badge>
-          </div>
+      <div className="pt-3 border-t border-border/50 mb-4">
+        <div className="flex items-center gap-2 mb-3">
+          <span
+            className="material-symbols-outlined text-[18px] text-emerald-500"
+            aria-hidden="true"
+          >
+            file_export
+          </span>
+          <p className="font-medium">{t("export")}</p>
         </div>
-        <div className="flex flex-wrap items-end gap-3">
-          <label className="flex flex-col gap-1 text-xs text-text-muted">
-            Keep latest backups
-            <input
-              type="number"
-              min={1}
-              max={200}
-              value={backupCleanupOptions.keepLatest}
-              onChange={(e) => {
-                const parsed = Number.parseInt(e.target.value || "1", 10);
-                setBackupCleanupOptions((prev) => ({
-                  ...prev,
-                  keepLatest: Number.isFinite(parsed) ? Math.max(1, parsed) : 1,
-                }));
-              }}
-              className="h-9 w-32 rounded-lg border border-border bg-background px-3 text-sm text-text-main"
-            />
-          </label>
-          <label className="flex flex-col gap-1 text-xs text-text-muted">
-            Delete older than days
-            <input
-              type="number"
-              min={0}
-              max={3650}
-              value={backupCleanupOptions.retentionDays}
-              onChange={(e) => {
-                const parsed = Number.parseInt(e.target.value || "0", 10);
-                setBackupCleanupOptions((prev) => ({
-                  ...prev,
-                  retentionDays: Number.isFinite(parsed) ? Math.max(0, parsed) : 0,
-                }));
-              }}
-              className="h-9 w-32 rounded-lg border border-border bg-background px-3 text-sm text-text-main"
-            />
-          </label>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="outline" size="sm" onClick={handleExport} loading={exportLoading}>
+            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
+              download
+            </span>
+            {t("exportDatabase")}
+          </Button>
           <Button
             variant="outline"
             size="sm"
-            onClick={handleCleanupBackups}
-            loading={cleanupBackupsLoading}
+            onClick={async () => {
+              setExportLoading(true);
+              try {
+                await fetchAndDownload(
+                  "/api/db-backups/exportAll",
+                  "omniroute-full-backup.tar.gz",
+                  t("exportFailed")
+                );
+              } catch (err) {
+                setImportStatus({
+                  type: "error",
+                  message: t("fullExportFailedWithError", { error: (err as Error).message }),
+                });
+              } finally {
+                setExportLoading(false);
+              }
+            }}
+            loading={exportLoading}
           >
             <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-              auto_delete
+              folder_zip
             </span>
-            Clean old backups
+            {t("exportAll")}
           </Button>
-        </div>
-        {cleanupBackupsStatus.message && (
-          <div
-            className={`mt-3 p-3 rounded-lg text-sm ${
-              cleanupBackupsStatus.type === "success"
-                ? "bg-green-500/10 text-green-500 border border-green-500/20"
-                : "bg-red-500/10 text-red-500 border border-red-500/20"
-            }`}
-            role="alert"
-          >
-            <div className="flex items-center gap-2">
-              <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-                {cleanupBackupsStatus.type === "success" ? "check_circle" : "error"}
-              </span>
-              {cleanupBackupsStatus.message}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Export / Import */}
-      <div className="flex flex-wrap items-center gap-2 mb-4">
-        <Button variant="outline" size="sm" onClick={handleExport} loading={exportLoading}>
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            download
-          </span>
-          {t("exportDatabase")}
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={async () => {
-            setExportLoading(true);
-            try {
-              await fetchAndDownload(
-                "/api/db-backups/exportAll",
-                "omniroute-full-backup.tar.gz",
-                t("exportFailed")
-              );
-            } catch (err) {
-              setImportStatus({
-                type: "error",
-                message: t("fullExportFailedWithError", { error: (err as Error).message }),
-              });
-            } finally {
-              setExportLoading(false);
-            }
-          }}
-          loading={exportLoading}
-        >
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            folder_zip
-          </span>
-          {t("exportAll")}
-        </Button>
-        <Button variant="outline" size="sm" onClick={handleImportClick} loading={importLoading}>
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            upload
-          </span>
-          {t("importDatabase")}
-        </Button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".sqlite"
-          className="hidden"
-          onChange={handleFileSelected}
-        />
-        <Button variant="outline" size="sm" onClick={handleExportJson} loading={exportLoading}>
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            data_object
-          </span>
-          Export JSON
-        </Button>
-        <Button variant="outline" size="sm" onClick={handleImportJsonClick} loading={importLoading}>
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            data_object
-          </span>
-          Import JSON
-        </Button>
-        <input
-          ref={jsonInputRef}
-          type="file"
-          accept=".json"
-          className="hidden"
-          onChange={handleJsonSelected}
-        />
-      </div>
-
-      {/* Import confirmation dialog */}
-      {confirmImport && pendingImportFile && (
-        <div className="p-4 rounded-lg mb-4 bg-amber-500/10 border border-amber-500/30">
-          <div className="flex items-start gap-3">
-            <span
-              className="material-symbols-outlined text-[20px] text-amber-500 mt-0.5"
-              aria-hidden="true"
-            >
-              warning
+          <Button variant="outline" size="sm" onClick={handleImportClick} loading={importLoading}>
+            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
+              upload
             </span>
-            <div className="flex-1">
-              <p className="text-sm font-medium text-amber-500 mb-1">{t("confirmDbImport")}</p>
-              <p className="text-xs text-text-muted mb-2">
-                {t("confirmDbImportDesc", { file: pendingImportFile.name })}
-              </p>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={handleImportConfirm}
-                  className="!bg-amber-500 hover:!bg-amber-600"
-                >
-                  {t("yesImport")}
-                </Button>
-                <Button variant="outline" size="sm" onClick={handleImportCancel}>
-                  {tc("cancel")}
-                </Button>
+            {t("importDatabase")}
+          </Button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".sqlite"
+            className="hidden"
+            onChange={handleFileSelected}
+          />
+          <Button variant="outline" size="sm" onClick={handleExportJson} loading={exportLoading}>
+            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
+              data_object
+            </span>
+            Export JSON
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleImportJsonClick}
+            loading={importLoading}
+          >
+            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
+              data_object
+            </span>
+            Import JSON
+          </Button>
+          <input
+            ref={jsonInputRef}
+            type="file"
+            accept=".json"
+            className="hidden"
+            onChange={handleJsonSelected}
+          />
+        </div>
+
+        {confirmImport && pendingImportFile && (
+          <div className="p-4 rounded-lg mt-3 bg-amber-500/10 border border-amber-500/30">
+            <div className="flex items-start gap-3">
+              <span
+                className="material-symbols-outlined text-[20px] text-amber-500 mt-0.5"
+                aria-hidden="true"
+              >
+                warning
+              </span>
+              <div className="flex-1">
+                <p className="text-sm font-medium text-amber-500 mb-1">{t("confirmDbImport")}</p>
+                <p className="text-xs text-text-muted mb-2">
+                  {t("confirmDbImportDesc", { file: pendingImportFile.name })}
+                </p>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={handleImportConfirm}
+                    className="!bg-amber-500 hover:!bg-amber-600"
+                  >
+                    {t("yesImport")}
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={handleImportCancel}>
+                    {tc("cancel")}
+                  </Button>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Import status */}
-      {importStatus.message && (
-        <div
-          className={`p-3 rounded-lg mb-4 text-sm ${
-            importStatus.type === "success"
-              ? "bg-green-500/10 text-green-500 border border-green-500/20"
-              : "bg-red-500/10 text-red-500 border border-red-500/20"
-          }`}
-          role="alert"
-        >
-          <div className="flex items-center gap-2">
-            <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-              {importStatus.type === "success" ? "check_circle" : "error"}
-            </span>
-            {importStatus.message}
-          </div>
-        </div>
-      )}
-      <div className="flex items-center justify-between p-3 rounded-lg bg-bg border border-border mb-4">
-        <div className="flex items-center gap-2">
-          <span className="material-symbols-outlined text-[16px] text-amber-500" aria-hidden="true">
-            schedule
-          </span>
-          <div>
-            <p className="text-sm font-medium">{t("lastBackup")}</p>
-            <p className="text-xs text-text-muted">
-              {storageHealth.lastBackupAt
-                ? `${new Date(storageHealth.lastBackupAt).toLocaleString(locale)} (${formatRelativeTime(storageHealth.lastBackupAt)})`
-                : t("noBackupYet")}
-            </p>
-          </div>
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleManualBackup}
-          loading={manualBackupLoading}
-        >
-          <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
-            backup
-          </span>
-          {t("backupNow")}
-        </Button>
+        {importStatus.message && <div className="mt-3">{renderStatusAlert(importStatus, 0)}</div>}
       </div>
 
-      {manualBackupStatus.message && (
-        <div
-          className={`p-3 rounded-lg mb-4 text-sm ${
-            manualBackupStatus.type === "success"
-              ? "bg-green-500/10 text-green-500 border border-green-500/20"
-              : manualBackupStatus.type === "info"
-                ? "bg-blue-500/10 text-blue-500 border border-blue-500/20"
-                : "bg-red-500/10 text-red-500 border border-red-500/20"
-          }`}
-          role="alert"
-        >
-          <div className="flex items-center gap-2">
-            <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-              {manualBackupStatus.type === "success"
-                ? "check_circle"
-                : manualBackupStatus.type === "info"
-                  ? "info"
-                  : "error"}
-            </span>
-            {manualBackupStatus.message}
-          </div>
-        </div>
-      )}
-
-      {/* Maintenance */}
       <div className="pt-3 border-t border-border/50 mb-4">
         <div className="flex items-center gap-2 mb-3">
           <span className="material-symbols-outlined text-[18px] text-blue-500" aria-hidden="true">
@@ -708,34 +1326,12 @@ export default function SystemStorageTab() {
           </span>
           <p className="font-medium">{t("maintenance") || "Maintenance"}</p>
         </div>
-        <div className="flex flex-wrap items-center gap-2 mb-3">
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
             size="sm"
             loading={clearCacheLoading}
-            onClick={async () => {
-              setClearCacheLoading(true);
-              setClearCacheStatus({ type: "", message: "" });
-              try {
-                const res = await fetch("/api/cache", { method: "DELETE" });
-                const data = await res.json();
-                if (res.ok) {
-                  setClearCacheStatus({
-                    type: "success",
-                    message: t("cacheCleared") || "Cache cleared successfully",
-                  });
-                } else {
-                  setClearCacheStatus({
-                    type: "error",
-                    message: data.error || t("clearCacheFailed") || "Failed to clear cache",
-                  });
-                }
-              } catch {
-                setClearCacheStatus({ type: "error", message: t("errorOccurred") });
-              } finally {
-                setClearCacheLoading(false);
-              }
-            }}
+            onClick={handleClearCache}
           >
             <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
               delete_sweep
@@ -746,90 +1342,101 @@ export default function SystemStorageTab() {
             variant="outline"
             size="sm"
             loading={purgeLogsLoading}
-            onClick={async () => {
-              setPurgeLogsLoading(true);
-              setPurgeLogsStatus({ type: "", message: "" });
-              try {
-                const res = await fetch("/api/settings/purge-logs", { method: "POST" });
-                const data = await res.json();
-                if (res.ok) {
-                  setPurgeLogsStatus({
-                    type: "success",
-                    message:
-                      t("logsDeleted", { count: data.deleted }) ||
-                      `Purged ${data.deleted} expired log(s)`,
-                  });
-                } else {
-                  setPurgeLogsStatus({
-                    type: "error",
-                    message: data.error || t("purgeLogsFailed") || "Failed to purge logs",
-                  });
-                }
-              } catch {
-                setPurgeLogsStatus({ type: "error", message: t("errorOccurred") });
-              } finally {
-                setPurgeLogsLoading(false);
-              }
-            }}
+            onClick={handlePurgeExpiredLogs}
           >
             <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
               auto_delete
             </span>
             {t("purgeExpiredLogs") || "Purge Expired Logs"}
           </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            loading={manualVacuumLoading}
+            onClick={handleManualVacuum}
+          >
+            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
+              cleaning_services
+            </span>
+            Manual VACUUM
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            loading={purgeQuotaSnapshotsLoading}
+            onClick={handlePurgeQuotaSnapshots}
+          >
+            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
+              delete_forever
+            </span>
+            Purge Quota Snapshots
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            loading={purgeCallLogsLoading}
+            onClick={handlePurgeCallLogs}
+          >
+            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
+              delete_forever
+            </span>
+            Purge Call Logs
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            loading={purgeDetailedLogsLoading}
+            onClick={handlePurgeDetailedLogs}
+          >
+            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
+              delete_forever
+            </span>
+            Purge Detailed Logs
+          </Button>
         </div>
-        {(clearCacheStatus.message || purgeLogsStatus.message) && (
+        <div className="mt-4 border-t border-border/50 pt-3">
           <div className="flex flex-col gap-2">
-            {clearCacheStatus.message && (
-              <div
-                className={`p-3 rounded-lg text-sm ${
-                  clearCacheStatus.type === "success"
-                    ? "bg-green-500/10 text-green-500 border border-green-500/20"
-                    : "bg-red-500/10 text-red-500 border border-red-500/20"
-                }`}
-                role="alert"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-                    {clearCacheStatus.type === "success" ? "check_circle" : "error"}
-                  </span>
-                  {clearCacheStatus.message}
-                </div>
-              </div>
-            )}
-            {purgeLogsStatus.message && (
-              <div
-                className={`p-3 rounded-lg text-sm ${
-                  purgeLogsStatus.type === "success"
-                    ? "bg-green-500/10 text-green-500 border border-green-500/20"
-                    : "bg-red-500/10 text-red-500 border border-red-500/20"
-                }`}
-                role="alert"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-                    {purgeLogsStatus.type === "success" ? "check_circle" : "error"}
-                  </span>
-                  {purgeLogsStatus.message}
-                </div>
-              </div>
-            )}
+            {[
+              clearCacheStatus,
+              purgeLogsStatus,
+              manualVacuumStatus,
+              purgeQuotaSnapshotsStatus,
+              purgeCallLogsStatus,
+              purgeDetailedLogsStatus,
+            ].map(renderStatusAlert)}
           </div>
-        )}
+        </div>
       </div>
 
-      {/* Backup/Restore section */}
-      <div className="pt-3 border-t border-border/50">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <span
-              className="material-symbols-outlined text-[18px] text-amber-500"
-              aria-hidden="true"
-            >
-              restore
-            </span>
-            <p className="font-medium">{t("backupRestore")}</p>
+      <div className="flex items-center justify-between p-3 rounded-lg bg-bg border border-border mb-4">
+        <div className="flex items-center gap-2">
+          <span className="material-symbols-outlined text-[16px] text-amber-500" aria-hidden="true">
+            schedule
+          </span>
+          <div>
+            <p className="text-sm font-medium">{t("lastBackup")}</p>
+            <p className="text-xs text-text-muted">
+              {storageHealth.lastBackupAt
+                ? new Date(storageHealth.lastBackupAt).toLocaleString(locale) +
+                  " (" +
+                  formatRelativeTime(storageHealth.lastBackupAt) +
+                  ")"
+                : t("noBackupYet")}
+            </p>
           </div>
+        </div>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleManualBackup}
+            loading={manualBackupLoading}
+          >
+            <span className="material-symbols-outlined text-[14px] mr-1" aria-hidden="true">
+              backup
+            </span>
+            {t("backupNow")}
+          </Button>
           <Button
             variant="outline"
             size="sm"
@@ -841,143 +1448,17 @@ export default function SystemStorageTab() {
             {backupsExpanded ? t("hide") : t("viewBackups")}
           </Button>
         </div>
-        <p className="text-xs text-text-muted mb-3">{t("backupRetentionDesc")}</p>
-
-        {restoreStatus.message && (
-          <div
-            className={`p-3 rounded-lg mb-3 text-sm ${
-              restoreStatus.type === "success"
-                ? "bg-green-500/10 text-green-500 border border-green-500/20"
-                : "bg-red-500/10 text-red-500 border border-red-500/20"
-            }`}
-            role="alert"
-          >
-            <div className="flex items-center gap-2">
-              <span className="material-symbols-outlined text-[16px]" aria-hidden="true">
-                {restoreStatus.type === "success" ? "check_circle" : "error"}
-              </span>
-              {restoreStatus.message}
-            </div>
-          </div>
-        )}
-
-        {backupsExpanded && (
-          <div className="flex flex-col gap-2">
-            {backupsLoading ? (
-              <div className="flex items-center justify-center py-6 text-text-muted">
-                <span
-                  className="material-symbols-outlined animate-spin text-[20px] mr-2"
-                  aria-hidden="true"
-                >
-                  progress_activity
-                </span>
-                {t("loadingBackups")}
-              </div>
-            ) : backups.length === 0 ? (
-              <div className="text-center py-6 text-text-muted text-sm">
-                <span
-                  className="material-symbols-outlined text-[32px] mb-2 block opacity-40"
-                  aria-hidden="true"
-                >
-                  folder_off
-                </span>
-                {t("noBackupsYet")}
-              </div>
-            ) : (
-              <>
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-xs text-text-muted">
-                    {t("backupsAvailable", { count: backups.length })}
-                  </span>
-                  <button
-                    onClick={loadBackups}
-                    className="text-xs text-primary hover:underline flex items-center gap-1"
-                  >
-                    <span className="material-symbols-outlined text-[14px]" aria-hidden="true">
-                      refresh
-                    </span>
-                    {t("refresh")}
-                  </button>
-                </div>
-                {backups.map((backup) => (
-                  <div
-                    key={backup.id}
-                    className="flex items-center justify-between p-3 rounded-lg bg-black/[0.02] dark:bg-white/[0.02] border border-border/50 hover:border-border transition-colors"
-                  >
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
-                        <span
-                          className="material-symbols-outlined text-[16px] text-amber-500"
-                          aria-hidden="true"
-                        >
-                          description
-                        </span>
-                        <span className="text-sm font-medium truncate">
-                          {new Date(backup.createdAt).toLocaleString(locale)}
-                        </span>
-                        <Badge
-                          variant={
-                            backup.reason === "pre-restore"
-                              ? "warning"
-                              : backup.reason === "manual"
-                                ? "success"
-                                : "default"
-                          }
-                          size="sm"
-                        >
-                          {formatBackupReason(backup.reason)}
-                        </Badge>
-                      </div>
-                      <div className="flex items-center gap-3 text-xs text-text-muted ml-6">
-                        <span>{t("connectionsCount", { count: backup.connectionCount })}</span>
-                        <span>•</span>
-                        <span>{formatBytes(backup.size)}</span>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2 ml-3">
-                      {confirmRestoreId === backup.id ? (
-                        <>
-                          <span className="text-xs text-amber-500 font-medium">{t("confirm")}</span>
-                          <Button
-                            variant="primary"
-                            size="sm"
-                            onClick={() => handleRestore(backup.id)}
-                            loading={restoringId === backup.id}
-                            className="!bg-amber-500 hover:!bg-amber-600"
-                          >
-                            {t("yes")}
-                          </Button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => setConfirmRestoreId(null)}
-                          >
-                            {t("no")}
-                          </Button>
-                        </>
-                      ) : (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setConfirmRestoreId(backup.id)}
-                        >
-                          <span
-                            className="material-symbols-outlined text-[14px] mr-1"
-                            aria-hidden="true"
-                          >
-                            restore
-                          </span>
-                          {t("restore")}
-                        </Button>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </>
-            )}
-          </div>
-        )}
       </div>
+
+      {manualBackupStatus.message && (
+        <div className="mb-4">{renderStatusAlert(manualBackupStatus, 0)}</div>
+      )}
+      {restoreStatus.message && <div className="mb-4">{renderStatusAlert(restoreStatus, 1)}</div>}
+      {renderBackupList()}
+
+      {renderRetentionSettings()}
+      {renderOptimizationSettings()}
+      {renderCompressionAggregationSettings()}
     </Card>
   );
 }

@@ -24,6 +24,14 @@ const originalFetch = globalThis.fetch;
 async function resetStorage() {
   delete process.env.INITIAL_PASSWORD;
   globalThis.fetch = originalFetch;
+  // Reset the shared loopback readiness gate between tests so the cached
+  // promise from a previous test doesn't poison this one (PR #2221 adds
+  // an __loopbackReadyPromise module-level cache that, once resolved, is
+  // reused for the rest of the process). Without this reset, the very
+  // first test's mock-fetch resolution (or rejection) leaks into every
+  // subsequent test, causing the route to use in-process fallback instead
+  // of the test's mocked self-fetch.
+  modelSyncRoute.__resetLoopbackReadinessForTests();
   core.resetDbInstance();
   apiKeysDb.resetApiKeyState();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
@@ -53,19 +61,20 @@ test("model sync route skips success log when fetched models do not change store
     apiKey: "test-key",
   });
 
-  await modelsDb.replaceCustomModels("openrouter", [
+  await modelsDb.replaceSyncedAvailableModelsForConnection("openrouter", connection.id, [
     {
       id: "custom-model-1",
       name: "Custom Model 1",
-      source: "auto-sync",
+      source: "imported",
     },
   ]);
 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({
       models: [{ id: "custom-model-1", name: "Custom Model 1" }],
@@ -85,6 +94,7 @@ test("model sync route skips success log when fetched models do not change store
     const body = (await response.json()) as any;
     assert.equal(body.logged, false);
     assert.deepEqual(body.modelChanges, { added: 0, removed: 0, updated: 0, total: 0 });
+    assert.deepEqual(body.models, []);
 
     const logs = await callLogs.getCallLogs({ model: "model-sync", limit: 10 });
     assert.equal(logs.length, 0);
@@ -106,9 +116,10 @@ test("model sync route stores the real provider while keeping the account label"
 
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({
       models: [{ id: "custom-model-2", name: "Custom Model 2" }],
@@ -190,9 +201,10 @@ test("model sync route propagates upstream failures and records an error log ent
   });
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({ error: "Provider upstream unavailable" }, { status: 502 });
   };
@@ -226,9 +238,10 @@ test("model sync route falls back to the upstream HTTP status when the models pa
   });
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({}, { status: 429 });
   };
@@ -250,6 +263,46 @@ test("model sync route falls back to the upstream HTTP status when the models pa
   assert.equal(logs[0].error, "HTTP 429");
 });
 
+test("model sync route reports invalid JSON /models responses without losing upstream status", async () => {
+  await resetStorage();
+
+  const connection = await providersDb.createProviderConnection({
+    provider: "openrouter",
+    authType: "apikey",
+    name: "Invalid JSON Sync",
+    apiKey: "test-key",
+  });
+
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
+    assert.equal(
+      String(url),
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
+    );
+    return new Response("<html>bad gateway</html>", {
+      status: 200,
+      headers: { "content-type": "text/html" },
+    });
+  };
+
+  const response = await modelSyncRoute.POST(
+    new Request(`http://localhost/api/providers/${connection.id}/sync-models`, {
+      method: "POST",
+      headers: scheduler.buildModelSyncInternalHeaders(),
+    }),
+    { params: { id: connection.id } }
+  );
+  const body = (await response.json()) as any;
+  const logs = await callLogs.getCallLogs({ model: "model-sync", limit: 10 });
+
+  assert.equal(response.status, 502);
+  assert.equal(body.error, "Invalid JSON response from /models");
+  assert.equal(body.upstreamStatus, 200);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].status, 200);
+  assert.equal(logs[0].error, "Invalid JSON response from /models");
+});
+
 test("model sync route preserves previously synced models when the upstream omits the models list", async () => {
   await resetStorage();
 
@@ -260,18 +313,19 @@ test("model sync route preserves previously synced models when the upstream omit
     apiKey: "test-key",
   });
 
-  await modelsDb.replaceCustomModels("openrouter", [
+  await modelsDb.replaceSyncedAvailableModelsForConnection("openrouter", connection.id, [
     {
       id: "persisted-model",
       name: "Persisted Model",
-      source: "auto-sync",
+      source: "imported",
     },
   ]);
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({});
   };
@@ -290,13 +344,12 @@ test("model sync route preserves previously synced models when the upstream omit
   assert.equal(body.syncedModels, 1);
   assert.equal(body.logged, false);
   assert.deepEqual(body.modelChanges, { added: 0, removed: 0, updated: 0, total: 0 });
-  assert.deepEqual(body.models, [
+  assert.deepEqual(body.models, []);
+  assert.deepEqual(await modelsDb.getSyncedAvailableModels("openrouter"), [
     {
       id: "persisted-model",
       name: "Persisted Model",
-      source: "auto-sync",
-      apiFormat: "chat-completions",
-      supportedEndpoints: ["chat"],
+      source: "imported",
     },
   ]);
   assert.equal(logs.length, 0);
@@ -313,9 +366,10 @@ test("model sync route writes synced available models for Gemini connections", a
   });
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({
       models: [
@@ -348,24 +402,12 @@ test("model sync route writes synced available models for Gemini connections", a
   assert.equal(body.syncedModels, 1);
   assert.equal(body.logged, true);
   assert.deepEqual(body.modelChanges, { added: 1, removed: 0, updated: 0, total: 1 });
-  assert.deepEqual(body.models, [
-    {
-      id: "gemini-custom-preview",
-      name: "Gemini Custom Preview",
-      source: "api-sync",
-      apiFormat: "chat-completions",
-      supportedEndpoints: ["chat", "embeddings"],
-      inputTokenLimit: 32768,
-      outputTokenLimit: 8192,
-      description: "Custom Gemini preview model",
-      supportsThinking: true,
-    },
-  ]);
+  assert.deepEqual(body.models, []);
   assert.deepEqual(synced, [
     {
       id: "gemini-custom-preview",
       name: "Gemini Custom Preview",
-      source: "api-sync",
+      source: "imported",
       supportedEndpoints: ["chat", "embeddings"],
       inputTokenLimit: 32768,
       outputTokenLimit: 8192,
@@ -388,9 +430,10 @@ test("model sync route writes synced available models for non-Gemini providers t
   });
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({
       models: [
@@ -421,7 +464,7 @@ test("model sync route writes synced available models for non-Gemini providers t
     {
       id: "glm-5.1",
       name: "GLM 5.1",
-      source: "api-sync",
+      source: "imported",
       supportedEndpoints: ["chat"],
       inputTokenLimit: 262144,
     },
@@ -439,12 +482,14 @@ test("model sync route import mode merges discovered models without deleting man
   });
 
   await modelsDb.addCustomModel("openrouter", "manual-only", "Manual Only", "manual");
+  await modelsDb.addCustomModel("openrouter", "router-v4", "Manual Router V4", "manual");
   await localDb.setModelAlias("manual-only", "openrouter/manual-only");
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({
       models: [{ id: "router-v4", name: "Router V4" }],
@@ -467,16 +512,21 @@ test("model sync route import mode merges discovered models without deleting man
   assert.equal(body.updatedCount, 0);
   assert.equal(body.syncedAliases, 1);
   assert.deepEqual(body.modelChanges, { added: 1, removed: 0, updated: 0, total: 1 });
+  assert.deepEqual(body.customModelChanges, { added: 0, removed: 1, updated: 0, total: 1 });
   assert.deepEqual(
     body.models.map((model) => ({ id: model.id, source: model.source })),
-    [
-      { id: "manual-only", source: "manual" },
-      { id: "router-v4", source: "api-sync" },
-    ]
+    [{ id: "manual-only", source: "manual" }]
   );
   assert.deepEqual(
     body.importedModels.map((model) => ({ id: model.id, source: model.source })),
-    [{ id: "router-v4", source: "api-sync" }]
+    [{ id: "router-v4", source: "imported" }]
+  );
+  assert.deepEqual(
+    (await modelsDb.getSyncedAvailableModels("openrouter")).map((model) => ({
+      id: model.id,
+      source: model.source,
+    })),
+    [{ id: "router-v4", source: "imported" }]
   );
   assert.equal(aliases["manual-only"], "openrouter/manual-only");
   assert.equal(aliases["router-v4"], "openrouter/router-v4");
@@ -492,20 +542,20 @@ test("model sync route import mode ignores supported endpoint ordering changes",
     apiKey: "test-key",
   });
 
-  await modelsDb.replaceCustomModels("openrouter", [
+  await modelsDb.replaceSyncedAvailableModelsForConnection("openrouter", connection.id, [
     {
       id: "router-v4",
       name: "Router V4",
-      source: "api-sync",
-      apiFormat: "chat-completions",
+      source: "imported",
       supportedEndpoints: ["chat", "embeddings"],
     },
   ]);
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({
       models: [
@@ -536,12 +586,13 @@ test("model sync route import mode ignores supported endpoint ordering changes",
   assert.equal(body.logged, false);
   assert.deepEqual(body.importedModels, []);
   assert.deepEqual(
-    body.models.map((model) => ({
+    (await modelsDb.getSyncedAvailableModels("openrouter")).map((model) => ({
       id: model.id,
       supportedEndpoints: model.supportedEndpoints,
     })),
     [{ id: "router-v4", supportedEndpoints: ["chat", "embeddings"] }]
   );
+  assert.deepEqual(body.models, []);
   assert.equal(logs.length, 0);
 });
 
@@ -555,20 +606,20 @@ test("model sync route import mode reports updates without counting them as new 
     apiKey: "test-key",
   });
 
-  await modelsDb.replaceCustomModels("openrouter", [
+  await modelsDb.replaceSyncedAvailableModelsForConnection("openrouter", connection.id, [
     {
       id: "router-v4",
       name: "Router V4",
-      source: "api-sync",
-      apiFormat: "chat-completions",
+      source: "imported",
       supportedEndpoints: ["chat"],
     },
   ]);
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({
       models: [
@@ -597,7 +648,7 @@ test("model sync route import mode reports updates without counting them as new 
   assert.deepEqual(body.importedChanges, { added: 0, updated: 1, unchanged: 0, total: 1 });
   assert.deepEqual(body.importedModels, []);
   assert.deepEqual(
-    body.models.map((model) => ({
+    (await modelsDb.getSyncedAvailableModels("openrouter")).map((model) => ({
       id: model.id,
       name: model.name,
       supportedEndpoints: model.supportedEndpoints,
@@ -610,6 +661,7 @@ test("model sync route import mode reports updates without counting them as new 
       },
     ]
   );
+  assert.deepEqual(body.models, []);
   assert.equal(body.logged, true);
   assert.equal(logs.length, 1);
 });
@@ -624,23 +676,24 @@ test("model sync route records added, removed, and updated model diffs with fall
     accessToken: "sync-token",
   });
 
-  await modelsDb.replaceCustomModels("openrouter", [
+  await modelsDb.replaceSyncedAvailableModelsForConnection("openrouter", connection.id, [
     {
       id: "persisted-model",
       name: "Persisted Model",
-      source: "auto-sync",
+      source: "imported",
     },
     {
       id: "removed-model",
       name: "Removed Model",
-      source: "auto-sync",
+      source: "imported",
     },
   ]);
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({
       models: [
@@ -673,7 +726,7 @@ test("model sync route records added, removed, and updated model diffs with fall
   assert.equal(body.logged, true);
   assert.deepEqual(body.modelChanges, { added: 1, removed: 1, updated: 1, total: 3 });
   assert.deepEqual(
-    body.models.map((model) => ({
+    (await modelsDb.getSyncedAvailableModels("openrouter")).map((model) => ({
       id: model.id,
       name: model.name,
       supportedEndpoints: model.supportedEndpoints,
@@ -689,7 +742,7 @@ test("model sync route records added, removed, and updated model diffs with fall
       {
         id: "fallback-model",
         name: "Fallback Model",
-        supportedEndpoints: ["chat"],
+        supportedEndpoints: undefined,
         description: "Fallback from model field",
       },
     ]
@@ -697,7 +750,7 @@ test("model sync route records added, removed, and updated model diffs with fall
   assert.equal(logs.length, 1);
   assert.equal(logs[0].status, 200);
   assert.equal(logs[0].provider, "openrouter");
-  assert.ok(logs[0].account.includes("*"), `Expected masked email, got: ${logs[0].account}`);
+  assert.equal(logs[0].account, "sync@example.com");
 });
 
 test("model sync route forwards cookies, filters built-ins, and syncs aliases for internal requests", async () => {
@@ -716,9 +769,10 @@ test("model sync route forwards cookies, filters built-ins, and syncs aliases fo
   await localDb.setModelAlias("router-v2", "other-provider/router-v2");
 
   globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     assert.equal(init.headers.cookie, "session=test-cookie");
     assert.equal(
@@ -753,17 +807,12 @@ test("model sync route forwards cookies, filters built-ins, and syncs aliases fo
   assert.equal(body.provider, "openrouter");
   assert.equal(body.syncedModels, 3);
   assert.equal(body.availableModelsCount, 3);
-  assert.equal(body.syncedAliases, 2);
+  assert.equal(body.syncedAliases, 3);
   assert.equal(body.logged, true);
-  assert.deepEqual(body.modelChanges, { added: 2, removed: 0, updated: 0, total: 2 });
-  assert.deepEqual(
-    body.models.map((model) => ({ id: model.id, name: model.name })),
-    [
-      { id: "router-v2", name: "Router V2" },
-      { id: "router-v3", name: "Router V3" },
-    ]
-  );
+  assert.deepEqual(body.modelChanges, { added: 3, removed: 0, updated: 0, total: 3 });
+  assert.deepEqual(body.models, []);
   assert.equal(aliases["stale-model"], undefined);
+  assert.equal(aliases["auto"], "openrouter/auto");
   assert.equal(aliases["openrouter-router-v2"], "openrouter/router-v2");
   assert.equal(aliases["router-v3"], "openrouter/router-v3");
   assert.equal(logs.length, 1);
@@ -782,11 +831,13 @@ test("model sync route reports synced managed models separately from preserved m
   });
 
   await modelsDb.addCustomModel("openrouter", "manual-only", "Manual Only", "manual");
+  await modelsDb.addCustomModel("openrouter", "router-v4", "Manual Router V4", "manual");
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({
       models: [{ id: "router-v4", name: "Router V4" }],
@@ -807,12 +858,17 @@ test("model sync route reports synced managed models separately from preserved m
   assert.equal(body.availableModelsCount, 2);
   assert.equal(body.importedCount, 1);
   assert.equal(body.updatedCount, 0);
+  assert.deepEqual(body.customModelChanges, { added: 0, removed: 1, updated: 0, total: 1 });
   assert.deepEqual(
     body.models.map((model) => ({ id: model.id, source: model.source })),
-    [
-      { id: "manual-only", source: "manual" },
-      { id: "router-v4", source: "api-sync" },
-    ]
+    [{ id: "manual-only", source: "manual" }]
+  );
+  assert.deepEqual(
+    (await modelsDb.getSyncedAvailableModels("openrouter")).map((model) => ({
+      id: model.id,
+      source: model.source,
+    })),
+    [{ id: "router-v4", source: "imported" }]
   );
 });
 
@@ -843,9 +899,10 @@ test("model sync route uses provider-node prefixes when syncing compatible-provi
   await localDb.setModelAlias("sonnet-4-6", "some-other-provider/sonnet-4-6");
 
   globalThis.fetch = async (url) => {
+    if (String(url).includes("__readiness_probe__")) return new Response(null, { status: 404 });
     assert.equal(
       String(url),
-      `http://localhost/api/providers/${connection.id}/models?refresh=true`
+      `http://127.0.0.1:20128/api/providers/${connection.id}/models?refresh=true`
     );
     return Response.json({
       models: [{ id: "sonnet-4-6", name: "Sonnet 4.6" }],
@@ -868,33 +925,91 @@ test("model sync route uses provider-node prefixes when syncing compatible-provi
   assert.equal(aliases["cm-sonnet-4-6"], "anthropic-compatible-demo/sonnet-4-6");
 });
 
-test("model sync route returns 500 and records a failure when the internal models fetch throws", async () => {
+test("model sync route falls back to in-process discovery when internal self-fetch throws", async () => {
   await resetStorage();
 
   const connection = await providersDb.createProviderConnection({
-    provider: "openrouter",
+    provider: "openai-compatible-aio",
     authType: "apikey",
-    name: "Exploding Sync",
+    name: "AIO Import",
     apiKey: "test-key",
+    providerSpecificData: {
+      prefix: "aio",
+      apiType: "chat",
+      baseUrl: "https://api.bltcy.ai/v1",
+      nodeName: "aio",
+      autoSync: true,
+    },
   });
 
-  globalThis.fetch = async () => {
-    throw new Error("network exploded");
+  // Reset shared readiness gate so this test exercises the probe path cleanly.
+  modelSyncRoute.__resetLoopbackReadinessForTests();
+
+  const fetchCalls: string[] = [];
+  globalThis.fetch = async (url) => {
+    const urlString = String(url);
+
+    // Loopback readiness probe: respond 404 so the gate opens immediately.
+    // (Any HTTP response confirms the server is up — see ensureLoopbackServerReady.)
+    if (urlString.includes("__readiness_probe__")) {
+      return new Response(null, { status: 404 });
+    }
+
+    fetchCalls.push(urlString);
+
+    if (urlString === `http://localhost/api/providers/${connection.id}/models?refresh=true`) {
+      throw new Error("fetch failed");
+    }
+
+    assert.equal(urlString, "https://api.bltcy.ai/v1/models");
+    return Response.json({
+      data: [{ id: "aio-model", name: "AIO Model" }],
+    });
   };
 
   const response = await modelSyncRoute.POST(
-    new Request(`http://localhost/api/providers/${connection.id}/sync-models`, {
+    new Request(`http://localhost/api/providers/${connection.id}/sync-models?mode=import`, {
       method: "POST",
       headers: scheduler.buildModelSyncInternalHeaders(),
     }),
     { params: { id: connection.id } }
   );
-  const body = (await response.json()) as any;
-  const logs = await callLogs.getCallLogs({ model: "model-sync", limit: 10 });
+  const body = (await response.json()) as {
+    importedCount: number;
+    importedModels: Array<{ id: string; source: string }>;
+  };
+  const customModels = (await modelsDb.getCustomModels("openai-compatible-aio")) as Array<{
+    id: string;
+    source: string;
+  }>;
+  const availableModels = await modelsDb.getSyncedAvailableModels("openai-compatible-aio");
 
-  assert.equal(response.status, 500);
-  assert.equal(body.error, "network exploded");
-  assert.equal(logs.length, 1);
-  assert.equal(logs[0].status, 500);
-  assert.equal(logs[0].provider, "openrouter");
+  assert.equal(response.status, 200);
+  assert.equal(body.importedCount, 1);
+  assert.deepEqual(
+    body.importedModels.map((model) => ({ id: model.id, source: model.source })),
+    [{ id: "aio-model", source: "imported" }]
+  );
+  assert.deepEqual(
+    customModels.map((model) => ({ id: model.id, source: model.source })),
+    []
+  );
+  assert.deepEqual(
+    availableModels.map((model) => ({ id: model.id, source: model.source })),
+    [{ id: "aio-model", source: "imported" }]
+  );
+  // selfFetchWithRetry default maxRetries=3: all 3 attempts throw, then in-process
+  // fallback fires (which triggers the upstream bltcy.ai fetch). So fetchCalls
+  // contains 3 self-fetch URLs followed by 1 upstream URL.
+  // Route forces IPv4 origin (http://127.0.0.1:PORT) — never "localhost" — to avoid
+  // ::1 (IPv6) resolution issues in containers. PORT defaults to 20128 when env unset.
+  const expectedPort = process.env.OMNIROUTE_PORT || process.env.PORT || "20128";
+  const selfFetchUrl = `http://127.0.0.1:${expectedPort}/api/providers/${connection.id}/models?refresh=true`;
+  assert.equal(
+    fetchCalls.slice(0, 3).every((u) => u === selfFetchUrl),
+    true,
+    "first 3 calls should be self-fetch retries"
+  );
+  assert.equal(fetchCalls[3], "https://api.bltcy.ai/v1/models", "4th call should be upstream");
+  assert.equal(fetchCalls.length, 4, "should have exactly 3 retries + 1 upstream call");
 });

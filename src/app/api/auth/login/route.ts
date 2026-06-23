@@ -8,7 +8,9 @@ import {
   getStoredManagementPassword,
   verifyManagementPassword,
 } from "@/lib/auth/managementPassword";
-import { isValidationFailure, loginSchema, validateBody } from "@/shared/validation/helpers";
+import { loginSchema } from "@/shared/validation/schemas";
+import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { checkLoginGuard, clearLoginAttempts, recordLoginFailure } from "@/server/auth/loginGuard";
 
 // SECURITY: No hardcoded fallback — JWT_SECRET must be configured.
 if (!process.env.JWT_SECRET) {
@@ -46,7 +48,20 @@ export async function POST(request) {
       );
     }
 
-    const rawBody = await request.json();
+    let rawBody;
+    try {
+      rawBody = await request.json();
+    } catch {
+      return NextResponse.json(
+        {
+          error: {
+            message: "Invalid request",
+            details: [{ field: "body", message: "Invalid JSON body" }],
+          },
+        },
+        { status: 400 }
+      );
+    }
 
     // Zod validation
     const validation = validateBody(loginSchema, rawBody);
@@ -58,6 +73,32 @@ export async function POST(request) {
       return NextResponse.json({ error: "Invalid password payload" }, { status: 400 });
     }
     const settings = await getSettings();
+    const bruteForceEnabled = settings.bruteForceProtection !== false;
+    const clientIp = auditContext.ipAddress || null;
+
+    const guardCheck = checkLoginGuard(clientIp, { enabled: bruteForceEnabled });
+    if (!guardCheck.allowed) {
+      logAuditEvent({
+        action: "auth.login.locked",
+        actor: "anonymous",
+        target: "dashboard-auth",
+        resourceType: "auth_session",
+        status: "failed",
+        ipAddress: clientIp || undefined,
+        requestId: auditContext.requestId,
+        metadata: { retryAfterSeconds: guardCheck.retryAfterSeconds || 0 },
+      });
+      return NextResponse.json(
+        { error: "Too many failed attempts. Try again later." },
+        {
+          status: 429,
+          headers: guardCheck.retryAfterSeconds
+            ? { "Retry-After": String(guardCheck.retryAfterSeconds) }
+            : {},
+        }
+      );
+    }
+
     const passwordState = await ensurePersistentManagementPasswordHash({
       settings,
       source: "auth.login",
@@ -118,8 +159,11 @@ export async function POST(request) {
         },
       });
 
+      clearLoginAttempts(clientIp);
       return NextResponse.json({ success: true });
     }
+
+    const failureDecision = recordLoginFailure(clientIp, { enabled: bruteForceEnabled });
 
     logAuditEvent({
       action: "auth.login.failed",
@@ -129,12 +173,24 @@ export async function POST(request) {
       status: "failed",
       ipAddress: auditContext.ipAddress || undefined,
       requestId: auditContext.requestId,
-      metadata: { reason: "invalid_password" },
+      metadata: { reason: "invalid_password", lockedOut: failureDecision.allowed === false },
     });
+
+    if (!failureDecision.allowed) {
+      return NextResponse.json(
+        { error: "Too many failed attempts. Try again later." },
+        {
+          status: 429,
+          headers: failureDecision.retryAfterSeconds
+            ? { "Retry-After": String(failureDecision.retryAfterSeconds) }
+            : {},
+        }
+      );
+    }
+
     return NextResponse.json({ error: "Invalid password" }, { status: 401 });
   } catch (error) {
     console.error("[AUTH] Login failed:", error);
-    const debugMessage = error instanceof Error ? error.message : "unknown_error";
     logAuditEvent({
       action: "auth.login.error",
       actor: "system",
@@ -144,7 +200,7 @@ export async function POST(request) {
       ipAddress: auditContext.ipAddress || undefined,
       requestId: auditContext.requestId,
       metadata: {
-        message: debugMessage,
+        message: error instanceof Error ? error.message : "unknown_error",
       },
     });
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });

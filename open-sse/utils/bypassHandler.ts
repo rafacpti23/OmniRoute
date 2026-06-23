@@ -1,4 +1,4 @@
-import { getCorsOrigin } from "./cors.ts";
+import { CORS_HEADERS } from "./cors.ts";
 import { detectFormat } from "../services/provider.ts";
 import { translateResponse, initState } from "../translator/index.ts";
 import { FORMATS } from "../translator/formats.ts";
@@ -69,6 +69,18 @@ export function handleBypassRequest(body, model, userAgent = "") {
     }
   }
 
+  // Pattern 5: Quota probe — max_tokens=1 + "quota" keyword (FCC try_quota_mock).
+  if (!shouldBypass && body.max_tokens === 1) {
+    const userText = messages
+      .filter((m) => m.role === "user")
+      .map((m) => getText(m.content))
+      .join(" ")
+      .toLowerCase();
+    if (userText.includes("quota")) {
+      shouldBypass = true;
+    }
+  }
+
   if (!shouldBypass) return null;
 
   const sourceFormat = detectFormat(body);
@@ -124,7 +136,6 @@ function createNonStreamingResponse(sourceFormat, model) {
       response: new Response(JSON.stringify(openaiResponse), {
         headers: {
           "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": getCorsOrigin(),
         },
       }),
     };
@@ -158,7 +169,6 @@ function createNonStreamingResponse(sourceFormat, model) {
     response: new Response(JSON.stringify(finalResponse), {
       headers: {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": getCorsOrigin(),
       },
     }),
   };
@@ -206,7 +216,6 @@ function createStreamingResponse(sourceFormat, model) {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
-        "Access-Control-Allow-Origin": getCorsOrigin(),
       },
     }),
   };

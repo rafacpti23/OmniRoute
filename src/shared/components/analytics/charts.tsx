@@ -1,9 +1,10 @@
 "use client";
 
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
-import { useLocale } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import Card from "../Card";
 import { getModelColor } from "@/shared/constants/colors";
+import { PROVIDER_COLORS } from "./chartColors";
 import {
   fmtCompact as fmt,
   fmtFull,
@@ -11,20 +12,10 @@ import {
   formatApiKeyLabel as maskApiKeyLabel,
 } from "@/shared/utils/formatting";
 import {
-  BarChart,
-  ComposedChart,
-  Bar,
-  Line,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  Cell,
-  PieChart,
-  Pie,
-  AreaChart,
-  Area,
-} from "recharts";
+  getServiceTierDisplayLabel,
+  translateCostText,
+  type TranslationFn,
+} from "@/shared/utils/serviceTierLabels";
 
 function createDateFormatter(locale: string, options: Intl.DateTimeFormatOptions) {
   try {
@@ -32,39 +23,6 @@ function createDateFormatter(locale: string, options: Intl.DateTimeFormatOptions
   } catch {
     return new Intl.DateTimeFormat(undefined, options);
   }
-}
-
-// ── Custom Tooltip for dark theme ──────────────────────────────────────────
-
-function DarkTooltip({
-  active,
-  payload,
-  label,
-  formatter,
-}: {
-  active?: boolean;
-  payload?: any[];
-  label?: any;
-  formatter?: Function;
-}) {
-  if (!active || !payload?.length) return null;
-  return (
-    <div className="chart-tooltip rounded-lg border border-white/10 bg-surface px-3 py-2 text-xs shadow-lg">
-      {label && <div className="font-semibold text-text-main mb-1">{label}</div>}
-      {payload.map((entry, i) => (
-        <div key={i} className="flex items-center gap-1.5 text-text-muted">
-          <span
-            className="w-2 h-2 rounded-full shrink-0"
-            style={{ backgroundColor: entry.color }}
-          />
-          <span>{entry.name}:</span>
-          <span className="font-mono font-medium text-text-main">
-            {formatter ? formatter(entry.value) : entry.value}
-          </span>
-        </div>
-      ))}
-    </div>
-  );
 }
 
 // ── Sort Indicator (shared by tables) ──────────────────────────────────────
@@ -174,6 +132,7 @@ export function CompactStatGrid({ sections }: { sections: CompactStatSection[] }
 // ── ActivityHeatmap ────────────────────────────────────────────────────────
 
 export function ActivityHeatmap({ activityMap }) {
+  const t = useTranslations("analytics");
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const cells = useMemo(() => {
@@ -259,7 +218,9 @@ export function ActivityHeatmap({ activityMap }) {
   return (
     <Card className="p-4 h-full min-w-0 overflow-hidden">
       <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider">Activity</h3>
+        <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider">
+          {t("overview")}
+        </h3>
         <span className="text-xs text-text-muted">
           {Object.keys(activityMap || {}).length} active days ·{" "}
           {fmt(Object.values(activityMap || {}).reduce((a: number, b: number) => a + b, 0))} tokens
@@ -324,290 +285,8 @@ export function ActivityHeatmap({ activityMap }) {
   );
 }
 
-// ── DailyTrendChart (Recharts) ─────────────────────────────────────────────
-
-export function DailyTrendChart({ dailyTrend }) {
-  const chartData = useMemo(() => {
-    return (dailyTrend || []).map((d) => ({
-      date: d.date.slice(5),
-      Input: d.promptTokens,
-      Output: d.completionTokens,
-      Cost: d.cost || 0,
-    }));
-  }, [dailyTrend]);
-
-  const hasCost = useMemo(() => chartData.some((d) => d.Cost > 0), [chartData]);
-
-  if (!chartData.length) {
-    return (
-      <Card className="p-4">
-        <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-          Token Trend
-        </h3>
-        <div className="text-center text-text-muted text-sm py-8">No data</div>
-      </Card>
-    );
-  }
-
-  return (
-    <Card className="p-4 flex-1">
-      <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        Token &amp; Cost Trend
-      </h3>
-      <ResponsiveContainer width="100%" height={164}>
-        <ComposedChart
-          data={chartData}
-          margin={{ top: 0, right: hasCost ? 40 : 0, left: 0, bottom: 0 }}
-        >
-          <XAxis
-            dataKey="date"
-            tick={{ fontSize: 9, fill: "var(--text-muted)" }}
-            axisLine={false}
-            tickLine={false}
-            interval={Math.max(Math.floor(chartData.length / 6), 0)}
-          />
-          {hasCost && (
-            <YAxis
-              yAxisId="cost"
-              orientation="right"
-              tick={{ fontSize: 8, fill: "#f59e0b" }}
-              axisLine={false}
-              tickLine={false}
-              tickFormatter={(v) => `$${v.toFixed(2)}`}
-              width={36}
-            />
-          )}
-          <Tooltip content={<CostTooltip />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
-          <Bar
-            dataKey="Input"
-            stackId="a"
-            fill="var(--primary)"
-            opacity={0.7}
-            radius={[0, 0, 0, 0]}
-            animationDuration={600}
-          />
-          <Bar
-            dataKey="Output"
-            stackId="a"
-            fill="#10b981"
-            opacity={0.7}
-            radius={[3, 3, 0, 0]}
-            animationDuration={600}
-          />
-          {hasCost && (
-            <Line
-              yAxisId="cost"
-              type="monotone"
-              dataKey="Cost"
-              stroke="#f59e0b"
-              strokeWidth={2.35}
-              dot={false}
-              animationDuration={600}
-            />
-          )}
-        </ComposedChart>
-      </ResponsiveContainer>
-      <div className="flex items-center gap-4 mt-2 text-[10px] text-text-muted">
-        <span className="flex items-center gap-1">
-          <span className="w-2 h-2 rounded-full bg-primary/70" /> Input
-        </span>
-        <span className="flex items-center gap-1">
-          <span className="w-2 h-2 rounded-full bg-emerald-500/70" /> Output
-        </span>
-        {hasCost && (
-          <span className="flex items-center gap-1">
-            <span className="w-2 h-2 rounded-full bg-amber-500/70" /> Cost ($)
-          </span>
-        )}
-      </div>
-    </Card>
-  );
-}
-
-// ── Cost-aware Tooltip ─────────────────────────────────────────────────────
-
-function CostTooltip({
-  active,
-  payload,
-  label,
-}: {
-  active?: boolean;
-  payload?: any[];
-  label?: any;
-}) {
-  if (!active || !payload?.length) return null;
-  return (
-    <div className="chart-tooltip rounded-lg border border-white/10 bg-surface px-3 py-2 text-xs shadow-lg">
-      {label && <div className="font-semibold text-text-main mb-1">{label}</div>}
-      {payload.map((entry, i) => (
-        <div key={i} className="flex items-center gap-1.5 text-text-muted">
-          <span
-            className="w-2 h-2 rounded-full shrink-0"
-            style={{ backgroundColor: entry.color }}
-          />
-          <span>{entry.name}:</span>
-          <span className="font-mono font-medium text-text-main">
-            {entry.name === "Cost" ? fmtCost(entry.value) : fmt(entry.value)}
-          </span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-// ── AccountDonut (Recharts) ────────────────────────────────────────────────
-
-export function AccountDonut({ byAccount }) {
-  const data = useMemo(() => byAccount || [], [byAccount]);
-  const hasData = data.length > 0;
-
-  const pieData = useMemo(() => {
-    return data.slice(0, 8).map((item, i) => ({
-      name: item.account,
-      value: item.totalTokens,
-      fill: getModelColor(i),
-    }));
-  }, [data]);
-
-  if (!hasData) {
-    return (
-      <Card className="p-4 flex-1">
-        <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-          By Account
-        </h3>
-        <div className="text-center text-text-muted text-sm py-8">No data</div>
-      </Card>
-    );
-  }
-
-  return (
-    <Card className="p-4 flex-1">
-      <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        By Account
-      </h3>
-      <div className="flex items-center gap-4">
-        <ResponsiveContainer width={120} height={120}>
-          <PieChart>
-            <Pie
-              data={pieData}
-              dataKey="value"
-              nameKey="name"
-              cx="50%"
-              cy="50%"
-              innerRadius={28}
-              outerRadius={55}
-              paddingAngle={1}
-              animationDuration={600}
-            >
-              {pieData.map((entry, i) => (
-                <Cell key={i} fill={entry.fill} stroke="none" />
-              ))}
-            </Pie>
-            <Tooltip content={<DarkTooltip formatter={fmt} />} />
-          </PieChart>
-        </ResponsiveContainer>
-        <div className="flex flex-col gap-1 min-w-0 flex-1">
-          {pieData.map((seg, i) => (
-            <div key={i} className="flex items-center justify-between gap-2 text-xs">
-              <div className="flex items-center gap-1.5 min-w-0">
-                <span
-                  className="w-2 h-2 rounded-full shrink-0"
-                  style={{ backgroundColor: seg.fill }}
-                />
-                <span className="truncate text-text-main">{seg.name}</span>
-              </div>
-              <span className="font-mono font-medium text-text-muted shrink-0">
-                {fmt(seg.value)}
-              </span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-// ── ApiKeyDonut (Recharts) ─────────────────────────────────────────────────
-
-export function ApiKeyDonut({ byApiKey }) {
-  const data = useMemo(() => byApiKey || [], [byApiKey]);
-  const hasData = data.length > 0;
-
-  const pieData = useMemo(() => {
-    return data.slice(0, 8).map((item, i) => ({
-      name: maskApiKeyLabel(item.apiKeyName, item.apiKeyId),
-      fullName: item.apiKeyName || item.apiKeyId || "unknown",
-      value: item.totalTokens,
-      fill: getModelColor(i),
-    }));
-  }, [data]);
-
-  if (!hasData) {
-    return (
-      <Card className="p-4 flex-1">
-        <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-          By API Key
-        </h3>
-        <div className="text-center text-text-muted text-sm py-8">No data</div>
-      </Card>
-    );
-  }
-
-  return (
-    <Card className="p-4 flex-1">
-      <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        By API Key
-      </h3>
-      <div className="flex items-center gap-4">
-        <ResponsiveContainer width={120} height={120}>
-          <PieChart>
-            <Pie
-              data={pieData}
-              dataKey="value"
-              nameKey="name"
-              cx="50%"
-              cy="50%"
-              innerRadius={28}
-              outerRadius={55}
-              paddingAngle={1}
-              animationDuration={600}
-            >
-              {pieData.map((entry, i) => (
-                <Cell key={i} fill={entry.fill} stroke="none" />
-              ))}
-            </Pie>
-            <Tooltip content={<DarkTooltip formatter={fmt} />} />
-          </PieChart>
-        </ResponsiveContainer>
-        <div className="flex flex-col gap-1 min-w-0 flex-1">
-          {pieData.map((seg, i) => (
-            <div
-              key={`${seg.fullName}-${i}`}
-              className="flex items-center justify-between gap-2 text-xs"
-            >
-              <div className="flex items-center gap-1.5 min-w-0">
-                <span
-                  className="w-2 h-2 rounded-full shrink-0"
-                  style={{ backgroundColor: seg.fill }}
-                />
-                <span className="truncate text-text-main" title={seg.fullName}>
-                  {seg.name}
-                </span>
-              </div>
-              <span className="font-mono font-medium text-text-muted shrink-0">
-                {fmt(seg.value)}
-              </span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-// ── ApiKeyTable ────────────────────────────────────────────────────────────
-
 export function ApiKeyTable({ byApiKey }) {
+  const t = useTranslations("analytics");
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState("totalTokens");
   const [sortOrder, setSortOrder] = useState("desc");
@@ -657,7 +336,7 @@ export function ApiKeyTable({ byApiKey }) {
         <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
           API Key Breakdown
         </h3>
-        <div className="text-center text-text-muted text-sm py-8">No data</div>
+        <div className="text-center text-text-muted text-sm py-8">{t("chartNoData")}</div>
       </Card>
     );
   }
@@ -672,7 +351,7 @@ export function ApiKeyTable({ byApiKey }) {
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Filter API key..."
+          placeholder={t("filterSearchKeys")}
           className="w-full max-w-[220px] px-3 py-1.5 rounded-lg bg-bg-subtle border border-border text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-primary"
         />
       </div>
@@ -690,33 +369,35 @@ export function ApiKeyTable({ byApiKey }) {
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("requests")}
               >
-                Requests <SortIndicator active={sortBy === "requests"} sortOrder={sortOrder} />
+                {t("chartRequests")}{" "}
+                <SortIndicator active={sortBy === "requests"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("promptTokens")}
               >
-                Input <SortIndicator active={sortBy === "promptTokens"} sortOrder={sortOrder} />
+                {t("chartInput")}{" "}
+                <SortIndicator active={sortBy === "promptTokens"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("completionTokens")}
               >
-                Output{" "}
+                {t("chartOutput")}{" "}
                 <SortIndicator active={sortBy === "completionTokens"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("totalTokens")}
               >
-                Total Tokens{" "}
+                {t("chartTotal")}{" "}
                 <SortIndicator active={sortBy === "totalTokens"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("cost")}
               >
-                Cost <SortIndicator active={sortBy === "cost"} sortOrder={sortOrder} />
+                {t("chartCost")} <SortIndicator active={sortBy === "cost"} sortOrder={sortOrder} />
               </th>
             </tr>
           </thead>
@@ -751,7 +432,7 @@ export function ApiKeyTable({ byApiKey }) {
             {sorted.length === 0 && (
               <tr>
                 <td colSpan={6} className="px-4 py-8 text-center text-text-muted">
-                  No API key matches this filter.
+                  {t("filterNoKeysMatch")}
                 </td>
               </tr>
             )}
@@ -761,48 +442,6 @@ export function ApiKeyTable({ byApiKey }) {
     </Card>
   );
 }
-
-// ── WeeklyPattern (Recharts) ───────────────────────────────────────────────
-
-export function WeeklyPattern({ weeklyPattern }) {
-  const chartData = useMemo(() => {
-    return (weeklyPattern || []).map((w) => ({
-      day: w.day.slice(0, 3),
-      Tokens: w.totalTokens,
-    }));
-  }, [weeklyPattern]);
-
-  return (
-    <Card className="px-4 py-3">
-      <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-2">
-        Weekly
-      </h3>
-      <ResponsiveContainer width="100%" height={64}>
-        <BarChart data={chartData} margin={{ top: 0, right: 0, left: 0, bottom: 0 }}>
-          <XAxis
-            dataKey="day"
-            tick={{ fontSize: 9, fill: "var(--text-muted)" }}
-            axisLine={false}
-            tickLine={false}
-          />
-          <Tooltip
-            content={<DarkTooltip formatter={fmt} />}
-            cursor={{ fill: "rgba(255,255,255,0.04)" }}
-          />
-          <Bar
-            dataKey="Tokens"
-            fill="var(--text-muted)"
-            opacity={0.3}
-            radius={[3, 3, 0, 0]}
-            animationDuration={400}
-          />
-        </BarChart>
-      </ResponsiveContainer>
-    </Card>
-  );
-}
-
-// ── MostActiveDay7d ────────────────────────────────────────────────────────
 
 export function MostActiveDay7d({ activityMap }) {
   const locale = useLocale();
@@ -844,7 +483,7 @@ export function MostActiveDay7d({ activityMap }) {
     <Card className="p-4 flex flex-col justify-center" style={{ flex: 1, minHeight: 0 }}>
       <h3
         className="text-xs font-semibold uppercase tracking-wider mb-2"
-        style={{ color: "var(--text-muted)" }}
+        style={{ color: "var(--color-text-muted)" }}
       >
         Most Active Day
       </h3>
@@ -853,12 +492,12 @@ export function MostActiveDay7d({ activityMap }) {
           <span className="text-xl font-bold capitalize" style={{ lineHeight: 1.2 }}>
             {data.weekday}
           </span>
-          <span className="text-xs mt-1" style={{ color: "var(--text-muted)" }}>
+          <span className="text-xs mt-1" style={{ color: "var(--color-text-muted)" }}>
             {data.label} · {fmt(data.tokens)} tokens
           </span>
         </>
       ) : (
-        <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+        <span className="text-xs" style={{ color: "var(--color-text-muted)" }}>
           No data in the last 7 days
         </span>
       )}
@@ -869,6 +508,7 @@ export function MostActiveDay7d({ activityMap }) {
 // ── WeeklySquares7d ────────────────────────────────────────────────────────
 
 export function WeeklySquares7d({ activityMap }) {
+  const t = useTranslations("analytics");
   const locale = useLocale();
   const weekdayFormatter = useMemo(
     () => createDateFormatter(locale, { weekday: "short" }),
@@ -910,9 +550,9 @@ export function WeeklySquares7d({ activityMap }) {
     <Card className="p-4 flex flex-col justify-center" style={{ flex: 1, minHeight: 0 }}>
       <h3
         className="text-xs font-semibold uppercase tracking-wider mb-3"
-        style={{ color: "var(--text-muted)" }}
+        style={{ color: "var(--color-text-muted)" }}
       >
-        Weekly
+        {t("chartWeekly")}
       </h3>
       <div style={{ display: "flex", alignItems: "flex-end", gap: 6, justifyContent: "center" }}>
         {days.map((d, i) => (
@@ -935,7 +575,7 @@ export function WeeklySquares7d({ activityMap }) {
               style={{
                 fontSize: 9,
                 fontWeight: 600,
-                color: "var(--text-muted)",
+                color: "var(--color-text-muted)",
                 letterSpacing: "0.03em",
               }}
             >
@@ -951,6 +591,7 @@ export function WeeklySquares7d({ activityMap }) {
 // ── ModelTable ──────────────────────────────────────────────────────────────
 
 export function ModelTable({ byModel, summary }) {
+  const t = useTranslations("analytics");
   const [sortBy, setSortBy] = useState("totalTokens");
   const [sortOrder, setSortOrder] = useState("desc");
 
@@ -982,7 +623,7 @@ export function ModelTable({ byModel, summary }) {
     <Card className="overflow-hidden">
       <div className="p-4 border-b border-border">
         <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider">
-          Model Breakdown
+          {t("chartModelBreakdown")}
         </h3>
       </div>
       <div className="overflow-x-auto">
@@ -993,40 +634,44 @@ export function ModelTable({ byModel, summary }) {
                 className="px-4 py-2.5 text-left cursor-pointer group"
                 onClick={() => toggleSort("model")}
               >
-                Model <SortIndicator active={sortBy === "model"} sortOrder={sortOrder} />
+                {t("chartModel")}{" "}
+                <SortIndicator active={sortBy === "model"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("requests")}
               >
-                Requests <SortIndicator active={sortBy === "requests"} sortOrder={sortOrder} />
+                {t("chartRequests")}{" "}
+                <SortIndicator active={sortBy === "requests"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("promptTokens")}
               >
-                Input <SortIndicator active={sortBy === "promptTokens"} sortOrder={sortOrder} />
+                {t("chartInput")}{" "}
+                <SortIndicator active={sortBy === "promptTokens"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("completionTokens")}
               >
-                Output{" "}
+                {t("chartOutput")}{" "}
                 <SortIndicator active={sortBy === "completionTokens"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("totalTokens")}
               >
-                Total <SortIndicator active={sortBy === "totalTokens"} sortOrder={sortOrder} />
+                {t("chartTotal")}{" "}
+                <SortIndicator active={sortBy === "totalTokens"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("cost")}
               >
-                Cost <SortIndicator active={sortBy === "cost"} sortOrder={sortOrder} />
+                {t("chartCost")} <SortIndicator active={sortBy === "cost"} sortOrder={sortOrder} />
               </th>
-              <th className="px-4 py-2.5 text-right w-36">Share</th>
+              <th className="px-4 py-2.5 text-right w-36">{t("chartShare")}</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
@@ -1081,19 +726,131 @@ export function ModelTable({ byModel, summary }) {
   );
 }
 
+function getServiceTierIcon(serviceTier) {
+  if (serviceTier === "priority") return "bolt";
+  if (serviceTier === "flex") return "savings";
+  return "speed";
+}
+
+function getServiceTierIconClass(serviceTier) {
+  if (serviceTier === "priority") return "text-sky-500";
+  if (serviceTier === "flex") return "text-emerald-500";
+  return "text-text-muted";
+}
+
+function getServiceTierBarClass(serviceTier) {
+  if (serviceTier === "priority") return "bg-sky-500";
+  if (serviceTier === "flex") return "bg-emerald-500";
+  return "bg-text-muted/50";
+}
+
+function getServiceTierCostClass(serviceTier) {
+  return serviceTier === "flex" ? "text-emerald-500" : "text-amber-500";
+}
+
+export function ServiceTierBreakdown({ byServiceTier, summary }) {
+  const t = useTranslations("costs") as TranslationFn;
+  const data = useMemo(() => byServiceTier || [], [byServiceTier]);
+  const totalRequests = Number(summary?.totalRequests || 0);
+  const totalCost = Number(summary?.totalCost || 0);
+
+  if (!data.length) {
+    return null;
+  }
+
+  return (
+    <Card className="overflow-hidden">
+      <div className="p-4 border-b border-border flex items-center justify-between gap-3">
+        <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider">
+          {translateCostText(t, "serviceTierBreakdownTitle", "Service Tier")}
+        </h3>
+        <span className="text-[11px] text-text-muted">
+          {translateCostText(t, "serviceTierBreakdownSubtitle", "Fast / Flex / Standard split")}
+        </span>
+      </div>
+      <div className="divide-y divide-border">
+        {data.map((tier) => {
+          const isFlex = tier.serviceTier === "flex";
+          const tierLabel = getServiceTierDisplayLabel(t, tier.serviceTier, tier.label);
+          const requestPct =
+            totalRequests > 0
+              ? ((Number(tier.requests || 0) / totalRequests) * 100).toFixed(1)
+              : "0";
+          const costPct =
+            totalCost > 0 ? ((Number(tier.cost || 0) / totalCost) * 100).toFixed(1) : "0";
+          const usageSavings = Number(tier.usageSavingsTokens || 0);
+          const costSavings = Number(tier.savings || 0);
+          const usageSavingsText =
+            isFlex && usageSavings > 0
+              ? ` · ${fmt(usageSavings)} ${translateCostText(
+                  t,
+                  "serviceTierUsageSaved",
+                  "usage saved"
+                )}`
+              : "";
+          const costDetailText =
+            isFlex && costSavings > 0
+              ? `${fmtCost(costSavings)} ${translateCostText(t, "serviceTierCostSaved", "saved")}`
+              : `${costPct}% ${translateCostText(t, "serviceTierCostShareSuffix", "of cost")}`;
+
+          return (
+            <div key={tier.serviceTier} className="p-4 flex flex-col gap-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`material-symbols-outlined text-[18px] ${getServiceTierIconClass(
+                      tier.serviceTier
+                    )}`}
+                  >
+                    {getServiceTierIcon(tier.serviceTier)}
+                  </span>
+                  <div>
+                    <div className="text-sm font-semibold text-text-main">{tierLabel}</div>
+                    <div className="text-xs text-text-muted">
+                      {fmtFull(tier.requests)} requests · {fmt(tier.totalTokens)} tokens
+                      {usageSavingsText}
+                    </div>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div
+                    className={`font-mono text-sm font-semibold ${getServiceTierCostClass(
+                      tier.serviceTier
+                    )}`}
+                  >
+                    {fmtCost(tier.cost)}
+                  </div>
+                  <div className="text-xs text-text-muted">{costDetailText}</div>
+                </div>
+              </div>
+              <div className="h-1.5 rounded-full bg-black/5 dark:bg-white/10 overflow-hidden">
+                <div
+                  className={`h-full rounded-full ${getServiceTierBarClass(tier.serviceTier)}`}
+                  style={{ width: `${requestPct}%` }}
+                />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
 // ── UsageDetail ────────────────────────────────────────────────────────────
 
 export function UsageDetail({ summary }) {
+  const t = useTranslations("analytics");
   const items = [
-    { label: "Input", value: summary?.promptTokens, color: "text-primary" },
-    { label: "Cache read", value: 0, color: "text-text-muted" },
-    { label: "Output", value: summary?.completionTokens, color: "text-emerald-500" },
+    { label: t("chartInput"), value: summary?.promptTokens, color: "text-primary" },
+    { label: t("chartCacheRead"), value: 0, color: "text-text-muted" },
+    { label: t("chartOutput"), value: summary?.completionTokens, color: "text-emerald-500" },
   ];
 
   return (
     <Card className="p-4 flex-1">
       <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        Usage Detail
+        {t("chartUsageDetail")}
       </h3>
       <div className="flex flex-col gap-2">
         {items.map((item, i) => (
@@ -1107,180 +864,10 @@ export function UsageDetail({ summary }) {
   );
 }
 
-// ── ProviderCostDonut ──────────────────────────────────────────────────────
-
-const PROVIDER_COLORS = [
-  "#f59e0b",
-  "#ef4444",
-  "#8b5cf6",
-  "#10b981",
-  "#06b6d4",
-  "#ec4899",
-  "#f97316",
-  "#6366f1",
-  "#14b8a6",
-  "#a855f7",
-];
-
-export function ProviderCostDonut({ byProvider }) {
-  const data = useMemo(() => byProvider || [], [byProvider]);
-  const hasData = data.length > 0 && data.some((p) => p.cost > 0);
-
-  const pieData = useMemo(() => {
-    return data
-      .filter((item) => item.cost > 0)
-      .sort((a, b) => b.cost - a.cost)
-      .slice(0, 8)
-      .map((item, i) => ({
-        name: item.provider,
-        value: item.cost,
-        fill: PROVIDER_COLORS[i % PROVIDER_COLORS.length],
-      }));
-  }, [data]);
-
-  if (!hasData) {
-    return (
-      <Card className="p-4 flex-1">
-        <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-          Cost by Provider
-        </h3>
-        <div className="text-center text-text-muted text-sm py-8">No cost data</div>
-      </Card>
-    );
-  }
-
-  return (
-    <Card className="p-4 flex-1">
-      <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        Cost by Provider
-      </h3>
-      <div className="flex items-center gap-4">
-        <ResponsiveContainer width={120} height={120}>
-          <PieChart>
-            <Pie
-              data={pieData}
-              dataKey="value"
-              nameKey="name"
-              cx="50%"
-              cy="50%"
-              innerRadius={28}
-              outerRadius={55}
-              paddingAngle={1}
-              animationDuration={600}
-            >
-              {pieData.map((entry, i) => (
-                <Cell key={i} fill={entry.fill} stroke="none" />
-              ))}
-            </Pie>
-            <Tooltip content={<DarkTooltip formatter={fmtCost} />} />
-          </PieChart>
-        </ResponsiveContainer>
-        <div className="flex flex-col gap-1 min-w-0 flex-1">
-          {pieData.map((seg, i) => (
-            <div key={i} className="flex items-center justify-between gap-2 text-xs">
-              <div className="flex items-center gap-1.5 min-w-0">
-                <span
-                  className="w-2 h-2 rounded-full shrink-0"
-                  style={{ backgroundColor: seg.fill }}
-                />
-                <span className="truncate text-text-main capitalize">{seg.name}</span>
-              </div>
-              <span className="font-mono font-medium text-amber-500 shrink-0">
-                {fmtCost(seg.value)}
-              </span>
-            </div>
-          ))}
-        </div>
-      </div>
-    </Card>
-  );
-}
-
-// ── ModelOverTimeChart (Stacked Area) ──────────────────────────────────────
-
-export function ModelOverTimeChart({ dailyByModel, modelNames }) {
-  const data = useMemo(() => dailyByModel || [], [dailyByModel]);
-  const models = useMemo(() => modelNames || [], [modelNames]);
-
-  // Prepare chart data — format dates (must be before early return for rules-of-hooks)
-  const chartData = useMemo(() => {
-    return data.map((d) => {
-      const row = { ...d };
-      // Short date label
-      if (d.date) {
-        const parts = d.date.split("-");
-        row.dateLabel = `${parts[1]}/${parts[2]}`;
-      }
-      return row;
-    });
-  }, [data]);
-
-  if (!data.length || !models.length) {
-    return (
-      <Card className="p-4">
-        <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-          Model Usage Over Time
-        </h3>
-        <div className="text-center text-text-muted text-sm py-8">No data</div>
-      </Card>
-    );
-  }
-
-  return (
-    <Card className="p-4">
-      <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-        Model Usage Over Time
-      </h3>
-      <ResponsiveContainer width="100%" height={240}>
-        <AreaChart data={chartData} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
-          <XAxis
-            dataKey="dateLabel"
-            tick={{ fontSize: 10, fill: "var(--text-muted)" }}
-            axisLine={false}
-            tickLine={false}
-            interval="preserveStartEnd"
-          />
-          <YAxis
-            tick={{ fontSize: 10, fill: "var(--text-muted)" }}
-            tickFormatter={(v) => fmt(v)}
-            axisLine={false}
-            tickLine={false}
-            width={50}
-          />
-          <Tooltip content={<DarkTooltip formatter={fmt} />} />
-          {models.map((m, i) => (
-            <Area
-              key={m}
-              type="monotone"
-              dataKey={m}
-              stackId="1"
-              stroke={getModelColor(i)}
-              fill={getModelColor(i)}
-              fillOpacity={0.4}
-              strokeWidth={1.9}
-              animationDuration={600}
-            />
-          ))}
-        </AreaChart>
-      </ResponsiveContainer>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-[10px] text-text-muted">
-        {models.map((m, i) => (
-          <span key={m} className="flex items-center gap-1">
-            <span
-              className="w-2 h-2 rounded-full shrink-0"
-              style={{ backgroundColor: getModelColor(i) }}
-            />
-            {m}
-          </span>
-        ))}
-      </div>
-    </Card>
-  );
-}
-
 // ── ProviderTable ──────────────────────────────────────────────────────────
 
 export function ProviderTable({ byProvider }) {
+  const t = useTranslations("analytics");
   const [sortBy, setSortBy] = useState("totalTokens");
   const [sortOrder, setSortOrder] = useState("desc");
 
@@ -1315,9 +902,9 @@ export function ProviderTable({ byProvider }) {
     return (
       <Card className="p-4">
         <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
-          Provider Breakdown
+          {t("chartProviderBreakdown")}
         </h3>
-        <div className="text-center text-text-muted text-sm py-8">No data</div>
+        <div className="text-center text-text-muted text-sm py-8">{t("chartNoData")}</div>
       </Card>
     );
   }
@@ -1326,7 +913,7 @@ export function ProviderTable({ byProvider }) {
     <Card className="overflow-hidden">
       <div className="p-4 border-b border-border">
         <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider">
-          Provider Breakdown
+          {t("chartProviderBreakdown")}
         </h3>
       </div>
       <div className="overflow-x-auto">
@@ -1337,40 +924,44 @@ export function ProviderTable({ byProvider }) {
                 className="px-4 py-2.5 text-left cursor-pointer group"
                 onClick={() => toggleSort("provider")}
               >
-                Provider <SortIndicator active={sortBy === "provider"} sortOrder={sortOrder} />
+                {t("chartProvider")}{" "}
+                <SortIndicator active={sortBy === "provider"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("requests")}
               >
-                Requests <SortIndicator active={sortBy === "requests"} sortOrder={sortOrder} />
+                {t("chartRequests")}{" "}
+                <SortIndicator active={sortBy === "requests"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("promptTokens")}
               >
-                Input <SortIndicator active={sortBy === "promptTokens"} sortOrder={sortOrder} />
+                {t("chartInput")}{" "}
+                <SortIndicator active={sortBy === "promptTokens"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("completionTokens")}
               >
-                Output{" "}
+                {t("chartOutput")}{" "}
                 <SortIndicator active={sortBy === "completionTokens"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("totalTokens")}
               >
-                Total <SortIndicator active={sortBy === "totalTokens"} sortOrder={sortOrder} />
+                {t("chartTotal")}{" "}
+                <SortIndicator active={sortBy === "totalTokens"} sortOrder={sortOrder} />
               </th>
               <th
                 className="px-4 py-2.5 text-right cursor-pointer group"
                 onClick={() => toggleSort("cost")}
               >
-                Cost <SortIndicator active={sortBy === "cost"} sortOrder={sortOrder} />
+                {t("chartCost")} <SortIndicator active={sortBy === "cost"} sortOrder={sortOrder} />
               </th>
-              <th className="px-4 py-2.5 text-right w-36">Share</th>
+              <th className="px-4 py-2.5 text-right w-36">{t("chartShare")}</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border">

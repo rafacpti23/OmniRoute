@@ -9,6 +9,7 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 
 const core = await import("../../src/lib/db/core.ts");
 const providersDb = await import("../../src/lib/db/providers.ts");
+const combosDb = await import("../../src/lib/db/combos.ts");
 const {
   resolveModelOrError,
   checkPipelineGates,
@@ -37,6 +38,7 @@ async function seedConnection(provider, overrides = {}) {
     isActive: overrides.isActive ?? true,
     testStatus: overrides.testStatus || "active",
     providerSpecificData: overrides.providerSpecificData || {},
+    defaultModel: overrides.defaultModel,
   });
 }
 
@@ -47,6 +49,63 @@ test.beforeEach(async () => {
 test.after(async () => {
   await resetStorage();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+});
+
+test("resolveModelOrError resolves built-in auto catalog ids without persisted combo rows", async () => {
+  await seedConnection("openai", { defaultModel: "gpt-4o-mini" });
+
+  const result = await resolveModelOrError(
+    "auto/best-coding",
+    { messages: [{ role: "user", content: "echo hi" }] },
+    "/v1/chat/completions"
+  );
+
+  assert.equal(result.error, undefined);
+  assert.ok(result.combo);
+  assert.equal(result.combo.id, "auto/best-coding");
+  assert.equal(result.combo.name, "auto/best-coding");
+  assert.equal(result.provider, "auto");
+  assert.equal(result.model, "best-coding");
+  assert.ok(Array.isArray(result.combo.models));
+  assert.ok(result.combo.models.length > 0);
+  assert.equal(result.combo.models[0].providerId, "openai");
+});
+
+test("resolveModelOrError rejects unknown built-in auto catalog ids", async () => {
+  await seedConnection("openai", { defaultModel: "gpt-4o-mini" });
+
+  const result = await resolveModelOrError(
+    "auto/not-a-real-template",
+    { messages: [{ role: "user", content: "echo hi" }] },
+    "/v1/chat/completions"
+  );
+
+  assert.ok(result.error);
+  assert.equal(result.error.status, 400);
+  const json = (await result.error.json()) as any;
+  assert.match(json.error.message, /Unknown built-in auto combo/i);
+});
+
+test("resolveModelOrError preserves persisted fuzzy auto combos before virtual catalog ids", async () => {
+  await combosDb.createCombo({
+    id: "persisted-auto-best-legacy",
+    name: "auto/best-legacy",
+    strategy: "priority",
+    models: [{ providerId: "openai", model: "gpt-4o-mini" }],
+  });
+
+  const result = await resolveModelOrError(
+    "auto/legacy",
+    { messages: [{ role: "user", content: "echo hi" }] },
+    "/v1/chat/completions"
+  );
+
+  assert.equal(result.error, undefined);
+  assert.ok(result.combo);
+  assert.equal(result.combo.id, "persisted-auto-best-legacy");
+  assert.equal(result.combo.name, "auto/best-legacy");
+  assert.equal(result.provider, "auto");
+  assert.equal(result.model, "legacy");
 });
 
 test("resolveModelOrError rejects ambiguous aliases without a provider prefix", async () => {
@@ -89,6 +148,59 @@ test("resolveModelOrError rejects malformed model strings", async () => {
   assert.match(json.error.message, /Invalid model format/i);
 });
 
+test("resolveModelOrError routes Codex native compact gpt-5.5 requests to Codex", async () => {
+  const result = await resolveModelOrError(
+    "gpt-5.5",
+    { model: "gpt-5.5", input: "compact this session", reasoning: { effort: "xhigh" } },
+    "/v1/responses/compact",
+    { "user-agent": "codex-cli/0.128.0" }
+  );
+
+  assert.equal(result.provider, "codex");
+  assert.equal(result.model, "gpt-5.5");
+});
+
+test("resolveModelOrError keeps non-Codex gpt-5.5 Responses requests on OpenAI", async () => {
+  const result = await resolveModelOrError(
+    "gpt-5.5",
+    { model: "gpt-5.5", input: "hello" },
+    "/v1/responses",
+    { "user-agent": "OpenAI/Node" }
+  );
+
+  assert.equal(result.provider, "openai");
+  assert.equal(result.model, "gpt-5.5");
+});
+
+test("resolveModelOrError routes bare gpt-5.5 to Codex medium when Codex is the only active account", async () => {
+  await seedConnection("codex");
+
+  const result = await resolveModelOrError(
+    "gpt-5.5",
+    { model: "gpt-5.5", input: "hello" },
+    "/v1/responses",
+    { "user-agent": "OpenAI/Node" }
+  );
+
+  assert.equal(result.provider, "codex");
+  assert.equal(result.model, "gpt-5.5");
+  assert.equal(result.targetFormat, "openai-responses");
+});
+
+test("resolveModelOrError keeps bare gpt-5.5 on OpenAI when OpenAI is the only active account", async () => {
+  await seedConnection("openai");
+
+  const result = await resolveModelOrError(
+    "gpt-5.5",
+    { model: "gpt-5.5", input: "hello" },
+    "/v1/responses",
+    { "user-agent": "OpenAI/Node" }
+  );
+
+  assert.equal(result.provider, "openai");
+  assert.equal(result.model, "gpt-5.5");
+});
+
 test("checkPipelineGates blocks providers with an open circuit breaker", async () => {
   const breaker = getCircuitBreaker("openai");
   breaker.state = STATE.OPEN;
@@ -123,6 +235,7 @@ test("checkPipelineGates reapplies runtime breaker settings to existing breakers
   const response = await checkPipelineGates("openai", "gpt-4o-mini", {
     providerProfile: {
       failureThreshold: 60,
+      degradationThreshold: 30,
       resetTimeoutMs: 5_000,
     },
   });
@@ -130,9 +243,23 @@ test("checkPipelineGates reapplies runtime breaker settings to existing breakers
   assert.equal(response, null);
   assert.equal(breaker.resetTimeout, 5_000);
   assert.equal(breaker.failureThreshold, 60);
+  assert.equal(breaker.degradationThreshold, 30);
 });
 
 test("handleNoCredentials reports missing provider credentials and exhausted accounts", async () => {
+  // Ported from upstream decolua/9router#336 (Ibrahim Ryan): when a provider has
+  // zero usable connections (all disabled, or none configured at all), the
+  // historical 400 BAD_REQUEST classified the failure as non-fallbackable, so a
+  // combo like `antigravity/opus → github/opus` died on the first leg with a
+  // hard 400 even though the next combo target was perfectly healthy.
+  //
+  // The combo target loop (open-sse/services/combo.ts) deliberately breaks on
+  // 400 to prevent infinite fallback loops with body-specific 4xx errors
+  // (#4279/PR#4316). 404 NOT_FOUND, by contrast, flows through checkFallbackError
+  // as `shouldFallback: true` (generic-error catch-all path,
+  // open-sse/services/accountFallback.ts:1593-1599) so the next combo target is
+  // tried. We surface "no active credentials" as 404 so combo can skip past a
+  // disabled-credentials provider instead of failing the whole request.
   const missing = handleNoCredentials(null, null, "openai", "gpt-4o-mini", null, null);
   const exhausted = handleNoCredentials(
     null,
@@ -146,8 +273,8 @@ test("handleNoCredentials reports missing provider credentials and exhausted acc
   const missingJson = (await missing.json()) as any;
   const exhaustedJson = (await exhausted.json()) as any;
 
-  assert.equal(missing.status, 400);
-  assert.match(missingJson.error.message, /No credentials for provider: openai/);
+  assert.equal(missing.status, 404);
+  assert.match(missingJson.error.message, /No active credentials for provider: openai/);
   assert.equal(exhausted.status, 500);
   assert.match(exhaustedJson.error.message, /Primary account failed/);
 });
@@ -202,6 +329,41 @@ test("handleNoCredentials returns structured model_cooldown when every credentia
   assert.equal(json.error.model, "gemini-2.5-pro");
   assert.ok(json.error.reset_seconds >= 1);
   assert.match(json.error.message, /cooling down/i);
+});
+
+test("handleNoCredentials returns 401 with re-auth hint when every connection is in a terminal state", async () => {
+  // Classic scenario: AWS SSO refresh tokens hit their 90-day TTL, every Kiro
+  // connection flips to is_active=0 + testStatus=banned/expired. Surface as
+  // 401 with a reconnect hint instead of the misleading 400 "No credentials".
+  const response = handleNoCredentials(
+    { allExpired: true, expiredCount: 1, expiredStatus: "banned" },
+    null,
+    "kiro",
+    "claude-sonnet-4.6",
+    null,
+    null
+  );
+  const json = (await response.json()) as any;
+
+  assert.equal(response.status, 401);
+  assert.match(json.error.message, /\[kiro\]/);
+  assert.match(json.error.message, /banned by upstream/);
+  assert.match(json.error.message, /please reconnect/i);
+});
+
+test("handleNoCredentials maps allExpired status='expired' to the 'authentication expired' reason", async () => {
+  const response = handleNoCredentials(
+    { allExpired: true, expiredCount: 3, expiredStatus: "expired" },
+    null,
+    "cline",
+    "claude-sonnet-4.6",
+    null,
+    null
+  );
+  const json = (await response.json()) as any;
+
+  assert.equal(response.status, 401);
+  assert.match(json.error.message, /3 connection\(s\) authentication expired/);
 });
 
 test("safeResolveProxy returns the direct route when no proxy config is present", async () => {
@@ -298,4 +460,18 @@ test("withSessionHeader adds headers to mutable and immutable responses", async 
   assert.equal(immutable.headers.get("X-OmniRoute-Session-Id"), "sess_redirect");
   assert.equal(immutable.status, 302);
   assert.equal(await immutable.text(), "");
+});
+
+test("resolveModelOrError returns model_not_found error for unrecognised bare model names", async () => {
+  const result = await resolveModelOrError(
+    "completely-unknown-model-xyz",
+    { messages: [{ role: "user", content: "hello" }] },
+    "/v1/chat/completions"
+  );
+
+  assert.ok(result.error);
+  assert.equal(result.error.status, 400);
+  const json = (await result.error.json()) as any;
+  assert.match(json.error.message, /Unable to determine provider/i);
+  assert.match(json.error.message, /completely-unknown-model-xyz/i);
 });

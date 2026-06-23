@@ -3,8 +3,7 @@
 import { useTranslations } from "next-intl";
 
 import { useState, useEffect } from "react";
-import Button from "@/shared/components/Button";
-import Input from "@/shared/components/Input";
+import { Button, Input } from "@/shared/components";
 import { useRouter } from "next/navigation";
 
 export default function LoginPage() {
@@ -37,7 +36,7 @@ export default function LoginPage() {
           if (data.nodeVersion) setNodeVersion(data.nodeVersion);
           if (data.nodeCompatible === false) setNodeCompatible(false);
           if (data.requireLogin === false) {
-            router.push("/adm");
+            router.push("/dashboard");
             router.refresh();
             return;
           }
@@ -70,13 +69,13 @@ export default function LoginPage() {
 
       if (res.ok) {
         sessionStorage.setItem("omniroute_login_time", String(Date.now()));
-        router.push("/adm");
+        router.push("/dashboard");
         router.refresh();
       } else {
         const data = await res.json();
         // (#521) If no password is set, redirect to onboarding instead of showing an error
         if (data.needsSetup) {
-          router.push("/adm/onboarding");
+          router.push("/dashboard/onboarding");
           return;
         }
         setError(data.error || t("invalidPassword"));
@@ -122,7 +121,7 @@ export default function LoginPage() {
 
   if (hasPassword === null || setupComplete === null) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-bg p-6">
+      <div className="min-h-screen flex flex-col items-center justify-center p-6">
         {nodeWarningBanner}
         <div className="flex flex-col items-center gap-3">
           <div className="relative">
@@ -137,7 +136,7 @@ export default function LoginPage() {
 
   if (!hasPassword && !setupComplete) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-bg p-6">
+      <div className="min-h-screen flex flex-col items-center justify-center p-6">
         {nodeWarningBanner}
         <div
           className={`w-full max-w-md transition-all duration-700 ease-out ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}
@@ -158,7 +157,7 @@ export default function LoginPage() {
               <Button
                 variant="primary"
                 className="w-full h-11 text-sm font-medium"
-                onClick={() => router.push("/adm/onboarding")}
+                onClick={() => router.push("/dashboard/onboarding")}
               >
                 {t("startOnboarding")}
               </Button>
@@ -175,7 +174,7 @@ export default function LoginPage() {
 
   if (!hasPassword && setupComplete) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-bg p-6">
+      <div className="min-h-screen flex flex-col items-center justify-center p-6">
         {nodeWarningBanner}
         <div
           className={`w-full max-w-md transition-all duration-700 ease-out ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}
@@ -198,7 +197,7 @@ export default function LoginPage() {
               <Button
                 variant="primary"
                 className="w-full h-11 text-sm font-medium"
-                onClick={() => router.push("/adm/settings?tab=security")}
+                onClick={() => router.push("/dashboard/onboarding")}
               >
                 {t("configurePassword")}
               </Button>
@@ -214,11 +213,11 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-bg">
+    <div className="min-h-screen flex flex-col">
       {nodeWarningBanner && (
         <div className="flex justify-center pt-6 px-6">{nodeWarningBanner}</div>
       )}
-      <div className="flex-1 flex bg-bg">
+      <div className="flex-1 flex">
         <div className="flex-1 flex items-center justify-center p-6">
           <div
             className={`w-full max-w-sm transition-all duration-700 ease-out ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}
@@ -228,7 +227,9 @@ export default function LoginPage() {
                 <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-primary-hover flex items-center justify-center">
                   <span className="material-symbols-outlined text-white text-[20px]">hub</span>
                 </div>
-                <span className="text-xl font-semibold text-text-main tracking-tight">Easy IA</span>
+                <span className="text-xl font-semibold text-text-main tracking-tight">
+                  OmniRoute
+                </span>
               </div>
               <h1 className="text-2xl font-bold text-text-main tracking-tight">{t("signIn")}</h1>
               <p className="text-text-muted mt-1.5">{t("enterPassword")}</p>

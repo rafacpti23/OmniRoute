@@ -5,6 +5,7 @@ import { Card, Button, EmptyState } from "@/shared/components";
 import { useNotificationStore } from "@/store/notificationStore";
 import { useTranslations } from "next-intl";
 import CacheEntriesTab from "./components/CacheEntriesTab";
+import ReasoningCacheTab from "./components/ReasoningCacheTab";
 
 interface SemanticCacheStats {
   memoryEntries: number;
@@ -63,7 +64,7 @@ interface CacheStats {
   config?: CacheConfig;
 }
 
-type CacheView = "prompt" | "semantic";
+type CacheView = "prompt" | "semantic" | "reasoning";
 
 function StatCard({
   icon,
@@ -292,7 +293,7 @@ function PromptTrendPanel({
         />
       </div>
 
-      <div className="mt-5 overflow-hidden rounded-2xl border border-border/25 bg-surface/35">
+      <div className="mt-5 overflow-hidden rounded-2xl border border-border/25 bg-surface">
         <div className="grid grid-cols-[84px_minmax(0,1fr)_92px_120px] gap-3 border-b border-border/20 px-4 py-3 text-[11px] font-medium uppercase tracking-[0.12em] text-text-muted">
           <span>{hourLabel}</span>
           <span>{activityLabel}</span>
@@ -427,11 +428,7 @@ export default function CachePage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-xl font-semibold">{t("title")}</h1>
-          <p className="mt-0.5 text-sm text-text-muted">{t("description")}</p>
-        </div>
+      <div className="flex justify-end">
         <Button
           variant="secondary"
           icon="refresh"
@@ -469,10 +466,22 @@ export default function CachePage() {
         >
           {t("semanticCache")}
         </button>
+        <button
+          type="button"
+          onClick={() => setActiveView("reasoning")}
+          aria-pressed={activeView === "reasoning"}
+          className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${
+            activeView === "reasoning"
+              ? "bg-white dark:bg-white/10 text-text-main shadow-sm"
+              : "text-text-muted hover:text-text-main"
+          }`}
+        >
+          {t("reasoningCache")}
+        </button>
       </div>
 
       {loading && (
-        <div className="grid grid-cols-1 gap-6" aria-busy="true" aria-label="Loading cache">
+        <div className="grid grid-cols-1 gap-6" aria-busy="true" aria-label={t("loadingCacheAria")}>
           <div className="h-96 rounded-3xl bg-surface-raised animate-pulse" />
         </div>
       )}
@@ -561,7 +570,7 @@ export default function CachePage() {
                   </div>
 
                   {providerEntries.length > 0 ? (
-                    <div className="mt-3 overflow-x-auto rounded-2xl border border-border/20 bg-surface/35">
+                    <div className="mt-3 overflow-x-auto rounded-2xl border border-border/20 bg-surface">
                       <table className="w-full text-sm">
                         <thead>
                           <tr className="border-b border-border/20 text-left text-[11px] uppercase tracking-[0.12em] text-text-muted">
@@ -815,6 +824,14 @@ export default function CachePage() {
               </div>
               <CacheEntriesTab />
             </div>
+          </div>
+        </Card>
+      )}
+
+      {activeView === "reasoning" && (
+        <Card className="border border-border/30 bg-surface-raised/40 backdrop-blur-sm rounded-3xl overflow-hidden">
+          <div className="p-6">
+            <ReasoningCacheTab />
           </div>
         </Card>
       )}

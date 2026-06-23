@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
 import { getProviderNodeById } from "@/models";
 import {
@@ -10,7 +11,7 @@ import { validateProviderApiKey } from "@/lib/providers/validation";
 import { getProxyForLevel, resolveProxyForProvider } from "@/lib/localDb";
 import { validateProviderApiKeySchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
+import { runWithProxyContextOrDirect } from "@omniroute/open-sse/utils/proxyFetch.ts";
 
 function sanitizeAuditUrl(url: string | null | undefined) {
   if (!url) return null;
@@ -24,6 +25,9 @@ function sanitizeAuditUrl(url: string | null | undefined) {
 
 // POST /api/providers/validate - Validate API key with provider
 export async function POST(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   const auditContext = getAuditRequestContext(request);
   let rawBody;
   try {
@@ -51,6 +55,7 @@ export async function POST(request) {
       validationModelId,
       customUserAgent,
       baseUrl: bodyBaseUrl,
+      region,
       cx,
     } = validation.data;
 
@@ -60,6 +65,9 @@ export async function POST(request) {
     }
     if (bodyBaseUrl) {
       providerSpecificData.baseUrl = bodyBaseUrl;
+    }
+    if (region) {
+      providerSpecificData.region = region;
     }
     if (cx) {
       providerSpecificData.cx = cx;
@@ -96,7 +104,7 @@ export async function POST(request) {
       proxyToUse = providerProxy || globalProxy || null;
     }
 
-    const result = await runWithProxyContext(proxyToUse || null, () =>
+    const result = await runWithProxyContextOrDirect(proxyToUse || null, () =>
       validateProviderApiKey({
         provider,
         apiKey,

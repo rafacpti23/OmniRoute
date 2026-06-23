@@ -1,12 +1,17 @@
 "use client";
 
 import { useState, useEffect, useMemo, useCallback } from "react";
-import PropTypes from "prop-types";
 import Link from "next/link";
 import { Card, Button, Input, Modal, CardSkeleton, SegmentedControl } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
+import { useDisplayBaseUrl } from "@/shared/hooks";
 import { AI_PROVIDERS, getProviderByAlias } from "@/shared/constants/providers";
+import { getProviderDisplayName } from "@/lib/display/names";
 import { useTranslations } from "next-intl";
+import A2ADashboardPage from "./components/A2ADashboard";
+import McpDashboardPage from "./components/MCPDashboard";
+import NotionSourceCard from "./components/NotionSourceCard";
+import VscodeTokenAliasCard from "./VscodeTokenAliasCard";
 
 const BUILD_TIME_CLOUD_URL = process.env.NEXT_PUBLIC_CLOUD_URL || null;
 const CLOUD_ACTION_TIMEOUT_MS = 15000;
@@ -63,12 +68,82 @@ type TailscaleTunnelStatus = {
   pid: number | null;
 };
 
+type NgrokTunnelPhase =
+  | "unsupported"
+  | "not_installed"
+  | "stopped"
+  | "needs_auth"
+  | "starting"
+  | "running"
+  | "error";
+
+type NgrokTunnelStatus = {
+  supported: boolean;
+  installed: boolean;
+  running: boolean;
+  publicUrl: string | null;
+  apiUrl: string | null;
+  targetUrl: string;
+  phase: NgrokTunnelPhase;
+  lastError: string | null;
+};
+
 type TunnelNotice = {
   type: "success" | "error" | "info";
   message: string;
 };
 
-export default function APIPageClient({ machineId }) {
+type APIPageClientProps = {
+  machineId: string;
+};
+
+type EndpointProviderSummary = {
+  id: string;
+  provider: {
+    name: string;
+    alias?: string;
+  };
+};
+
+type EndpointModelSummary = {
+  id: string;
+  owned_by?: string;
+  parent?: string;
+  type?: string;
+  custom?: boolean;
+  root?: string;
+};
+
+type CopyHandler = (text: string, key?: string) => void | Promise<void>;
+
+type EndpointTunnelVisibility = {
+  showCloudflaredTunnel: boolean;
+  showTailscaleFunnel: boolean;
+  showNgrokTunnel: boolean;
+};
+
+type EndpointTab = "apis" | "mcp" | "a2a" | "context-sources";
+
+const ENDPOINT_TABS: Array<{ value: EndpointTab; label: string; icon: string }> = [
+  { value: "apis", label: "APIs", icon: "api" },
+  { value: "mcp", label: "MCP", icon: "extension" },
+  { value: "a2a", label: "A2A", icon: "hub" },
+  { value: "context-sources", label: "Context Sources", icon: "database" },
+];
+
+const DEFAULT_TUNNEL_VISIBILITY: EndpointTunnelVisibility = {
+  showCloudflaredTunnel: true,
+  showTailscaleFunnel: true,
+  showNgrokTunnel: true,
+};
+
+function runEndpointBackgroundTask(taskName: string, task: () => Promise<unknown>) {
+  void task().catch((error) => {
+    console.log("Error running endpoint background task:", taskName, error);
+  });
+}
+
+export default function APIPageClient({ machineId }: Readonly<APIPageClientProps>) {
   const [resolvedMachineId, setResolvedMachineId] = useState(machineId || "");
   const t = useTranslations("endpoint");
   const tc = useTranslations("common");
@@ -76,6 +151,7 @@ export default function APIPageClient({ machineId }) {
 
   // Endpoints / models state
   const [allModels, setAllModels] = useState([]);
+  const [modelsLoading, setModelsLoading] = useState(true);
   const [expandedEndpoint, setExpandedEndpoint] = useState(null);
 
   // Cloud sync state
@@ -89,7 +165,6 @@ export default function APIPageClient({ machineId }) {
   const [selectedProvider, setSelectedProvider] = useState(null); // for provider models popup
   const [cloudBaseUrl, setCloudBaseUrl] = useState(BUILD_TIME_CLOUD_URL); // dynamic cloud URL from API response
   const [cloudConfigured, setCloudConfigured] = useState(Boolean(BUILD_TIME_CLOUD_URL));
-  const [viewTab, setViewTab] = useState("api");
   const [mcpStatus, setMcpStatus] = useState<any>(null);
   const [a2aStatus, setA2aStatus] = useState<any>(null);
   const [searchProviders, setSearchProviders] = useState<any[]>([]);
@@ -103,6 +178,17 @@ export default function APIPageClient({ machineId }) {
   const [tailscaleInstallBusy, setTailscaleInstallBusy] = useState(false);
   const [tailscaleInstallLog, setTailscaleInstallLog] = useState<string[]>([]);
   const [tailscalePassword, setTailscalePassword] = useState("");
+  const [showCloudflaredTunnel, setShowCloudflaredTunnel] = useState(true);
+  const [showTailscaleFunnel, setShowTailscaleFunnel] = useState(true);
+  const [ngrokStatus, setNgrokStatus] = useState<NgrokTunnelStatus | null>(null);
+  const [ngrokBusy, setNgrokBusy] = useState(false);
+  const [ngrokNotice, setNgrokNotice] = useState<TunnelNotice | null>(null);
+  const [ngrokToken, setNgrokToken] = useState("");
+  const [showNgrokTunnel, setShowNgrokTunnel] = useState(true);
+  const [expandedTunnel, setExpandedTunnel] = useState<string | null>(null);
+  const [lanUrls, setLanUrls] = useState<string[]>([]);
+  const [tailscaleIpUrl, setTailscaleIpUrl] = useState<string | null>(null);
+  const [activeEndpointTab, setActiveEndpointTab] = useState<EndpointTab>("apis");
 
   const { copied, copy } = useCopyToClipboard();
 
@@ -199,20 +285,82 @@ export default function APIPageClient({ machineId }) {
     [translateOrFallback]
   );
 
+  const fetchNgrokStatus = useCallback(
+    async (silent = false) => {
+      try {
+        const res = await fetch("/api/tunnels/ngrok", { cache: "no-store" });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          throw new Error(
+            data?.error || translateOrFallback("ngrokRequestFailed", "Failed to load ngrok status")
+          );
+        }
+
+        setNgrokStatus(data);
+        return data as NgrokTunnelStatus;
+      } catch (error) {
+        if (!silent) {
+          setNgrokNotice({
+            type: "error",
+            message:
+              error instanceof Error
+                ? error.message
+                : translateOrFallback("ngrokRequestFailed", "Failed to load ngrok status"),
+          });
+        }
+        return null;
+      }
+    },
+    [translateOrFallback]
+  );
+
   useEffect(() => {
-    Promise.allSettled([
-      loadCloudSettings(),
-      fetchModels(),
-      fetchProtocolStatus(),
-      fetchSearchProviders(),
-      fetchCloudflaredStatus(true),
-      fetchTailscaleStatus(true),
-    ]).finally(() => {
+    let mounted = true;
+
+    const loadPage = async () => {
+      const tunnelVisibility = await loadCloudSettings(() => mounted);
+
+      if (!mounted) return;
       setLoading(false);
-    });
-  }, [fetchCloudflaredStatus, fetchTailscaleStatus]);
+
+      runEndpointBackgroundTask("models", fetchModels);
+      runEndpointBackgroundTask("protocol-status", fetchProtocolStatus);
+      runEndpointBackgroundTask("search-providers", fetchSearchProviders);
+      runEndpointBackgroundTask("network-info", async () => {
+        try {
+          const res = await fetch("/api/network/info");
+          if (res.ok) {
+            const data = await res.json();
+            if (mounted) {
+              setLanUrls(data.lanUrls ?? []);
+              if (data.tailscaleIpUrl) setTailscaleIpUrl(data.tailscaleIpUrl);
+            }
+          }
+        } catch {
+          // non-critical
+        }
+      });
+
+      if (tunnelVisibility.showCloudflaredTunnel) {
+        runEndpointBackgroundTask("cloudflared-status", () => fetchCloudflaredStatus(true));
+      }
+      if (tunnelVisibility.showTailscaleFunnel) {
+        runEndpointBackgroundTask("tailscale-status", () => fetchTailscaleStatus(true));
+      }
+      if (tunnelVisibility.showNgrokTunnel) {
+        runEndpointBackgroundTask("ngrok-status", () => fetchNgrokStatus(true));
+      }
+    };
+
+    void loadPage();
+
+    return () => {
+      mounted = false;
+    };
+  }, [fetchCloudflaredStatus, fetchTailscaleStatus, fetchNgrokStatus]);
 
   const fetchModels = async () => {
+    setModelsLoading(true);
     try {
       const res = await fetch("/v1/models");
       if (res.ok) {
@@ -221,6 +369,8 @@ export default function APIPageClient({ machineId }) {
       }
     } catch (e) {
       console.log("Error fetching models:", e);
+    } finally {
+      setModelsLoading(false);
     }
   };
 
@@ -271,6 +421,28 @@ export default function APIPageClient({ machineId }) {
     };
   }, [allModels]);
 
+  const totalEndpointModelCount = useMemo(
+    () => Object.values(endpointData).reduce((acc, models) => acc + models.length, 0),
+    [endpointData]
+  );
+
+  const availableEndpointCount = useMemo(() => {
+    const chatCount = endpointData.chat.length > 0 ? 4 : 0; // chat + responses + completions + messages
+    const imageCount = endpointData.images.length > 0 ? 2 : 0; // image gen + image edits
+    const otherMedia = [
+      endpointData.embeddings,
+      endpointData.audioTranscription,
+      endpointData.audioSpeech,
+      endpointData.music,
+      endpointData.video,
+    ].filter((m) => m.length > 0).length;
+    const utilityFixed = 3; // batch + files + list models (always available)
+    const modelUtility =
+      (endpointData.rerank.length > 0 ? 1 : 0) + (endpointData.moderation.length > 0 ? 1 : 0);
+    const searchCount = searchProviders.length > 0 ? 1 : 0;
+    return chatCount + imageCount + otherMedia + utilityFixed + modelUtility + searchCount;
+  }, [endpointData, searchProviders]);
+
   const postCloudAction = async (action, timeoutMs = CLOUD_ACTION_TIMEOUT_MS) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -293,11 +465,23 @@ export default function APIPageClient({ machineId }) {
     }
   };
 
-  const loadCloudSettings = async () => {
+  const loadCloudSettings = async (
+    shouldApplyState: () => boolean = () => true
+  ): Promise<EndpointTunnelVisibility> => {
     try {
       const res = await fetch("/api/settings");
       if (res.ok) {
         const data = await res.json();
+        const tunnelVisibility = {
+          showCloudflaredTunnel: data.hideEndpointCloudflaredTunnel !== true,
+          showTailscaleFunnel: data.hideEndpointTailscaleFunnel !== true,
+          showNgrokTunnel: data.hideEndpointNgrokTunnel !== true,
+        };
+
+        if (!shouldApplyState()) {
+          return tunnelVisibility;
+        }
+
         setCloudEnabled(data.cloudEnabled || false);
         if (typeof data.cloudConfigured === "boolean") {
           setCloudConfigured(data.cloudConfigured);
@@ -308,10 +492,31 @@ export default function APIPageClient({ machineId }) {
         if (data.machineId) {
           setResolvedMachineId(data.machineId);
         }
+        setShowCloudflaredTunnel(tunnelVisibility.showCloudflaredTunnel);
+        setShowTailscaleFunnel(tunnelVisibility.showTailscaleFunnel);
+        setShowNgrokTunnel(tunnelVisibility.showNgrokTunnel);
+        if (data.ngrokAuthToken) setNgrokToken(data.ngrokAuthToken);
+
+        if (!tunnelVisibility.showCloudflaredTunnel) {
+          setCloudflaredStatus(null);
+          setCloudflaredNotice(null);
+        }
+        if (!tunnelVisibility.showTailscaleFunnel) {
+          setTailscaleStatus(null);
+          setTailscaleNotice(null);
+        }
+        if (!tunnelVisibility.showNgrokTunnel) {
+          setNgrokStatus(null);
+          setNgrokNotice(null);
+        }
+
+        return tunnelVisibility;
       }
     } catch (error) {
       console.log("Error loading cloud settings:", error);
     }
+
+    return DEFAULT_TUNNEL_VISIBILITY;
   };
 
   const handleCloudToggle = (checked) => {
@@ -352,13 +557,34 @@ export default function APIPageClient({ machineId }) {
   }, [tailscaleNotice]);
 
   useEffect(() => {
+    if (ngrokNotice) {
+      const timer = setTimeout(() => setNgrokNotice(null), 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [ngrokNotice]);
+
+  useEffect(() => {
     const interval = setInterval(() => {
       void fetchProtocolStatus();
-      void fetchCloudflaredStatus(true);
-      void fetchTailscaleStatus(true);
+      if (showCloudflaredTunnel) {
+        void fetchCloudflaredStatus(true);
+      }
+      if (showTailscaleFunnel) {
+        void fetchTailscaleStatus(true);
+      }
+      if (showNgrokTunnel) {
+        void fetchNgrokStatus(true);
+      }
     }, 30000);
     return () => clearInterval(interval);
-  }, [fetchCloudflaredStatus, fetchTailscaleStatus]);
+  }, [
+    fetchCloudflaredStatus,
+    fetchNgrokStatus,
+    fetchTailscaleStatus,
+    showCloudflaredTunnel,
+    showNgrokTunnel,
+    showTailscaleFunnel,
+  ]);
 
   const dispatchCloudChange = () => {
     globalThis.dispatchEvent(new Event("cloud-status-changed"));
@@ -495,6 +721,56 @@ export default function APIPageClient({ machineId }) {
     } finally {
       setCloudflaredBusy(false);
       await fetchCloudflaredStatus(true);
+    }
+  };
+
+  const handleNgrokAction = async (action: "enable" | "disable") => {
+    setNgrokBusy(true);
+    setNgrokNotice(null);
+
+    try {
+      const res = await fetch("/api/tunnels/ngrok", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, authToken: action === "enable" ? ngrokToken : undefined }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(
+          data?.error || translateOrFallback("ngrokRequestFailed", "Failed to update ngrok tunnel")
+        );
+      }
+
+      if (data?.status) {
+        setNgrokStatus(data.status);
+      }
+
+      setNgrokNotice({
+        type: "success",
+        message:
+          action === "enable"
+            ? translateOrFallback("ngrokStarted", "ngrok tunnel started")
+            : translateOrFallback("ngrokStopped", "ngrok tunnel stopped"),
+      });
+      if (action === "enable" && ngrokToken) {
+        await fetch("/api/settings", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ngrokAuthToken: ngrokToken }),
+        });
+      }
+    } catch (error) {
+      setNgrokNotice({
+        type: "error",
+        message:
+          error instanceof Error
+            ? error.message
+            : translateOrFallback("ngrokRequestFailed", "Failed to update ngrok tunnel"),
+      });
+    } finally {
+      setNgrokBusy(false);
+      await fetchNgrokStatus(true);
     }
   };
 
@@ -685,7 +961,7 @@ export default function APIPageClient({ machineId }) {
       setTailscaleBusy(false);
       await fetchTailscaleStatus(true);
     }
-  }, [fetchTailscaleStatus, translateOrFallback]);
+  }, [fetchTailscaleStatus, tailscalePassword, translateOrFallback]);
 
   const handleTailscaleInstall = useCallback(async () => {
     setTailscaleInstallBusy(true);
@@ -780,21 +1056,14 @@ export default function APIPageClient({ machineId }) {
     }
   }, [fetchTailscaleStatus, handleTailscaleEnable, tailscalePassword, translateOrFallback]);
 
-  const [baseUrl, setBaseUrl] = useState("/v1");
+  const displayBaseUrl = useDisplayBaseUrl();
+  const baseUrl = `${displayBaseUrl}/v1`;
   const normalizedCloudBaseUrl = cloudBaseUrl
     ? resolvedMachineId && !cloudBaseUrl.endsWith(`/${resolvedMachineId}`)
       ? `${cloudBaseUrl}/${resolvedMachineId}`
       : cloudBaseUrl
     : null;
   const cloudEndpointNew = normalizedCloudBaseUrl ? `${normalizedCloudBaseUrl}/v1` : null;
-
-  // Hydration fix: Only access window on client side
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      const defaultOrigin = process.env.NEXT_PUBLIC_BASE_URL || window.location.origin;
-      setBaseUrl(`${defaultOrigin}/v1`);
-    }
-  }, []);
 
   if (loading) {
     return (
@@ -807,6 +1076,37 @@ export default function APIPageClient({ machineId }) {
 
   // Use new format endpoint (machineId embedded in key)
   const currentEndpoint = cloudEnabled && cloudEndpointNew ? cloudEndpointNew : baseUrl;
+
+  const activeUrls = [
+    { label: "Local", url: baseUrl, key: "active_local" },
+    ...(cloudEnabled && cloudEndpointNew
+      ? [{ label: "Cloud", url: cloudEndpointNew, key: "active_cloud" }]
+      : []),
+    ...(cloudflaredStatus?.running && cloudflaredStatus.apiUrl
+      ? [{ label: "Cloudflare", url: cloudflaredStatus.apiUrl, key: "active_cf" }]
+      : []),
+    ...(tailscaleStatus?.running && (tailscaleStatus.apiUrl ?? tailscaleStatus.tunnelUrl)
+      ? [
+          {
+            label: "Tailscale",
+            url: tailscaleStatus.apiUrl ?? tailscaleStatus.tunnelUrl ?? "",
+            key: "active_ts",
+          },
+        ]
+      : []),
+    ...(ngrokStatus?.running && ngrokStatus.apiUrl
+      ? [{ label: "ngrok", url: ngrokStatus.apiUrl, key: "active_ngrok" }]
+      : []),
+  ];
+  const visibleTunnelCount = [showCloudflaredTunnel, showTailscaleFunnel, showNgrokTunnel].filter(
+    Boolean
+  ).length;
+  const activeTunnelCount = [
+    showCloudflaredTunnel && cloudflaredStatus?.running,
+    showTailscaleFunnel && tailscaleStatus?.running,
+    showNgrokTunnel && ngrokStatus?.running,
+  ].filter(Boolean).length;
+
   const mcpOnline = Boolean(mcpStatus?.online);
   const a2aOnline = a2aStatus?.status === "ok";
   const mcpToolCount = Number(mcpStatus?.heartbeat?.toolCount || 0);
@@ -877,72 +1177,73 @@ export default function APIPageClient({ machineId }) {
   };
   const tailscaleActionLabel = tailscaleStatus?.running
     ? translateOrFallback("tailscaleDisable", "Stop Funnel")
-    : !tailscaleStatus?.installed
-      ? translateOrFallback("tailscaleInstallAndEnable", "Install & Enable")
-      : !tailscaleStatus?.loggedIn
-        ? translateOrFallback("tailscaleLoginAndEnable", "Login & Enable")
-        : translateOrFallback("tailscaleEnable", "Enable Funnel");
+    : tailscaleStatus?.installed
+      ? tailscaleStatus?.loggedIn
+        ? translateOrFallback("tailscaleEnable", "Enable Funnel")
+        : translateOrFallback("tailscaleLoginAndEnable", "Login & Enable")
+      : translateOrFallback("tailscaleInstallAndEnable", "Install & Enable");
   const tailscaleUrlNotice = translateOrFallback(
     "tailscaleUrlNotice",
     "Uses your Tailscale .ts.net address. Login and Funnel approval may be required on first use."
   );
 
+  const ngrokPhase = ngrokStatus?.phase || "not_installed";
+  const ngrokPhaseMeta: Record<NgrokTunnelPhase, { label: string; className: string }> = {
+    running: {
+      label: translateOrFallback("ngrokRunning", "Running"),
+      className: "bg-green-500/10 border-green-500/30 text-green-400",
+    },
+    starting: {
+      label: translateOrFallback("ngrokStarting", "Starting"),
+      className: "bg-blue-500/10 border-blue-500/30 text-blue-400",
+    },
+    stopped: {
+      label: translateOrFallback("ngrokStoppedState", "Stopped"),
+      className: "bg-surface border-border/70 text-text-muted",
+    },
+    needs_auth: {
+      label: translateOrFallback("ngrokNeedsAuth", "Needs Auth"),
+      className: "bg-amber-500/10 border-amber-500/30 text-amber-400",
+    },
+    not_installed: {
+      label: translateOrFallback("ngrokNotInstalled", "Not installed"),
+      className: "bg-surface border-border/70 text-text-muted",
+    },
+    unsupported: {
+      label: translateOrFallback("ngrokUnsupported", "Unsupported"),
+      className: "bg-amber-500/10 border-amber-500/30 text-amber-400",
+    },
+    error: {
+      label: translateOrFallback("ngrokError", "Error"),
+      className: "bg-red-500/10 border-red-500/30 text-red-400",
+    },
+  };
+  const ngrokActionLabel = ngrokStatus?.running
+    ? translateOrFallback("ngrokDisable", "Stop Tunnel")
+    : translateOrFallback("ngrokEnable", "Enable Tunnel");
+  const ngrokUrlNotice = translateOrFallback("ngrokUrlNotice", "Creates a public ngrok tunnel.");
+
   return (
     <div className="flex flex-col gap-8">
-      {/* Endpoint Card */}
-      <Card className={cloudEnabled ? "" : ""}>
-        <div className="flex items-center justify-between mb-4">
-          <div>
-            <h2 className="text-lg font-semibold">{t("title")}</h2>
-            <div className="mt-2">
-              <Button
-                size="sm"
-                variant={cloudEnabled ? "primary" : "secondary"}
-                icon={cloudEnabled ? "cloud_done" : "dns"}
-                onClick={() => handleCloudToggle(!cloudEnabled)}
-                disabled={cloudSyncing || (!cloudEnabled && !cloudConfigured)}
-                className={
-                  cloudEnabled ? "" : "border-border/70! text-text-muted! hover:text-text!"
-                }
-              >
-                {cloudEnabled ? t("usingCloudProxy") : t("usingLocalServer")}
-              </Button>
-            </div>
-            {resolvedMachineId && (
-              <p className="text-xs text-text-muted mt-2">
-                {t("machineId", { id: resolvedMachineId.slice(0, 8) })}
-              </p>
-            )}
-          </div>
-          <div className="flex items-center gap-2">
-            {cloudEnabled ? (
-              <Button
-                size="sm"
-                variant="secondary"
-                icon="cloud_off"
-                onClick={() => handleCloudToggle(false)}
-                disabled={cloudSyncing}
-                className="bg-red-500/10! text-red-500! hover:bg-red-500/20! border-red-500/30!"
-              >
-                {t("disableCloud")}
-              </Button>
-            ) : cloudConfigured ? (
-              <Button
-                variant="primary"
-                icon="cloud_upload"
-                onClick={() => handleCloudToggle(true)}
-                disabled={cloudSyncing}
-                className="bg-linear-to-r from-primary to-blue-500 hover:from-primary-hover hover:to-blue-600"
-              >
-                {t("enableCloud")}
-              </Button>
-            ) : (
-              <span className="text-xs px-2 py-1 rounded-full bg-surface text-text-muted border border-border/70">
-                Cloud not configured
-              </span>
-            )}
-          </div>
+      <SegmentedControl
+        options={ENDPOINT_TABS}
+        value={activeEndpointTab}
+        onChange={(value) => setActiveEndpointTab(value as EndpointTab)}
+        aria-label="Endpoint sections"
+        className="w-fit"
+      />
+
+      {activeEndpointTab === "mcp" ? <McpDashboardPage /> : null}
+      {activeEndpointTab === "a2a" ? <A2ADashboardPage /> : null}
+      {activeEndpointTab === "context-sources" ? (
+        <div className="flex flex-col gap-4">
+          <NotionSourceCard />
         </div>
+      ) : null}
+
+      {/* Endpoint Card */}
+      <Card>
+        <h2 className="text-lg font-semibold mb-4">{t("title")}</h2>
 
         {/* Cloud Status Toast */}
         {cloudStatus && (
@@ -972,758 +1273,758 @@ export default function APIPageClient({ machineId }) {
           </div>
         )}
 
-        {/* Endpoint URL */}
-        <div className="flex flex-col sm:flex-row gap-2 mb-3">
-          <Input
-            value={currentEndpoint}
-            readOnly
-            className={`flex-1 min-w-0 font-mono text-sm ${cloudEnabled ? "animate-border-glow" : ""}`}
-          />
-          <Button
-            variant="secondary"
-            icon={copied === "endpoint_url" ? "check" : "content_copy"}
-            onClick={() => copy(currentEndpoint, "endpoint_url")}
-            className="shrink-0 self-start sm:self-auto"
-          >
-            {copied === "endpoint_url" ? tc("copied") : tc("copy")}
-          </Button>
-        </div>
-
-        <div className="rounded-xl border border-border/70 bg-surface/40 p-4">
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h3 className="text-sm font-semibold">
-                    {translateOrFallback("cloudflaredTitle", "Cloudflare Quick Tunnel")}
-                  </h3>
-                  <span
-                    className={`inline-flex items-center rounded-full border px-2 py-1 text-xs font-medium ${cloudflaredPhaseMeta[cloudflaredPhase].className}`}
+        {/* Active URLs bar */}
+        {activeUrls.length > 0 && (
+          <div className="mb-4 rounded-lg border border-primary/20 bg-primary/5 p-3">
+            <p className="text-[10px] font-semibold text-primary uppercase tracking-wider mb-2">
+              Active Endpoints
+            </p>
+            <div className="flex flex-col gap-1.5">
+              {activeUrls.map(({ label, url, key }) => (
+                <div key={key} className="flex items-center gap-2 min-w-0">
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-400 shrink-0" />
+                  <span className="text-xs text-text-muted w-20 shrink-0">{label}</span>
+                  <code className="text-xs font-mono text-text-main flex-1 truncate min-w-0">
+                    {url}
+                  </code>
+                  <button
+                    onClick={() => void copy(url, key)}
+                    className="shrink-0 flex items-center gap-1 px-2 py-0.5 rounded border border-border/70 text-text-muted hover:text-text transition-colors"
                   >
-                    {cloudflaredPhaseMeta[cloudflaredPhase].label}
-                  </span>
+                    <span className="material-symbols-outlined text-[12px]">
+                      {copied === key ? "check" : "content_copy"}
+                    </span>
+                  </button>
                 </div>
-              </div>
-
-              {cloudflaredStatus?.supported !== false && (
-                <Button
-                  size="sm"
-                  variant={cloudflaredStatus?.running ? "secondary" : "primary"}
-                  icon={cloudflaredStatus?.running ? "cloud_off" : "cloud_upload"}
-                  onClick={() =>
-                    handleCloudflaredAction(cloudflaredStatus?.running ? "disable" : "enable")
-                  }
-                  loading={cloudflaredBusy}
-                  className={
-                    cloudflaredStatus?.running
-                      ? "border-border/70! text-text-muted! hover:text-text!"
-                      : "bg-linear-to-r from-primary to-cyan-500 hover:from-primary-hover hover:to-cyan-600"
-                  }
-                >
-                  {cloudflaredActionLabel}
-                </Button>
-              )}
+              ))}
             </div>
-
-            {cloudflaredNotice && (
-              <div
-                className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
-                  cloudflaredNotice.type === "success"
-                    ? "border-green-500/30 bg-green-500/10 text-green-400"
-                    : cloudflaredNotice.type === "info"
-                      ? "border-blue-500/30 bg-blue-500/10 text-blue-400"
-                      : "border-red-500/30 bg-red-500/10 text-red-400"
-                }`}
-              >
-                <span className="material-symbols-outlined text-[18px]">
-                  {cloudflaredNotice.type === "success"
-                    ? "check_circle"
-                    : cloudflaredNotice.type === "info"
-                      ? "info"
-                      : "error"}
-                </span>
-                <span className="flex-1">{cloudflaredNotice.message}</span>
-                <button
-                  onClick={() => setCloudflaredNotice(null)}
-                  className="rounded p-0.5 transition-colors hover:bg-white/10"
-                >
-                  <span className="material-symbols-outlined text-[16px]">close</span>
-                </button>
-              </div>
-            )}
-
-            <p className="text-xs text-text-muted">{cloudflaredUrlNotice}</p>
-            <div className="flex flex-col sm:flex-row gap-2">
-              <Input
-                value={cloudflaredStatus?.apiUrl || ""}
-                readOnly
-                placeholder="https://*.trycloudflare.com/v1"
-                className="flex-1 min-w-0 font-mono text-sm"
-              />
-              <Button
-                variant="secondary"
-                icon={copied === "cloudflared_url" ? "check" : "content_copy"}
-                onClick={() =>
-                  cloudflaredStatus?.apiUrl && copy(cloudflaredStatus.apiUrl, "cloudflared_url")
-                }
-                disabled={!cloudflaredStatus?.apiUrl}
-                className="shrink-0 self-start sm:self-auto"
-              >
-                {copied === "cloudflared_url" ? tc("copied") : tc("copy")}
-              </Button>
-            </div>
-            {cloudflaredStatus?.lastError && (
-              <p className="text-xs text-red-400">
-                {translateOrFallback("cloudflaredLastError", "Last error: {error}", {
-                  error: cloudflaredStatus.lastError,
-                })}
-              </p>
-            )}
           </div>
-        </div>
+        )}
 
-        <div className="mt-4 rounded-xl border border-border/70 bg-surface/40 p-4">
-          <div className="flex flex-col gap-3">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h3 className="text-sm font-semibold">
-                    {translateOrFallback("tailscaleTitle", "Tailscale Funnel")}
-                  </h3>
-                  <span
-                    className={`inline-flex items-center rounded-full border px-2 py-1 text-xs font-medium ${tailscalePhaseMeta[tailscalePhase].className}`}
-                  >
-                    {tailscalePhaseMeta[tailscalePhase].label}
-                  </span>
-                </div>
-              </div>
-
-              {tailscaleStatus?.supported !== false && (
-                <Button
-                  size="sm"
-                  variant={tailscaleStatus?.running ? "secondary" : "primary"}
-                  icon={tailscaleStatus?.running ? "vpn_lock_off" : "vpn_lock"}
-                  onClick={() => {
-                    if (tailscaleStatus?.running) {
-                      void handleTailscaleDisable();
-                    } else if (!tailscaleStatus?.installed) {
-                      setShowTailscaleInstallModal(true);
-                    } else {
-                      void handleTailscaleEnable();
-                    }
-                  }}
-                  loading={tailscaleBusy}
-                  className={
-                    tailscaleStatus?.running
-                      ? "border-border/70! text-text-muted! hover:text-text!"
-                      : "bg-linear-to-r from-indigo-500 to-cyan-500 hover:from-indigo-600 hover:to-cyan-600"
-                  }
-                >
-                  {tailscaleActionLabel}
-                </Button>
-              )}
-            </div>
-
-            {tailscaleNotice && (
-              <div
-                className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
-                  tailscaleNotice.type === "success"
-                    ? "border-green-500/30 bg-green-500/10 text-green-400"
-                    : tailscaleNotice.type === "info"
-                      ? "border-blue-500/30 bg-blue-500/10 text-blue-400"
-                      : "border-red-500/30 bg-red-500/10 text-red-400"
-                }`}
-              >
-                <span className="material-symbols-outlined text-[18px]">
-                  {tailscaleNotice.type === "success"
-                    ? "check_circle"
-                    : tailscaleNotice.type === "info"
-                      ? "info"
-                      : "error"}
-                </span>
-                <span className="flex-1">{tailscaleNotice.message}</span>
-                <button
-                  onClick={() => setTailscaleNotice(null)}
-                  className="rounded p-0.5 transition-colors hover:bg-white/10"
-                >
-                  <span className="material-symbols-outlined text-[16px]">close</span>
-                </button>
-              </div>
-            )}
-
-            <p className="text-xs text-text-muted">{tailscaleUrlNotice}</p>
-            {tailscaleStatus?.phase === "needs_login" && (
-              <p className="text-xs text-blue-400">
-                {translateOrFallback(
-                  "tailscaleNeedsLoginHint",
-                  "Authenticate this machine with Tailscale, then enable Funnel."
+        {/* Connection rows */}
+        <div className="flex flex-col">
+          {/* Local Server */}
+          <div className="flex items-center gap-3 py-3">
+            <span className="material-symbols-outlined text-[18px] text-emerald-500 shrink-0">
+              computer
+            </span>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-baseline gap-1 flex-wrap">
+                <span className="text-sm font-medium">{t("localServer")}</span>
+                {resolvedMachineId && (
+                  <span className="text-xs text-text-muted">· {resolvedMachineId.slice(0, 8)}</span>
                 )}
-              </p>
-            )}
-            {/* Sudo password input — shown when Tailscale is installed but not running (needs sudo to start daemon) */}
-            {tailscaleStatus?.installed &&
-              !tailscaleStatus?.running &&
-              tailscaleStatus?.platform !== "win32" && (
-                <div className="flex flex-col gap-1">
-                  <label className="text-xs text-text-muted">
-                    {translateOrFallback(
-                      "tailscaleSudoLabel",
-                      "Sudo Password (required on macOS/Linux)"
-                    )}
-                  </label>
-                  <Input
-                    type="password"
-                    value={tailscalePassword}
-                    onChange={(event) => setTailscalePassword(event.target.value)}
-                    placeholder={translateOrFallback(
-                      "tailscaleSudoPlaceholder",
-                      "Enter sudo password"
-                    )}
-                    disabled={tailscaleBusy}
-                    className="font-mono text-sm"
-                  />
-                </div>
-              )}
-            <div className="flex flex-col sm:flex-row gap-2">
-              <Input
-                value={tailscaleStatus?.apiUrl || ""}
-                readOnly
-                placeholder="https://your-device.tailnet.ts.net/v1"
-                className="flex-1 min-w-0 font-mono text-sm"
-              />
-              <Button
-                variant="secondary"
-                icon={copied === "tailscale_url" ? "check" : "content_copy"}
-                onClick={() =>
-                  tailscaleStatus?.apiUrl && copy(tailscaleStatus.apiUrl, "tailscale_url")
-                }
-                disabled={!tailscaleStatus?.apiUrl}
-                className="shrink-0 self-start sm:self-auto"
-              >
-                {copied === "tailscale_url" ? tc("copied") : tc("copy")}
-              </Button>
+                {lanUrls.map((url) => (
+                  <button
+                    key={url}
+                    onClick={() => void copy(url, `lan_${url}`)}
+                    title={`Copy ${url}`}
+                    className="inline-flex items-center gap-0.5 text-[10px] text-text-muted hover:text-text transition-colors"
+                  >
+                    <code className="font-mono">{url.replace(/^https?:\/\//, "")}</code>
+                    <span className="material-symbols-outlined text-[10px] opacity-60">
+                      {copied === `lan_${url}` ? "check" : "content_copy"}
+                    </span>
+                  </button>
+                ))}
+              </div>
             </div>
-            {tailscaleStatus?.binaryPath && (
-              <p className="text-xs text-text-muted">
-                {translateOrFallback("tailscaleBinaryPath", "Binary: {path}", {
-                  path: tailscaleStatus.binaryPath,
-                })}
-              </p>
-            )}
-            {tailscaleStatus?.lastError && (
-              <p className="text-xs text-red-400">
-                {translateOrFallback("tailscaleLastError", "Last error: {error}", {
-                  error: tailscaleStatus.lastError,
-                })}
-              </p>
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-green-500/10 border border-green-500/30 text-green-400 shrink-0">
+              <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+              Running
+            </span>
+            <button
+              onClick={() => void copy(baseUrl, "endpoint_url")}
+              className="shrink-0 flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md border border-border/70 text-text-muted hover:text-text hover:border-border transition-colors"
+            >
+              <span className="material-symbols-outlined text-[14px]">
+                {copied === "endpoint_url" ? "check" : "content_copy"}
+              </span>
+              {copied === "endpoint_url" ? tc("copied") : tc("copy")}
+            </button>
+          </div>
+
+          {/* Tunnels section header */}
+          <div className="flex items-center gap-2 pt-4 pb-1 border-t border-border/50">
+            <span className="material-symbols-outlined text-[14px] text-text-muted">
+              network_node
+            </span>
+            <span className="text-[10px] font-semibold text-text-muted uppercase tracking-wider">
+              Tunnels
+            </span>
+            <div className="flex-1 h-px bg-border/50" />
+            <span className="text-[10px] text-text-muted">
+              {activeTunnelCount} / {visibleTunnelCount} active
+            </span>
+          </div>
+
+          {/* Cloud OmniRoute */}
+          <div className="flex items-center gap-3 py-3">
+            <span className="material-symbols-outlined text-[18px] text-blue-400 shrink-0">
+              cloud
+            </span>
+            <div className="flex-1 min-w-0">
+              <span className="text-sm font-medium">{t("cloudOmniroute")}</span>
+            </div>
+            <span
+              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium border shrink-0 ${
+                cloudEnabled
+                  ? "bg-green-500/10 border-green-500/30 text-green-400"
+                  : "bg-surface border-border/70 text-text-muted"
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full shrink-0 ${cloudEnabled ? "bg-green-400 animate-pulse" : "bg-text-muted"}`}
+              />
+              {cloudEnabled ? "Active" : "Disabled"}
+            </span>
+            {cloudEnabled ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                icon="cloud_off"
+                onClick={() => handleCloudToggle(false)}
+                disabled={cloudSyncing}
+                className="shrink-0 bg-red-500/10! text-red-500! hover:bg-red-500/20! border-red-500/30!"
+              >
+                {t("disableCloud")}
+              </Button>
+            ) : cloudConfigured ? (
+              <Button
+                size="sm"
+                variant="primary"
+                icon="cloud_upload"
+                onClick={() => handleCloudToggle(true)}
+                disabled={cloudSyncing}
+                className="shrink-0"
+              >
+                {t("enableCloud")}
+              </Button>
+            ) : (
+              <span className="text-xs text-text-muted shrink-0 px-2 py-1 rounded border border-border/70 bg-surface">
+                Not configured
+              </span>
             )}
           </div>
+
+          {/* Cloudflare Quick Tunnel */}
+          {showCloudflaredTunnel && (
+            <div className="border-t border-border/30">
+              <div className="flex items-center gap-3 py-3">
+                <span className="material-symbols-outlined text-[18px] text-orange-400 shrink-0">
+                  cloud_queue
+                </span>
+                <div className="flex-1 min-w-0">
+                  <span className="text-sm font-medium">
+                    {translateOrFallback("cloudflaredTitle", "Cloudflare Quick Tunnel")}
+                  </span>
+                </div>
+                <span
+                  className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium shrink-0 ${cloudflaredPhaseMeta[cloudflaredPhase].className}`}
+                >
+                  {cloudflaredPhaseMeta[cloudflaredPhase].label}
+                </span>
+                {cloudflaredStatus?.supported !== false && (
+                  <Button
+                    size="sm"
+                    variant={cloudflaredStatus?.running ? "secondary" : "primary"}
+                    icon={cloudflaredStatus?.running ? "cloud_off" : "cloud_upload"}
+                    loading={cloudflaredBusy}
+                    onClick={() => {
+                      void handleCloudflaredAction(
+                        cloudflaredStatus?.running ? "disable" : "enable"
+                      );
+                    }}
+                    className={`shrink-0 ${cloudflaredStatus?.running ? "border-border/70! text-text-muted! hover:text-text!" : ""}`}
+                  >
+                    {cloudflaredActionLabel}
+                  </Button>
+                )}
+              </div>
+              {cloudflaredNotice && (
+                <div
+                  className={`mb-2 ml-7 flex items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
+                    cloudflaredNotice.type === "success"
+                      ? "border-green-500/30 bg-green-500/10 text-green-400"
+                      : cloudflaredNotice.type === "info"
+                        ? "border-blue-500/30 bg-blue-500/10 text-blue-400"
+                        : "border-red-500/30 bg-red-500/10 text-red-400"
+                  }`}
+                >
+                  <span className="material-symbols-outlined text-[18px]">
+                    {cloudflaredNotice.type === "success"
+                      ? "check_circle"
+                      : cloudflaredNotice.type === "info"
+                        ? "info"
+                        : "error"}
+                  </span>
+                  <span className="flex-1">{cloudflaredNotice.message}</span>
+                  <button
+                    onClick={() => setCloudflaredNotice(null)}
+                    className="rounded p-0.5 transition-colors hover:bg-white/10"
+                  >
+                    <span className="material-symbols-outlined text-[16px]">close</span>
+                  </button>
+                </div>
+              )}
+              {cloudflaredStatus?.lastError && (
+                <p className="mb-2 ml-7 text-xs text-red-400">
+                  {translateOrFallback("cloudflaredLastError", "Last error: {error}", {
+                    error: cloudflaredStatus.lastError,
+                  })}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Tailscale Funnel */}
+          {showTailscaleFunnel && (
+            <div className={showCloudflaredTunnel ? "border-t border-border/30" : ""}>
+              <div
+                role="button"
+                tabIndex={0}
+                className="w-full flex items-center gap-3 py-3 hover:bg-surface/40 transition-colors rounded -mx-1 px-1 text-left cursor-pointer"
+                onClick={() => setExpandedTunnel(expandedTunnel === "ts" ? null : "ts")}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setExpandedTunnel(expandedTunnel === "ts" ? null : "ts");
+                  }
+                }}
+              >
+                <span className="material-symbols-outlined text-[18px] text-indigo-400 shrink-0">
+                  vpn_lock
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-baseline gap-1 flex-wrap">
+                    <span className="text-sm font-medium">
+                      {translateOrFallback("tailscaleTitle", "Tailscale Funnel")}
+                    </span>
+                    {tailscaleIpUrl && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void copy(tailscaleIpUrl, "tailscale_ip_inline");
+                        }}
+                        title={`Copy ${tailscaleIpUrl}`}
+                        className="inline-flex items-center gap-0.5 text-[10px] text-text-muted hover:text-text transition-colors"
+                      >
+                        <code className="font-mono">
+                          {tailscaleIpUrl.replace(/^https?:\/\//, "")}
+                        </code>
+                        <span className="material-symbols-outlined text-[10px] opacity-60">
+                          {copied === "tailscale_ip_inline" ? "check" : "content_copy"}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <span
+                  className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium shrink-0 ${tailscalePhaseMeta[tailscalePhase].className}`}
+                >
+                  {tailscalePhaseMeta[tailscalePhase].label}
+                </span>
+                {tailscaleStatus?.supported !== false && (
+                  <Button
+                    size="sm"
+                    variant={tailscaleStatus?.running ? "secondary" : "primary"}
+                    icon={tailscaleStatus?.running ? "vpn_key_off" : "vpn_lock"}
+                    loading={tailscaleBusy}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (tailscaleStatus?.running) {
+                        void handleTailscaleDisable();
+                      } else if (tailscaleStatus?.installed) {
+                        void handleTailscaleEnable();
+                      } else {
+                        setShowTailscaleInstallModal(true);
+                      }
+                    }}
+                    className={`shrink-0 ${tailscaleStatus?.running ? "border-border/70! text-text-muted! hover:text-text!" : ""}`}
+                  >
+                    {tailscaleActionLabel}
+                  </Button>
+                )}
+                <span
+                  className="material-symbols-outlined text-[18px] text-text-muted shrink-0 transition-transform duration-200"
+                  style={{
+                    transform: expandedTunnel === "ts" ? "rotate(180deg)" : "rotate(0deg)",
+                  }}
+                >
+                  expand_more
+                </span>
+              </div>
+              {expandedTunnel === "ts" && (
+                <div className="pb-3 pl-7 pr-1 flex flex-col gap-2">
+                  {tailscaleNotice && (
+                    <div
+                      className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
+                        tailscaleNotice.type === "success"
+                          ? "border-green-500/30 bg-green-500/10 text-green-400"
+                          : tailscaleNotice.type === "info"
+                            ? "border-blue-500/30 bg-blue-500/10 text-blue-400"
+                            : "border-red-500/30 bg-red-500/10 text-red-400"
+                      }`}
+                    >
+                      <span className="material-symbols-outlined text-[18px]">
+                        {tailscaleNotice.type === "success"
+                          ? "check_circle"
+                          : tailscaleNotice.type === "info"
+                            ? "info"
+                            : "error"}
+                      </span>
+                      <span className="flex-1">{tailscaleNotice.message}</span>
+                      <button
+                        onClick={() => setTailscaleNotice(null)}
+                        className="rounded p-0.5 transition-colors hover:bg-white/10"
+                      >
+                        <span className="material-symbols-outlined text-[16px]">close</span>
+                      </button>
+                    </div>
+                  )}
+                  <p className="text-xs text-text-muted">{tailscaleUrlNotice}</p>
+                  {tailscaleStatus?.phase === "needs_login" && (
+                    <p className="text-xs text-blue-400">
+                      {translateOrFallback(
+                        "tailscaleNeedsLoginHint",
+                        "Authenticate this machine with Tailscale, then enable Funnel."
+                      )}
+                    </p>
+                  )}
+                  {tailscaleStatus?.installed && tailscaleStatus?.platform !== "win32" && (
+                    <div className="flex flex-col gap-1">
+                      <label className="text-xs text-text-muted">
+                        {translateOrFallback(
+                          "tailscaleSudoLabel",
+                          "Sudo Password (required on macOS/Linux)"
+                        )}
+                      </label>
+                      <Input
+                        type="password"
+                        value={tailscalePassword}
+                        onChange={(event) => setTailscalePassword(event.target.value)}
+                        placeholder={translateOrFallback(
+                          "tailscaleSudoPlaceholder",
+                          "Optional sudo password"
+                        )}
+                        disabled={tailscaleBusy}
+                        className="font-mono text-sm"
+                      />
+                    </div>
+                  )}
+                  {tailscaleStatus?.binaryPath && (
+                    <p className="text-xs text-text-muted">
+                      {translateOrFallback("tailscaleBinaryPath", "Binary: {path}", {
+                        path: tailscaleStatus.binaryPath,
+                      })}
+                    </p>
+                  )}
+                  {tailscaleStatus?.lastError && (
+                    <p className="text-xs text-red-400">
+                      {translateOrFallback("tailscaleLastError", "Last error: {error}", {
+                        error: tailscaleStatus.lastError,
+                      })}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ngrok Tunnel */}
+          {showNgrokTunnel && (
+            <div
+              className={
+                showCloudflaredTunnel || showTailscaleFunnel ? "border-t border-border/30" : ""
+              }
+            >
+              <div
+                role="button"
+                tabIndex={0}
+                className="w-full flex items-center gap-3 py-3 hover:bg-surface/40 transition-colors rounded -mx-1 px-1 text-left cursor-pointer"
+                onClick={() => setExpandedTunnel(expandedTunnel === "ngrok" ? null : "ngrok")}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setExpandedTunnel(expandedTunnel === "ngrok" ? null : "ngrok");
+                  }
+                }}
+              >
+                <span className="material-symbols-outlined text-[18px] text-purple-400 shrink-0">
+                  public
+                </span>
+                <div className="flex-1 min-w-0">
+                  <span className="text-sm font-medium">
+                    {translateOrFallback("ngrokTitle", "ngrok Tunnel")}
+                  </span>
+                </div>
+                <span
+                  className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium shrink-0 ${ngrokPhaseMeta[ngrokPhase].className}`}
+                >
+                  {ngrokPhaseMeta[ngrokPhase].label}
+                </span>
+                {ngrokStatus?.supported !== false && (
+                  <Button
+                    size="sm"
+                    variant={ngrokStatus?.running ? "secondary" : "primary"}
+                    icon={ngrokStatus?.running ? "public_off" : "public"}
+                    loading={ngrokBusy}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleNgrokAction(ngrokStatus?.running ? "disable" : "enable");
+                    }}
+                    className={`shrink-0 ${ngrokStatus?.running ? "border-border/70! text-text-muted! hover:text-text!" : ""}`}
+                  >
+                    {ngrokActionLabel}
+                  </Button>
+                )}
+                <span
+                  className="material-symbols-outlined text-[18px] text-text-muted shrink-0 transition-transform duration-200"
+                  style={{
+                    transform: expandedTunnel === "ngrok" ? "rotate(180deg)" : "rotate(0deg)",
+                  }}
+                >
+                  expand_more
+                </span>
+              </div>
+              {expandedTunnel === "ngrok" && (
+                <div className="pb-3 pl-7 pr-1 flex flex-col gap-2">
+                  {ngrokNotice && (
+                    <div
+                      className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-sm ${
+                        ngrokNotice.type === "success"
+                          ? "border-green-500/30 bg-green-500/10 text-green-400"
+                          : ngrokNotice.type === "info"
+                            ? "border-blue-500/30 bg-blue-500/10 text-blue-400"
+                            : "border-red-500/30 bg-red-500/10 text-red-400"
+                      }`}
+                    >
+                      <span className="material-symbols-outlined text-[18px]">
+                        {ngrokNotice.type === "success"
+                          ? "check_circle"
+                          : ngrokNotice.type === "info"
+                            ? "info"
+                            : "error"}
+                      </span>
+                      <span className="flex-1">{ngrokNotice.message}</span>
+                      <button
+                        onClick={() => setNgrokNotice(null)}
+                        className="rounded p-0.5 transition-colors hover:bg-white/10"
+                      >
+                        <span className="material-symbols-outlined text-[16px]">close</span>
+                      </button>
+                    </div>
+                  )}
+                  <p className="text-xs text-text-muted">{ngrokUrlNotice}</p>
+                  {ngrokStatus?.phase === "needs_auth" && (
+                    <div className="flex flex-col gap-1">
+                      <label className="text-xs text-text-muted">
+                        {translateOrFallback(
+                          "ngrokAuthTokenLabel",
+                          "Authtoken (Required if NGROK_AUTHTOKEN not set in environment)"
+                        )}
+                      </label>
+                      <Input
+                        type="password"
+                        value={ngrokToken}
+                        onChange={(event) => setNgrokToken(event.target.value)}
+                        placeholder={translateOrFallback(
+                          "ngrokAuthTokenPlaceholder",
+                          "Enter your ngrok authtoken"
+                        )}
+                        disabled={ngrokBusy}
+                        className="font-mono text-sm"
+                      />
+                    </div>
+                  )}
+                  {ngrokStatus?.lastError && (
+                    <p className="text-xs text-red-400">
+                      {translateOrFallback("ngrokLastError", "Last error: {error}", {
+                        error: ngrokStatus.lastError,
+                      })}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </Card>
 
       <Card>
-        <div className="flex flex-wrap gap-3 items-center justify-between">
+        <div className="flex items-center justify-between mb-5">
           <div>
-            <h2 className="text-lg font-semibold">{t("sectionTitle") || "Integration Surface"}</h2>
+            <h2 className="text-lg font-semibold">{t("available")}</h2>
             <p className="text-sm text-text-muted">
-              {t("sectionDescription") ||
-                "OpenAI-compatible APIs and operational protocol endpoints"}
+              {modelsLoading
+                ? translateOrFallback("loadingModels", "Loading available models...")
+                : t("modelsAcrossEndpoints", {
+                    models: totalEndpointModelCount,
+                    endpoints: availableEndpointCount,
+                  })}
             </p>
           </div>
-          <SegmentedControl
-            options={[
-              { value: "api", label: t("tabApis") || "OpenAI-compatible APIs", icon: "api" },
-              { value: "protocols", label: t("tabProtocols") || "Protocols", icon: "hub" },
-            ]}
-            value={viewTab}
-            onChange={setViewTab}
-            aria-label={t("tabsAria") || "Endpoint sections"}
-          />
         </div>
-      </Card>
 
-      {viewTab === "api" ? (
-        <Card>
-          <div className="flex items-center justify-between mb-4">
-            <div>
-              <h2 className="text-lg font-semibold">{t("available")}</h2>
-              <p className="text-sm text-text-muted">
-                {t("modelsAcrossEndpoints", {
-                  models: Object.values(endpointData).reduce(
-                    (acc, models) => acc + models.length,
-                    0
-                  ),
-                  endpoints:
-                    [
-                      endpointData.chat,
-                      endpointData.embeddings,
-                      endpointData.images,
-                      endpointData.video,
-                      endpointData.rerank,
-                      endpointData.audioTranscription,
-                      endpointData.audioSpeech,
-                      endpointData.moderation,
-                      endpointData.music,
-                    ].filter((a) => a.length > 0).length + 2,
-                })}
-              </p>
-            </div>
+        {/* Core APIs */}
+        <div className="mb-5">
+          <div className="flex items-center gap-2 mb-3">
+            <span className="material-symbols-outlined text-sm text-primary">hub</span>
+            <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">
+              {t("categoryCore") || "Core APIs"}
+            </h3>
+            <div className="flex-1 h-px bg-border/50" />
           </div>
+          <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2">
+            <EndpointCard
+              icon="chat"
+              iconColor="text-blue-500"
+              iconBg="bg-blue-500/10"
+              title={t("chatCompletions")}
+              path="/v1/chat/completions"
+              models={endpointData.chat}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="code"
+              iconColor="text-indigo-500"
+              iconBg="bg-indigo-500/10"
+              title={t("responses") || "Responses API"}
+              path="/v1/responses"
+              models={endpointData.chat}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="text_fields"
+              iconColor="text-orange-500"
+              iconBg="bg-orange-500/10"
+              title={t("completionsLegacy") || "Completions (Legacy)"}
+              path="/v1/completions"
+              models={endpointData.chat}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="psychology"
+              iconColor="text-violet-500"
+              iconBg="bg-violet-500/10"
+              title={t("messagesApi") || "Messages"}
+              path="/v1/messages"
+              models={null}
+              badge="Anthropic"
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+            />
+          </div>
+        </div>
 
-          {/* Core APIs */}
-          <div className="mb-6">
+        {/* Media & Multi-Modal */}
+        <div className="mb-5">
+          <div className="flex items-center gap-2 mb-3">
+            <span className="material-symbols-outlined text-sm text-purple-400">perm_media</span>
+            <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">
+              {t("categoryMedia") || "Media & Multi-Modal"}
+            </h3>
+            <div className="flex-1 h-px bg-border/50" />
+          </div>
+          <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2">
+            <EndpointCard
+              icon="data_array"
+              iconColor="text-emerald-500"
+              iconBg="bg-emerald-500/10"
+              title={t("embeddings")}
+              path="/v1/embeddings"
+              models={endpointData.embeddings}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="image"
+              iconColor="text-purple-500"
+              iconBg="bg-purple-500/10"
+              title={t("imageGeneration")}
+              path="/v1/images/generations"
+              models={endpointData.images}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="edit_square"
+              iconColor="text-violet-500"
+              iconBg="bg-violet-500/10"
+              title={t("imageEdits") || "Image Edits"}
+              path="/v1/images/edits"
+              models={endpointData.images}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="mic"
+              iconColor="text-rose-500"
+              iconBg="bg-rose-500/10"
+              title={t("audioTranscription")}
+              path="/v1/audio/transcriptions"
+              models={endpointData.audioTranscription}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="record_voice_over"
+              iconColor="text-cyan-500"
+              iconBg="bg-cyan-500/10"
+              title={t("textToSpeech")}
+              path="/v1/audio/speech"
+              models={endpointData.audioSpeech}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="music_note"
+              iconColor="text-fuchsia-500"
+              iconBg="bg-fuchsia-500/10"
+              title={t("musicGeneration") || "Music Generation"}
+              path="/v1/music/generations"
+              models={endpointData.music}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="videocam"
+              iconColor="text-red-500"
+              iconBg="bg-red-500/10"
+              title={t("videoGeneration") || "Video Generation"}
+              path="/v1/videos/generations"
+              models={endpointData.video}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+          </div>
+        </div>
+
+        {/* Search & Discovery */}
+        {searchProviders.length > 0 && (
+          <div className="mb-5">
             <div className="flex items-center gap-2 mb-3">
-              <span className="material-symbols-outlined text-sm text-primary">hub</span>
+              <span className="material-symbols-outlined text-sm text-cyan-400">
+                travel_explore
+              </span>
               <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">
-                {t("categoryCore") || "Core APIs"}
+                {t("categorySearch") || "Search & Discovery"}
               </h3>
               <div className="flex-1 h-px bg-border/50" />
             </div>
-            <div className="flex flex-col gap-3">
-              {/* Chat Completions */}
-              <EndpointSection
-                icon="chat"
-                iconColor="text-blue-500"
-                iconBg="bg-blue-500/10"
-                title={t("chatCompletions")}
-                path="/v1/chat/completions"
-                description={t("chatDesc")}
-                models={endpointData.chat}
-                expanded={expandedEndpoint === "chat"}
-                onToggle={() => setExpandedEndpoint(expandedEndpoint === "chat" ? null : "chat")}
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-
-              {/* Responses API */}
-              <EndpointSection
-                icon="code"
-                iconColor="text-indigo-500"
-                iconBg="bg-indigo-500/10"
-                title={t("responses") || "Responses API"}
-                path="/v1/responses"
-                description={
-                  t("responsesDesc") ||
-                  "OpenAI Responses API for Codex and advanced agentic workflows"
-                }
-                models={endpointData.chat}
-                expanded={expandedEndpoint === "responses"}
-                onToggle={() =>
-                  setExpandedEndpoint(expandedEndpoint === "responses" ? null : "responses")
-                }
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-
-              {/* Legacy Completions */}
-              <EndpointSection
-                icon="text_fields"
-                iconColor="text-orange-500"
-                iconBg="bg-orange-500/10"
-                title={t("completionsLegacy") || "Completions (Legacy)"}
-                path="/v1/completions"
-                description={
-                  t("completionsLegacyDesc") ||
-                  "Legacy OpenAI text completions — accepts both prompt and messages format"
-                }
-                models={endpointData.chat}
-                expanded={expandedEndpoint === "completions"}
-                onToggle={() =>
-                  setExpandedEndpoint(expandedEndpoint === "completions" ? null : "completions")
-                }
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-            </div>
-          </div>
-
-          {/* Media & Multi-Modal */}
-          <div className="mb-6">
-            <div className="flex items-center gap-2 mb-3">
-              <span className="material-symbols-outlined text-sm text-purple-400">perm_media</span>
-              <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">
-                {t("categoryMedia") || "Media & Multi-Modal"}
-              </h3>
-              <div className="flex-1 h-px bg-border/50" />
-            </div>
-            <div className="flex flex-col gap-3">
-              {/* Embeddings */}
-              <EndpointSection
-                icon="data_array"
-                iconColor="text-emerald-500"
-                iconBg="bg-emerald-500/10"
-                title={t("embeddings")}
-                path="/v1/embeddings"
-                description={t("embeddingsDesc")}
-                models={endpointData.embeddings}
-                expanded={expandedEndpoint === "embeddings"}
-                onToggle={() =>
-                  setExpandedEndpoint(expandedEndpoint === "embeddings" ? null : "embeddings")
-                }
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-
-              {/* Image Generation */}
-              <EndpointSection
-                icon="image"
-                iconColor="text-purple-500"
-                iconBg="bg-purple-500/10"
-                title={t("imageGeneration")}
-                path="/v1/images/generations"
-                description={t("imageDesc")}
-                models={endpointData.images}
-                expanded={expandedEndpoint === "images"}
-                onToggle={() =>
-                  setExpandedEndpoint(expandedEndpoint === "images" ? null : "images")
-                }
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-
-              {/* Audio Transcription */}
-              <EndpointSection
-                icon="mic"
-                iconColor="text-rose-500"
-                iconBg="bg-rose-500/10"
-                title={t("audioTranscription")}
-                path="/v1/audio/transcriptions"
-                description={t("audioTranscriptionDesc")}
-                models={endpointData.audioTranscription}
-                expanded={expandedEndpoint === "audioTranscription"}
-                onToggle={() =>
-                  setExpandedEndpoint(
-                    expandedEndpoint === "audioTranscription" ? null : "audioTranscription"
-                  )
-                }
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-
-              {/* Audio Speech (TTS) */}
-              <EndpointSection
-                icon="record_voice_over"
+            <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2">
+              <EndpointCard
+                icon="search"
                 iconColor="text-cyan-500"
                 iconBg="bg-cyan-500/10"
-                title={t("textToSpeech")}
-                path="/v1/audio/speech"
-                description={t("textToSpeechDesc")}
-                models={endpointData.audioSpeech}
-                expanded={expandedEndpoint === "audioSpeech"}
-                onToggle={() =>
-                  setExpandedEndpoint(expandedEndpoint === "audioSpeech" ? null : "audioSpeech")
-                }
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-
-              {/* Music Generation */}
-              <EndpointSection
-                icon="music_note"
-                iconColor="text-fuchsia-500"
-                iconBg="bg-fuchsia-500/10"
-                title={t("musicGeneration") || "Music Generation"}
-                path="/v1/music/generations"
-                description={
-                  t("musicDesc") ||
-                  "Generate music and audio tracks via ComfyUI (Stable Audio, MusicGen)"
-                }
-                models={endpointData.music}
-                expanded={expandedEndpoint === "music"}
-                onToggle={() => setExpandedEndpoint(expandedEndpoint === "music" ? null : "music")}
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-
-              {/* Video Generation */}
-              <EndpointSection
-                icon="videocam"
-                iconColor="text-red-500"
-                iconBg="bg-red-500/10"
-                title={t("videoGeneration") || "Video Generation"}
-                path="/v1/videos/generations"
-                description={
-                  t("videoDesc") ||
-                  "Generate videos via ComfyUI, Stable Diffusion WebUI, and compatible providers"
-                }
-                models={endpointData.video}
-                expanded={expandedEndpoint === "video"}
-                onToggle={() => setExpandedEndpoint(expandedEndpoint === "video" ? null : "video")}
+                title={t("webSearch") || "Web Search"}
+                path="/v1/search"
+                models={searchProviders.map((p) => ({ id: p.id, owned_by: p.id, type: "search" }))}
                 copy={copy}
                 copied={copied}
                 baseUrl={currentEndpoint}
               />
             </div>
           </div>
+        )}
 
-          {/* Search & Discovery */}
-          {searchProviders.length > 0 && (
-            <div className="mb-6">
-              <div className="flex items-center gap-2 mb-3">
-                <span className="material-symbols-outlined text-sm text-cyan-400">
-                  travel_explore
-                </span>
-                <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">
-                  {t("categorySearch") || "Search & Discovery"}
-                </h3>
-                <div className="flex-1 h-px bg-border/50" />
-              </div>
-              <div className="flex flex-col gap-3">
-                <EndpointSection
-                  icon="search"
-                  iconColor="text-cyan-500"
-                  iconBg="bg-cyan-500/10"
-                  title={t("webSearch") || "Web Search"}
-                  path="/v1/search"
-                  description={
-                    t("webSearchDesc") ||
-                    "Unified web search across multiple providers with automatic failover and caching"
-                  }
-                  models={searchProviders.map((p) => ({
-                    id: p.id,
-                    name: p.name,
-                    owned_by: p.id,
-                    type: "search",
-                  }))}
-                  expanded={expandedEndpoint === "search"}
-                  onToggle={() =>
-                    setExpandedEndpoint(expandedEndpoint === "search" ? null : "search")
-                  }
-                  copy={copy}
-                  copied={copied}
-                  baseUrl={currentEndpoint}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Utility & Management */}
-          <div>
-            <div className="flex items-center gap-2 mb-3">
-              <span className="material-symbols-outlined text-sm text-amber-400">build</span>
-              <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">
-                {t("categoryUtility") || "Utility & Management"}
-              </h3>
-              <div className="flex-1 h-px bg-border/50" />
-            </div>
-            <div className="flex flex-col gap-3">
-              {/* Rerank */}
-              <EndpointSection
-                icon="sort"
-                iconColor="text-amber-500"
-                iconBg="bg-amber-500/10"
-                title={t("rerank")}
-                path="/v1/rerank"
-                description={t("rerankDesc")}
-                models={endpointData.rerank}
-                expanded={expandedEndpoint === "rerank"}
-                onToggle={() =>
-                  setExpandedEndpoint(expandedEndpoint === "rerank" ? null : "rerank")
-                }
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-
-              {/* Moderations */}
-              <EndpointSection
-                icon="shield"
-                iconColor="text-orange-500"
-                iconBg="bg-orange-500/10"
-                title={t("moderations")}
-                path="/v1/moderations"
-                description={t("moderationsDesc")}
-                models={endpointData.moderation}
-                expanded={expandedEndpoint === "moderation"}
-                onToggle={() =>
-                  setExpandedEndpoint(expandedEndpoint === "moderation" ? null : "moderation")
-                }
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-
-              {/* List Models */}
-              <EndpointSection
-                icon="list"
-                iconColor="text-teal-500"
-                iconBg="bg-teal-500/10"
-                title={t("listModels") || "List Models"}
-                path="/v1/models"
-                description={
-                  t("listModelsDesc") || "List all available models across all connected providers"
-                }
-                models={[]}
-                expanded={expandedEndpoint === "models"}
-                onToggle={() =>
-                  setExpandedEndpoint(expandedEndpoint === "models" ? null : "models")
-                }
-                copy={copy}
-                copied={copied}
-                baseUrl={currentEndpoint}
-              />
-            </div>
+        {/* Utility & Management */}
+        <div>
+          <div className="flex items-center gap-2 mb-3">
+            <span className="material-symbols-outlined text-sm text-amber-400">build</span>
+            <h3 className="text-xs font-semibold text-text-muted uppercase tracking-wider">
+              {t("categoryUtility") || "Utility & Management"}
+            </h3>
+            <div className="flex-1 h-px bg-border/50" />
           </div>
-        </Card>
-      ) : (
-        <Card>
-          <div className="flex flex-col gap-6">
-            <div>
-              <h2 className="text-lg font-semibold">{t("protocolsTitle") || "Protocols"}</h2>
-              <p className="text-sm text-text-muted mt-1">
-                {t("protocolsDescription") ||
-                  "MCP and A2A are first-class endpoints with dedicated observability and controls."}
-              </p>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="rounded-xl border border-border p-4 bg-bg-subtle">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <h3 className="font-semibold flex items-center gap-2">
-                      <span className="material-symbols-outlined text-primary text-[18px]">
-                        hub
-                      </span>
-                      {t("mcpCardTitle") || "MCP Server"}
-                    </h3>
-                    <p className="text-xs text-text-muted mt-1">
-                      {t("mcpCardDescription") || "Model Context Protocol over stdio"}
-                    </p>
-                  </div>
-                  <span
-                    className={`text-xs px-2 py-1 rounded-full font-semibold ${
-                      mcpOnline ? "bg-green-500/15 text-green-500" : "bg-red-500/15 text-red-500"
-                    }`}
-                  >
-                    {mcpOnline ? tc("active") : tc("inactive")}
-                  </span>
-                </div>
-                <div className="mt-3 text-xs text-text-muted space-y-1">
-                  <p>
-                    {t("protocolToolsLabel") || "Tools"}:{" "}
-                    <span className="text-text-main font-semibold">{mcpToolCount || 29}</span>
-                  </p>
-                  <p>
-                    {t("protocolLastActivity") || "Last activity"}:{" "}
-                    <span className="text-text-main">
-                      {mcpStatus?.activity?.lastCallAt
-                        ? new Date(mcpStatus.activity.lastCallAt).toLocaleString()
-                        : "—"}
-                    </span>
-                  </p>
-                </div>
-                <div className="mt-3 rounded-lg bg-bg p-3 border border-border/70">
-                  <p className="text-xs font-semibold mb-1">{t("quickStart") || "Quick Start"}</p>
-                  <code className="text-xs font-mono break-all">omniroute --mcp</code>
-                </div>
-                <div className="mt-3">
-                  <Link
-                    href="/dashboard/mcp"
-                    className="text-sm text-primary hover:text-primary-hover transition-colors"
-                  >
-                    {t("openMcpDashboard") || "Open MCP management"} →
-                  </Link>
-                </div>
-              </div>
-
-              <div className="rounded-xl border border-border p-4 bg-bg-subtle">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <h3 className="font-semibold flex items-center gap-2">
-                      <span className="material-symbols-outlined text-primary text-[18px]">
-                        group_work
-                      </span>
-                      {t("a2aCardTitle") || "A2A Server"}
-                    </h3>
-                    <p className="text-xs text-text-muted mt-1">
-                      {t("a2aCardDescription") || "Agent2Agent JSON-RPC endpoint"}
-                    </p>
-                  </div>
-                  <span
-                    className={`text-xs px-2 py-1 rounded-full font-semibold ${
-                      a2aOnline ? "bg-green-500/15 text-green-500" : "bg-red-500/15 text-red-500"
-                    }`}
-                  >
-                    {a2aOnline ? tc("active") : tc("inactive")}
-                  </span>
-                </div>
-                <div className="mt-3 text-xs text-text-muted space-y-1">
-                  <p>
-                    {t("protocolTasksLabel") || "Tasks"}:{" "}
-                    <span className="text-text-main font-semibold">
-                      {a2aStatus?.tasks?.total || 0}
-                    </span>
-                  </p>
-                  <p>
-                    {t("protocolActiveStreamsLabel") || "Active streams"}:{" "}
-                    <span className="text-text-main font-semibold">{a2aActiveStreams}</span>
-                  </p>
-                </div>
-                <div className="mt-3 rounded-lg bg-bg p-3 border border-border/70">
-                  <p className="text-xs font-semibold mb-1">{t("quickStart") || "Quick Start"}</p>
-                  <code className="text-xs font-mono break-all">
-                    {baseUrl.replace(/\/v1$/, "")}/a2a
-                  </code>
-                </div>
-                <div className="mt-3">
-                  <Link
-                    href="/dashboard/a2a"
-                    className="text-sm text-primary hover:text-primary-hover transition-colors"
-                  >
-                    {t("openA2aDashboard") || "Open A2A management"} →
-                  </Link>
-                </div>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <div className="rounded-xl border border-border p-4 bg-bg-subtle">
-                <h4 className="font-semibold mb-2">
-                  {t("mcpQuickStartTitle") || "MCP Quick Start"}
-                </h4>
-                <ol className="text-sm text-text-muted space-y-1 list-decimal list-inside">
-                  <li>{t("mcpQuickStartStep1") || "Run the MCP server via `omniroute --mcp`."}</li>
-                  <li>
-                    {t("mcpQuickStartStep2") ||
-                      "Configure your MCP client to connect over stdio transport."}
-                  </li>
-                  <li>
-                    {t("mcpQuickStartStep3") ||
-                      "Invoke tools such as `omniroute_get_health` and `omniroute_list_combos`."}
-                  </li>
-                </ol>
-              </div>
-              <div className="rounded-xl border border-border p-4 bg-bg-subtle">
-                <h4 className="font-semibold mb-2">
-                  {t("a2aQuickStartTitle") || "A2A Quick Start"}
-                </h4>
-                <ol className="text-sm text-text-muted space-y-1 list-decimal list-inside">
-                  <li>
-                    {t("a2aQuickStartStep1") ||
-                      "Discover the agent card at `/.well-known/agent.json`."}
-                  </li>
-                  <li>
-                    {t("a2aQuickStartStep2") ||
-                      "Send JSON-RPC requests to `POST /a2a` using `message/send` or `message/stream`."}
-                  </li>
-                  <li>
-                    {t("a2aQuickStartStep3") ||
-                      "Track and control tasks using `tasks/get` and `tasks/cancel`."}
-                  </li>
-                </ol>
-              </div>
-            </div>
+          <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2">
+            <EndpointCard
+              icon="sort"
+              iconColor="text-amber-500"
+              iconBg="bg-amber-500/10"
+              title={t("rerank")}
+              path="/v1/rerank"
+              models={endpointData.rerank}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="shield"
+              iconColor="text-orange-500"
+              iconBg="bg-orange-500/10"
+              title={t("moderations")}
+              path="/v1/moderations"
+              models={endpointData.moderation}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+              modelsLoading={modelsLoading}
+            />
+            <EndpointCard
+              icon="view_list"
+              iconColor="text-teal-500"
+              iconBg="bg-teal-500/10"
+              title={t("batchApi") || "Batch API"}
+              path="/v1/batches"
+              models={null}
+              badge="OpenAI"
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+            />
+            <EndpointCard
+              icon="folder"
+              iconColor="text-yellow-500"
+              iconBg="bg-yellow-500/10"
+              title={t("filesApi") || "Files API"}
+              path="/v1/files"
+              models={null}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+            />
+            <EndpointCard
+              icon="list"
+              iconColor="text-teal-500"
+              iconBg="bg-teal-500/10"
+              title={t("listModels") || "List Models"}
+              path="/v1/models"
+              models={null}
+              copy={copy}
+              copied={copied}
+              baseUrl={currentEndpoint}
+            />
           </div>
-        </Card>
-      )}
+
+          <VscodeTokenAliasCard className="mt-4" />
+        </div>
+      </Card>
 
       {/* Cloud Enable Modal */}
       <Modal
@@ -1963,13 +2264,21 @@ export default function APIPageClient({ machineId }) {
   );
 }
 
-APIPageClient.propTypes = {
-  machineId: PropTypes.string.isRequired,
-};
-
 // -- Sub-component: Provider Models Modal ------------------------------------------
 
-function ProviderModelsModal({ provider, models, copy, copied, onClose }) {
+function ProviderModelsModal({
+  provider,
+  models,
+  copy,
+  copied,
+  onClose,
+}: Readonly<{
+  provider: EndpointProviderSummary;
+  models: EndpointModelSummary[];
+  copy: CopyHandler;
+  copied?: string | null;
+  onClose: () => void;
+}>) {
   const t = useTranslations("endpoint");
   const tc = useTranslations("common");
   // Get provider alias for matching models
@@ -2045,15 +2354,78 @@ function ProviderModelsModal({ provider, models, copy, copied, onClose }) {
   );
 }
 
-ProviderModelsModal.propTypes = {
-  provider: PropTypes.object.isRequired,
-  models: PropTypes.array.isRequired,
-  copy: PropTypes.func.isRequired,
-  copied: PropTypes.string,
-  onClose: PropTypes.func.isRequired,
-};
-
 // -- Sub-component: Endpoint Section ------------------------------------------
+
+function EndpointCard({
+  icon,
+  iconColor,
+  iconBg,
+  title,
+  path,
+  models,
+  copy,
+  copied,
+  baseUrl,
+  badge,
+  modelsLoading = false,
+}: Readonly<{
+  icon: string;
+  iconColor: string;
+  iconBg: string;
+  title: string;
+  path: string;
+  models: EndpointModelSummary[] | null;
+  copy: CopyHandler;
+  copied?: string | null;
+  baseUrl: string;
+  badge?: string;
+  modelsLoading?: boolean;
+}>) {
+  const t = useTranslations("endpoint");
+  const copyId = `endpoint_${path}`;
+  const fullUrl = `${baseUrl.replace(/\/v1$/, "")}${path}`;
+
+  return (
+    <div className="border border-border rounded-lg p-3 hover:bg-surface/30 transition-colors flex flex-col gap-2">
+      <div className="flex items-start gap-2.5">
+        <div className={`flex items-center justify-center size-8 rounded-lg ${iconBg} shrink-0`}>
+          <span className={`material-symbols-outlined text-base ${iconColor}`}>{icon}</span>
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="font-semibold text-xs leading-tight">{title}</span>
+            {badge && (
+              <span className="text-[9px] px-1.5 py-0.5 rounded-full border border-border/60 text-text-muted font-medium uppercase tracking-wider leading-none">
+                {badge}
+              </span>
+            )}
+          </div>
+          <span className="text-xs text-text-muted mt-0.5 block">
+            {models === null
+              ? "—"
+              : modelsLoading
+                ? "..."
+                : t("modelsCount", { count: models.length })}
+          </span>
+        </div>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <code className="flex-1 text-[10px] font-mono text-text-muted bg-surface/80 px-2 py-1 rounded truncate">
+          {path}
+        </code>
+        <button
+          onClick={() => void copy(fullUrl, copyId)}
+          className="shrink-0 flex items-center justify-center size-6 rounded hover:bg-sidebar transition-colors"
+          title={t("copyUrl")}
+        >
+          <span className="material-symbols-outlined text-[12px] text-text-muted">
+            {copied === copyId ? "check" : "content_copy"}
+          </span>
+        </button>
+      </div>
+    </div>
+  );
+}
 
 function EndpointSection({
   icon,
@@ -2068,7 +2440,22 @@ function EndpointSection({
   copy,
   copied,
   baseUrl,
-}) {
+  modelsLoading = false,
+}: Readonly<{
+  icon: string;
+  iconColor: string;
+  iconBg: string;
+  title: string;
+  path: string;
+  description: string;
+  models: EndpointModelSummary[];
+  expanded: boolean;
+  onToggle: () => void;
+  copy: CopyHandler;
+  copied?: string | null;
+  baseUrl: string;
+  modelsLoading?: boolean;
+}>) {
   const t = useTranslations("endpoint");
   const grouped = useMemo(() => {
     const map = {};
@@ -2077,14 +2464,12 @@ function EndpointSection({
       if (!map[owner]) map[owner] = [];
       map[owner].push(m);
     }
-    return Object.entries(map).sort(
-      (a: any, b: any) => (b[1] as any).length - (a[1] as any).length
-    );
+    return Object.entries(map).sort((a: any, b: any) => b[1].length - a[1].length);
   }, [models]);
 
   const resolveProvider = (id) => AI_PROVIDERS[id] || getProviderByAlias(id);
   const providerColor = (id) => resolveProvider(id)?.color || "#888";
-  const providerName = (id) => resolveProvider(id)?.name || id;
+  const providerName = (id) => getProviderDisplayName(id, resolveProvider(id));
   const copyId = `endpoint_${path}`;
 
   return (
@@ -2101,7 +2486,7 @@ function EndpointSection({
           <div className="flex items-center gap-2">
             <span className="font-semibold text-sm">{title}</span>
             <span className="text-xs px-2 py-0.5 rounded-full bg-surface text-text-muted font-medium">
-              {t("modelsCount", { count: models.length })}
+              {modelsLoading ? "..." : t("modelsCount", { count: models.length })}
             </span>
           </div>
           <p className="text-xs text-text-muted mt-0.5">{description}</p>
@@ -2133,52 +2518,46 @@ function EndpointSection({
           </div>
 
           {/* Models grouped by provider */}
-          <div className="flex flex-col gap-2">
-            {grouped.map(([providerId, providerModels]) => (
-              <div key={providerId}>
-                <div className="flex items-center gap-2 mb-1">
-                  <div
-                    className="size-2.5 rounded-full shrink-0"
-                    style={{ backgroundColor: providerColor(providerId) }}
-                  />
-                  <span className="text-xs font-semibold text-text-main">
-                    {providerName(providerId)}
-                  </span>
-                  <span className="text-xs text-text-muted">
-                    ({(providerModels as any).length})
-                  </span>
-                </div>
-                <div className="ml-5 flex flex-wrap gap-1.5">
-                  {(providerModels as any).map((m) => (
-                    <span
-                      key={m.id}
-                      className="text-xs px-2 py-0.5 rounded-md bg-surface/80 text-text-muted font-mono"
-                      title={m.id}
-                    >
-                      {m.root || m.id.split("/").pop()}
+          {modelsLoading ? (
+            <div className="flex items-center gap-2 rounded-lg border border-border/70 bg-surface/40 px-3 py-2 text-xs text-text-muted">
+              <span className="material-symbols-outlined animate-spin text-sm">
+                progress_activity
+              </span>
+              <span>{t("loadingModels")}</span>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {grouped.map(([providerId, providerModels]) => (
+                <div key={providerId}>
+                  <div className="flex items-center gap-2 mb-1">
+                    <div
+                      className="size-2.5 rounded-full shrink-0"
+                      style={{ backgroundColor: providerColor(providerId) }}
+                    />
+                    <span className="text-xs font-semibold text-text-main">
+                      {providerName(providerId)}
                     </span>
-                  ))}
+                    <span className="text-xs text-text-muted">
+                      ({(providerModels as any).length})
+                    </span>
+                  </div>
+                  <div className="ml-5 flex flex-wrap gap-1.5">
+                    {(providerModels as any).map((m) => (
+                      <span
+                        key={m.id}
+                        className="text-xs px-2 py-0.5 rounded-md bg-surface/80 text-text-muted font-mono"
+                        title={m.id}
+                      >
+                        {m.root || m.id.split("/").pop()}
+                      </span>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 }
-
-EndpointSection.propTypes = {
-  icon: PropTypes.string.isRequired,
-  iconColor: PropTypes.string.isRequired,
-  iconBg: PropTypes.string.isRequired,
-  title: PropTypes.string.isRequired,
-  path: PropTypes.string.isRequired,
-  description: PropTypes.string.isRequired,
-  models: PropTypes.array.isRequired,
-  expanded: PropTypes.bool.isRequired,
-  onToggle: PropTypes.func.isRequired,
-  copy: PropTypes.func.isRequired,
-  copied: PropTypes.string,
-  baseUrl: PropTypes.string.isRequired,
-};

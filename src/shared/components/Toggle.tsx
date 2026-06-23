@@ -8,9 +8,10 @@ interface ToggleProps {
   label?: string;
   description?: string;
   disabled?: boolean;
-  size?: "sm" | "md" | "lg";
+  size?: "xs" | "sm" | "md" | "lg";
   className?: string;
   title?: string;
+  ariaLabel?: string;
 }
 
 export default function Toggle({
@@ -21,8 +22,15 @@ export default function Toggle({
   disabled = false,
   size = "md",
   className,
+  title,
+  ariaLabel,
 }: ToggleProps) {
   const sizes = {
+    xs: {
+      track: "w-6 h-3",
+      thumb: "size-[8px]",
+      translate: "translate-x-3.5",
+    },
     sm: {
       track: "w-8 h-4",
       thumb: "size-3",
@@ -58,14 +66,16 @@ export default function Toggle({
         type="button"
         role="switch"
         aria-checked={checked}
-        aria-label={!label ? description || "Toggle" : undefined}
+        aria-label={ariaLabel || label || description || title || "Toggle"}
+        title={title}
         disabled={disabled}
         onClick={handleClick}
         className={cn(
           "relative inline-flex shrink-0 cursor-pointer rounded-full",
           "transition-colors duration-200 ease-in-out",
-          "focus:outline-none focus:ring-1 focus:ring-primary/30",
-          checked ? "bg-primary" : "bg-black/10 dark:bg-white/20",
+          "border shadow-inner",
+          "focus:outline-none focus:ring-1 focus:ring-accent/30",
+          checked ? "border-primary bg-primary" : "border-border bg-surface-2 dark:bg-white/20",
           sizes[size].track,
           disabled && "cursor-not-allowed"
         )}

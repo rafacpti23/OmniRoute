@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 const { handleAudioSpeech } = await import("../../open-sse/handlers/audioSpeech.ts");
+const { AUDIO_SPEECH_PROVIDERS } = await import("../../open-sse/config/audioRegistry.ts");
 
 test("handleAudioSpeech requires model", async () => {
   const response = await handleAudioSpeech({
@@ -62,7 +63,7 @@ test("handleAudioSpeech proxies OpenAI-compatible providers with defaults", asyn
     });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("content-type"), "audio/opus");
-    assert.ok(response.headers.get("access-control-allow-origin"));
+    assert.match(response.headers.get("access-control-allow-methods") || "", /OPTIONS/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -267,6 +268,74 @@ test("handleAudioSpeech signs AWS Polly synthesize requests with SigV4", async (
   }
 });
 
+test("handleAudioSpeech maps Xiaomi MiMo TTS to chat completions audio payload", async () => {
+  const originalFetch = globalThis.fetch;
+  let captured;
+
+  globalThis.fetch = async (url, options = {}) => {
+    captured = {
+      url: String(url),
+      headers: options.headers,
+      body: JSON.parse(String(options.body || "{}")),
+    };
+
+    return new Response(
+      JSON.stringify({
+        choices: [{ message: { audio: { data: "AQID" } } }],
+      }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }
+    );
+  };
+
+  try {
+    const response = await handleAudioSpeech({
+      body: {
+        model: "xiaomi-mimo/mimo-v2.5-tts",
+        input: "mimo text",
+        voice: "default_zh",
+        response_format: "wav",
+      },
+      credentials: {
+        apiKey: "xm-key",
+        providerSpecificData: {
+          baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1",
+        },
+      },
+    });
+
+    assert.equal(captured.url, "https://token-plan-sgp.xiaomimimo.com/v1/chat/completions");
+    assert.equal(captured.headers.Authorization, "Bearer xm-key");
+    assert.deepEqual(captured.body, {
+      model: "mimo-v2.5-tts",
+      messages: [{ role: "assistant", content: "mimo text" }],
+      audio: { format: "audio/wav", voice: "default_zh" },
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "audio/wav");
+    assert.deepEqual(Array.from(new Uint8Array(await response.arrayBuffer())), [1, 2, 3]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleAudioSpeech rejects unsupported Xiaomi MiMo TTS audio formats", async () => {
+  const response = await handleAudioSpeech({
+    body: {
+      model: "xiaomi-mimo/mimo-v2.5-tts",
+      input: "mimo text",
+      response_format: "opus",
+    },
+    credentials: { apiKey: "xm-key" },
+  });
+  const payload = (await response.json()) as any;
+
+  assert.equal(response.status, 400);
+  assert.equal(payload.error.message, "Xiaomi MiMo TTS supports response_format mp3 or wav only");
+});
+
 test("handleAudioSpeech requires credentials for authenticated providers", async () => {
   const response = await handleAudioSpeech({
     body: {
@@ -418,7 +487,7 @@ test("handleAudioSpeech maps Inworld requests to basic auth and wav output", asy
   try {
     const response = await handleAudioSpeech({
       body: {
-        model: "inworld/inworld-tts-1.5-max",
+        model: "inworld/inworld-tts-2",
         input: "inworld text",
         voice: "voice-9",
         response_format: "wav",
@@ -430,11 +499,65 @@ test("handleAudioSpeech maps Inworld requests to basic auth and wav output", asy
     assert.deepEqual(captured.body, {
       text: "inworld text",
       voiceId: "voice-9",
-      modelId: "inworld-tts-1.5-max",
-      audioConfig: { audioEncoding: "LINEAR16" },
+      modelId: "inworld-tts-2",
+      audioConfig: { audioEncoding: "WAV" },
     });
     assert.equal(response.headers.get("content-type"), "audio/wav");
     assert.deepEqual(Array.from(new Uint8Array(await response.arrayBuffer())), [1, 2, 3, 4]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Inworld speech registry exposes supported formats without flac", () => {
+  assert.deepEqual(AUDIO_SPEECH_PROVIDERS.inworld.supportedFormats, ["mp3", "wav", "opus", "pcm"]);
+});
+
+test("handleAudioSpeech maps Inworld opus output and rejects flac", async () => {
+  const originalFetch = globalThis.fetch;
+  let captured;
+  let callCount = 0;
+
+  globalThis.fetch = async (_url, options = {}) => {
+    callCount += 1;
+    captured = JSON.parse(String(options.body || "{}"));
+
+    return new Response(JSON.stringify({ audioContent: "BQY=", contentType: "audio/opus" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const opusResponse = await handleAudioSpeech({
+      body: {
+        model: "inworld/inworld-tts-2",
+        input: "inworld text",
+        response_format: "opus",
+      },
+      credentials: { apiKey: "encoded-basic-token" },
+    });
+
+    assert.deepEqual(captured.audioConfig, { audioEncoding: "OPUS" });
+    assert.equal(opusResponse.headers.get("content-type"), "audio/opus");
+    assert.deepEqual(Array.from(new Uint8Array(await opusResponse.arrayBuffer())), [5, 6]);
+
+    const flacResponse = await handleAudioSpeech({
+      body: {
+        model: "inworld/inworld-tts-2",
+        input: "inworld text",
+        response_format: "flac",
+      },
+      credentials: { apiKey: "encoded-basic-token" },
+    });
+    const payload = (await flacResponse.json()) as any;
+
+    assert.equal(flacResponse.status, 400);
+    assert.equal(
+      payload.error.message,
+      "Inworld TTS supports response_format mp3, wav, opus, or pcm only"
+    );
+    assert.equal(callCount, 1);
   } finally {
     globalThis.fetch = originalFetch;
   }

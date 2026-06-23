@@ -14,23 +14,14 @@ import {
   getAutoUpdateConfig,
   launchAutoUpdate,
   validateAutoUpdateRuntime,
+  PROJECT_ROOT,
 } from "@/lib/system/autoUpdate";
+import { NEWS_JSON_URL, parseActiveNewsPayload } from "@/shared/utils/releaseNotes";
+import { isNewer, resolveLatestVersion } from "@/lib/system/versionCheck";
 
 const execFileAsync = promisify(execFile);
 
 export const dynamic = "force-dynamic";
-
-async function getLatestNpmVersion(): Promise<string | null> {
-  try {
-    const { stdout } = await execFileAsync("npm", ["info", "omniroute", "version", "--json"], {
-      timeout: 10000,
-    });
-    const parsed = JSON.parse(stdout.trim());
-    return typeof parsed === "string" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
 
 function getCurrentVersion(): string {
   try {
@@ -40,14 +31,15 @@ function getCurrentVersion(): string {
   }
 }
 
-function isNewer(a: string | null, b: string): boolean {
-  if (!a) return false;
-  const parse = (v: string) => v.split(".").map(Number);
-  const [aMaj, aMin, aPat] = parse(a);
-  const [bMaj, bMin, bPat] = parse(b);
-  if (aMaj !== bMaj) return aMaj > bMaj;
-  if (aMin !== bMin) return aMin > bMin;
-  return aPat > bPat;
+async function getNews() {
+  try {
+    const res = await fetch(NEWS_JSON_URL, { next: { revalidate: 3600 } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return parseActiveNewsPayload(data);
+  } catch {
+    return null;
+  }
 }
 
 export async function GET(req: NextRequest) {
@@ -56,10 +48,15 @@ export async function GET(req: NextRequest) {
   }
 
   const current = getCurrentVersion();
-  const latest = await getLatestNpmVersion();
-  const updateAvailable = isNewer(latest, current);
   const config = getAutoUpdateConfig();
-  const validation = await validateAutoUpdateRuntime(config);
+
+  const [latest, news, validation] = await Promise.all([
+    resolveLatestVersion(),
+    getNews(),
+    validateAutoUpdateRuntime(config),
+  ]);
+
+  const updateAvailable = isNewer(latest, current);
 
   return NextResponse.json({
     current,
@@ -68,6 +65,7 @@ export async function GET(req: NextRequest) {
     channel: config.mode,
     autoUpdateSupported: validation.supported,
     autoUpdateError: validation.reason,
+    news,
   });
 }
 
@@ -77,7 +75,7 @@ export async function POST(req: NextRequest) {
   }
 
   const current = getCurrentVersion();
-  const latest = await getLatestNpmVersion();
+  const latest = await resolveLatestVersion();
 
   if (!latest) {
     return NextResponse.json(
@@ -151,7 +149,7 @@ export async function POST(req: NextRequest) {
           });
           await execFileAsync("git", ["fetch", "--tags", config.gitRemote], {
             timeout: 60_000,
-            cwd: process.cwd(),
+            cwd: PROJECT_ROOT,
           });
           send({ step: "install", status: "done", message: "Tags fetched" });
 
@@ -160,7 +158,7 @@ export async function POST(req: NextRequest) {
             status: "running",
             message: `Validating ${resolvedTargetTag}...`,
           });
-          await ensureGitTagExists(resolvedTargetTag, execFileAsync, process.cwd());
+          await ensureGitTagExists(resolvedTargetTag, execFileAsync, PROJECT_ROOT);
           send({
             step: "install",
             status: "done",
@@ -175,7 +173,7 @@ export async function POST(req: NextRequest) {
           try {
             await execFileAsync("git", ["stash", "--include-untracked"], {
               timeout: 30_000,
-              cwd: process.cwd(),
+              cwd: PROJECT_ROOT,
             });
           } catch {
             // No local changes to stash.
@@ -184,7 +182,7 @@ export async function POST(req: NextRequest) {
           const shortHead = (
             await execFileAsync("git", ["rev-parse", "--short", "HEAD"], {
               timeout: 10_000,
-              cwd: process.cwd(),
+              cwd: PROJECT_ROOT,
             })
           ).stdout.trim();
           const backupBranch = `pre-update/${shortHead}-${new Date().toISOString().replace(/[:.]/g, "-")}`;
@@ -192,7 +190,7 @@ export async function POST(req: NextRequest) {
           try {
             await execFileAsync("git", ["branch", backupBranch], {
               timeout: 10_000,
-              cwd: process.cwd(),
+              cwd: PROJECT_ROOT,
             });
           } catch {
             // Backup branch is best-effort only.
@@ -200,7 +198,7 @@ export async function POST(req: NextRequest) {
 
           await execFileAsync("git", ["checkout", resolvedTargetTag], {
             timeout: 30_000,
-            cwd: process.cwd(),
+            cwd: PROJECT_ROOT,
           });
           send({ step: "install", status: "done", message: `Checked out ${resolvedTargetTag}` });
 
@@ -211,14 +209,14 @@ export async function POST(req: NextRequest) {
           });
           await execFileAsync("npm", ["install", "--legacy-peer-deps"], {
             timeout: 300_000,
-            cwd: process.cwd(),
+            cwd: PROJECT_ROOT,
           });
           send({ step: "rebuild", status: "done", message: "Dependencies installed" });
 
           try {
-            await execFileAsync("node", ["scripts/sync-env.mjs"], {
+            await execFileAsync("node", ["scripts/dev/sync-env.mjs"], {
               timeout: 15_000,
-              cwd: process.cwd(),
+              cwd: PROJECT_ROOT,
             });
           } catch {
             // .env sync is non-fatal during update.
@@ -231,7 +229,7 @@ export async function POST(req: NextRequest) {
           });
           await execFileAsync("npm", ["run", "build"], {
             timeout: 600_000,
-            cwd: process.cwd(),
+            cwd: PROJECT_ROOT,
           });
           send({ step: "rebuild", status: "done", message: "Build complete" });
 
@@ -239,7 +237,7 @@ export async function POST(req: NextRequest) {
           try {
             await execFileAsync("pm2", ["restart", "omniroute", "--update-env"], {
               timeout: 30_000,
-              cwd: process.cwd(),
+              cwd: PROJECT_ROOT,
             });
             send({ step: "restart", status: "done", message: "Service restarted" });
           } catch {
@@ -288,13 +286,14 @@ export async function POST(req: NextRequest) {
       try {
         // Step 1: Install
         send({ step: "install", status: "running", message: `Installing omniroute@${latest}...` });
-        await execFileAsync(
-          "npm",
-          ["install", "-g", `omniroute@${latest}`, "--ignore-scripts", "--legacy-peer-deps"],
-          {
-            timeout: 300000,
-          }
-        );
+          await execFileAsync(
+            "npm",
+            ["install", "-g", `omniroute@${latest}`, "--ignore-scripts", "--legacy-peer-deps"],
+            {
+              timeout: 300000,
+              cwd: PROJECT_ROOT,
+            }
+          );
         send({ step: "install", status: "done", message: `Installed omniroute@${latest}` });
 
         // Step 2: Rebuild native modules (critical for better-sqlite3)
@@ -303,29 +302,36 @@ export async function POST(req: NextRequest) {
           status: "running",
           message: "Rebuilding native modules (better-sqlite3)...",
         });
-        const globalRoot = (
-          await execFileAsync("npm", ["root", "-g"], { timeout: 10000 })
-        ).stdout.trim();
+          const globalRoot = (
+            await execFileAsync("npm", ["root", "-g"], { timeout: 10000, cwd: PROJECT_ROOT })
+          ).stdout.trim();
         const omniPath = `${globalRoot}/omniroute/app`;
-        await execFileAsync("npm", ["rebuild", "better-sqlite3"], {
-          cwd: omniPath,
-          timeout: 120000,
-        });
+        await execFileAsync(
+          "npm",
+          ["rebuild", "better-sqlite3"],
+          {
+            cwd: omniPath,
+            timeout: 120000,
+          }
+        );
         send({ step: "rebuild", status: "done", message: "Native modules rebuilt" });
 
         // Step 3: Restart PM2
         send({ step: "restart", status: "running", message: "Restarting service via PM2..." });
-        try {
-          await execFileAsync("pm2", ["restart", "omniroute", "--update-env"], { timeout: 30000 });
-          send({ step: "restart", status: "done", message: "Service restarted" });
-        } catch {
-          // PM2 may not be available (Docker/manual setups)
-          send({
-            step: "restart",
-            status: "skipped",
-            message: "PM2 not available — manual restart needed",
-          });
-        }
+          try {
+            await execFileAsync("pm2", ["restart", "omniroute", "--update-env"], {
+              timeout: 30000,
+              cwd: PROJECT_ROOT,
+            });
+            send({ step: "restart", status: "done", message: "Service restarted" });
+          } catch {
+            // PM2 may not be available (Docker/manual setups)
+            send({
+              step: "restart",
+              status: "skipped",
+              message: "PM2 not available — manual restart needed",
+            });
+          }
 
         send({
           step: "complete",

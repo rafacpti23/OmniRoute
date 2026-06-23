@@ -128,3 +128,103 @@ test("Claude Code compatible validation surfaces bridge connection failures", as
   assert.equal(result.valid, false);
   assert.match(result.error, /bridge failed/i);
 });
+
+// Regression for the non-string-input crash class surfaced by #2463
+// ("e.startsWith is not a function" during a connection test). A non-string
+// apiKey / modelsUrl must never throw a TypeError mid-validation — it should
+// return a clean { valid: boolean } result.
+
+test("#2463 snowflake validation does not throw on non-string apiKey", async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify({ data: [] }), { status: 200 });
+  const result = await validateProviderApiKey({
+    provider: "snowflake",
+    apiKey: 12345 as any, // simulates a corrupted / mis-typed credential
+    providerSpecificData: { baseUrl: "https://acct.snowflakecomputing.com" },
+  });
+  assert.equal(typeof result.valid, "boolean");
+});
+
+test("#2463 gemini validation does not throw on non-string apiKey", async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify({ data: [] }), { status: 200 });
+  const result = await validateProviderApiKey({
+    provider: "gemini",
+    apiKey: null as any,
+    providerSpecificData: {},
+  });
+  assert.equal(typeof result.valid, "boolean");
+});
+
+test("#2463 openai-compatible validation does not throw on non-string modelsUrl", async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify({ data: [] }), { status: 200 });
+  const result = await validateProviderApiKey({
+    provider: "openai-compatible-nonstring-modelsurl",
+    apiKey: "sk-test",
+    providerSpecificData: { baseUrl: "https://compat.example.com/v1", modelsUrl: 999 as any },
+  });
+  assert.equal(typeof result.valid, "boolean");
+});
+
+// Regression for #2545: the default Gemini (AI Studio) base URL ends in /v1beta/models,
+// so the validator must not append a second /models (which produced /models/models → 404).
+test("#2545 gemini validation does not produce /models/models", async () => {
+  const calls: string[] = [];
+  globalThis.fetch = async (url: any) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify({ models: [] }), { status: 200 });
+  };
+  const result = await validateProviderApiKey({
+    provider: "gemini",
+    apiKey: "AIzaTestKey",
+    providerSpecificData: {},
+  });
+  assert.equal(typeof result.valid, "boolean");
+  assert.ok(calls.length > 0, "validator must make a request");
+  assert.ok(
+    !calls.some((u) => u.includes("/models/models")),
+    `outbound URL must not contain /models/models — got ${calls.join(", ")}`
+  );
+  assert.ok(
+    calls.some((u) => /\/v1beta\/models(\?|$)/.test(u)),
+    `outbound URL must hit a single /models segment — got ${calls.join(", ")}`
+  );
+});
+
+test("qoder regular API key validates against dashscope, not the Cosy PAT endpoint (#3149)", async () => {
+  const calls: string[] = [];
+  globalThis.fetch = async (url: any, init: any) => {
+    calls.push(String(url));
+    const auth = new Headers(init?.headers as HeadersInit | undefined).get("authorization");
+    assert.equal(auth, "Bearer sk-qoder-regular", "dashscope probe must forward the API key");
+    return new Response(JSON.stringify({ data: [] }), { status: 200 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "qoder",
+    apiKey: "sk-qoder-regular",
+    providerSpecificData: {},
+  });
+
+  assert.equal(result.valid, true);
+  assert.ok(
+    calls.some((u) => u.includes("dashscope.aliyuncs.com/compatible-mode/v1/models")),
+    `regular qoder key must validate against dashscope — got ${calls.join(", ")}`
+  );
+  assert.ok(
+    !calls.some((u) => u.includes("api1.qoder.sh")),
+    "regular (non-PAT) key must not hit the Cosy PAT endpoint"
+  );
+});
+
+test("qoder regular API key surfaces an auth error when dashscope rejects it (#3149)", async () => {
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { message: "invalid api key" } }), { status: 401 });
+
+  const result = await validateProviderApiKey({
+    provider: "qoder",
+    apiKey: "sk-qoder-bad",
+    providerSpecificData: {},
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error, /Qoder|Dashscope|API key/i);
+});

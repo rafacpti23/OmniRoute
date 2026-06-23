@@ -1,6 +1,8 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
 import { CLAUDE_OAUTH_TOOL_PREFIX } from "../request/openai-to-claude.ts";
+import { hasToolCallShim, applyToolCallShimToBuffer } from "../helpers/toolCallShim.ts";
+import { appendToolCallArgumentDelta } from "../../utils/toolCallArguments.ts";
 
 // Helper: stop thinking block if started
 function stopThinkingBlock(state, results) {
@@ -157,17 +159,22 @@ export function openaiToClaudeResponse(chunk, state) {
         stopTextBlock(state, results);
 
         const toolBlockIndex = state.nextBlockIndex++;
-        state.toolCalls.set(idx, {
-          id: tc.id,
-          name: tc.function?.name || "",
-          blockIndex: toolBlockIndex,
-        });
 
         // Strip prefix from tool name for response
         let toolName = tc.function?.name || "";
         if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
           toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
         }
+
+        state.toolCalls.set(idx, {
+          id: tc.id,
+          name: toolName,
+          blockIndex: toolBlockIndex,
+          // Shimmed tools buffer their raw args and emit a single corrected
+          // input_json_delta at content_block_stop time (see finish handler).
+          shimmed: hasToolCallShim(toolName),
+          argBuffer: "",
+        });
 
         results.push({
           type: "content_block_start",
@@ -184,10 +191,31 @@ export function openaiToClaudeResponse(chunk, state) {
       if (tc.function?.arguments) {
         const toolInfo = state.toolCalls.get(idx);
         if (toolInfo) {
+          // Always buffer the raw stream so shimmed tools can re-emit a
+          // corrected JSON at stop time.
+          const existingArgs = toolInfo.argBuffer || "";
+          const nextArgs = appendToolCallArgumentDelta(existingArgs, tc.function.arguments);
+          let deltaStr = nextArgs.slice(existingArgs.length);
+          toolInfo.argBuffer = nextArgs;
+
+          if (toolInfo.shimmed || !deltaStr) {
+            // Suppress passthrough for shimmed tools; emit one corrective delta at finish.
+            continue;
+          }
+
+          // Fix #1852: Strip empty string and array placeholders from streaming tool arguments
+          if (deltaStr.includes('""') || deltaStr.includes("[]") || deltaStr.includes("[ ]")) {
+            deltaStr = deltaStr
+              .replace(/,"[a-zA-Z0-9_]+":""/g, "")
+              .replace(/"[a-zA-Z0-9_]+":"",/g, "")
+              .replace(/,"[a-zA-Z0-9_]+":\s*\[\s*\]/g, "")
+              .replace(/"[a-zA-Z0-9_]+":\s*\[\s*\],?/g, "");
+          }
+
           results.push({
             type: "content_block_delta",
             index: toolInfo.blockIndex,
-            delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+            delta: { type: "input_json_delta", partial_json: deltaStr },
           });
         }
       }
@@ -200,6 +228,17 @@ export function openaiToClaudeResponse(chunk, state) {
     stopTextBlock(state, results);
 
     for (const [, toolInfo] of state.toolCalls) {
+      // For shimmed tools, emit one corrective input_json_delta with the
+      // fully patched JSON before closing the block.
+      if (toolInfo.shimmed) {
+        const patched = applyToolCallShimToBuffer(toolInfo.name, toolInfo.argBuffer || "");
+        results.push({
+          type: "content_block_delta",
+          index: toolInfo.blockIndex,
+          delta: { type: "input_json_delta", partial_json: patched },
+        });
+      }
+
       results.push({
         type: "content_block_stop",
         index: toolInfo.blockIndex,

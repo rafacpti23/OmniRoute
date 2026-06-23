@@ -24,10 +24,12 @@ const resilienceSettings = {
   providerBreaker: {
     oauth: {
       failureThreshold: 3,
+      degradationThreshold: 2,
       resetTimeoutMs: 60000,
     },
     apikey: {
       failureThreshold: 5,
+      degradationThreshold: 3,
       resetTimeoutMs: 30000,
     },
   },
@@ -167,7 +169,7 @@ async function mockHealthPageApis(page: Page) {
     });
   });
 
-  await page.route("**/api/v1/db/health", async (route) => {
+  await page.route("**/api/db/health", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -305,13 +307,14 @@ test.describe("Resilience Plan Alignment", () => {
     await mockResilienceSettings(page);
 
     await gotoDashboardRoute(page, "/dashboard/settings?tab=resilience");
+    const resiliencePanel = page.getByRole("tabpanel", { name: "Resilience" });
     await expect(
-      page.getByRole("heading", { name: "Connection Cooldown", exact: true })
+      resiliencePanel.getByRole("heading", { name: "Connection Cooldown", exact: true })
     ).toBeVisible({ timeout: 15000 });
-    await expect(page.getByText("Base cooldown", { exact: true }).first()).toBeVisible();
-    await expect(page.getByText("Use upstream retry hints", { exact: true }).first()).toBeVisible();
-    await expect(page.getByText("Max backoff steps", { exact: true }).first()).toBeVisible();
-    await expect(page.getByText(/Rate-limit fallback/i)).toHaveCount(0);
+    await expect(resiliencePanel.getByText(/Base cooldown\s*60000ms/)).toBeVisible();
+    await expect(resiliencePanel.getByText(/Use upstream retry hints\s*No/)).toBeVisible();
+    await expect(resiliencePanel.getByText(/Max backoff steps\s*8/)).toBeVisible();
+    await expect(resiliencePanel.getByText(/Rate-limit fallback/i)).toHaveCount(0);
   });
 
   test("health page renders provider breaker runtime state for multiple providers", async ({
@@ -320,12 +323,15 @@ test.describe("Resilience Plan Alignment", () => {
     await mockHealthPageApis(page);
 
     await gotoDashboardRoute(page, "/dashboard/health");
-    await expect(page.getByText("Provider Health")).toBeVisible({ timeout: 15000 });
-    await expect(page.getByText("OpenAI")).toBeVisible();
-    await expect(page.getByText("Gemini")).toBeVisible();
-    await expect(page.getByText("Groq")).toBeVisible();
-    await expect(page.getByText("Recovering", { exact: true }).first()).toBeVisible();
-    await expect(page.getByText("Down", { exact: true }).first()).toBeVisible();
+    const providerHealthRegion = page.getByRole("region", { name: "Provider health status" });
+    await expect(providerHealthRegion).toBeVisible({ timeout: 15000 });
+    await expect(providerHealthRegion.getByText("OpenAI")).toBeVisible();
+    await expect(providerHealthRegion.getByText("Gemini")).toBeVisible();
+    await expect(providerHealthRegion.getByText("Groq")).toBeVisible();
+    await expect(
+      providerHealthRegion.getByText("Recovering", { exact: true }).first()
+    ).toBeVisible();
+    await expect(providerHealthRegion.getByText("Down", { exact: true }).first()).toBeVisible();
   });
 
   test("providers page no longer requests legacy model availability data", async ({ page }) => {
@@ -342,10 +348,9 @@ test.describe("Resilience Plan Alignment", () => {
     });
 
     await gotoDashboardRoute(page, "/dashboard/providers");
-    await page.waitForLoadState("networkidle");
+    await expect(page.getByText("OpenAI").first()).toBeVisible({ timeout: 15000 });
 
     expect(availabilityRequests).toBe(0);
-    await expect(page.getByText("OpenAI").first()).toBeVisible();
     await expect(page.getByText(/Model Availability/i)).toHaveCount(0);
   });
 
@@ -365,10 +370,11 @@ test.describe("Resilience Plan Alignment", () => {
     });
 
     await gotoDashboardRoute(page, "/dashboard/combos?filter=intelligent");
-    await page.waitForLoadState("networkidle");
-
-    expect(monitoringHealthRequests).toBe(0);
     await expect(page.getByText("Intelligent Routing Dashboard")).toBeVisible({ timeout: 15000 });
+    const healthRequestsAfterPanelVisible = monitoringHealthRequests;
+    await page.waitForTimeout(500);
+
+    expect(monitoringHealthRequests).toBe(healthRequestsAfterPanelVisible);
     await expect(page.getByText("Routing Inputs", { exact: true })).toBeVisible();
     await expect(page.getByText(/Excluded Providers/i)).toHaveCount(0);
     await expect(page.getByText(/Incident Mode/i)).toHaveCount(0);

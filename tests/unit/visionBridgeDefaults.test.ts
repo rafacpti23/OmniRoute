@@ -8,6 +8,7 @@ import {
   VISION_BRIDGE_DEFAULTS,
   VISION_BRIDGE_SETTINGS_KEYS,
   getVisionBridgeConfig,
+  isVisionBridgeForcedModel,
   type VisionBridgeSettings,
 } from "@/shared/constants/visionBridgeDefaults";
 
@@ -30,6 +31,20 @@ test("VISION_BRIDGE_SETTINGS_KEYS exports all expected keys", () => {
     "visionBridgeTimeout",
     "visionBridgeMaxImages",
   ]);
+});
+
+test("isVisionBridgeForcedModel does not blanket-force GPT-family models", () => {
+  assert.strictEqual(isVisionBridgeForcedModel("gpt-5.5"), false);
+  assert.strictEqual(isVisionBridgeForcedModel("codex/gpt-5.5"), false);
+  assert.strictEqual(isVisionBridgeForcedModel("openai/gpt-4o-mini"), false);
+});
+
+test("isVisionBridgeForcedModel forces tokenrouter deepseek models (text-only backend, #3946)", () => {
+  // These route through a Fireworks text-only backend that overstates vision
+  // support at the provider level, so they must be force-bridged or raw image
+  // data leaks to a backend that cannot process it.
+  assert.strictEqual(isVisionBridgeForcedModel("tokenrouter/deepseek-v4-pro"), true);
+  assert.strictEqual(isVisionBridgeForcedModel("tokenrouter/deepseek-v4-flash"), true);
 });
 
 test("getVisionBridgeConfig returns defaults when no settings provided", () => {

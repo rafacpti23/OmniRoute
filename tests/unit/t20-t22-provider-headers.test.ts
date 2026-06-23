@@ -2,27 +2,33 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 const { REGISTRY } = await import("../../open-sse/config/providerRegistry.ts");
-const { antigravityUserAgent, geminiCLIUserAgent, GEMINI_CLI_VERSION } =
-  await import("../../open-sse/services/antigravityHeaders.ts");
+const { antigravityUserAgent } = await import("../../open-sse/services/antigravityHeaders.ts");
+const { getCodexClientVersion } = await import("../../open-sse/config/codexClient.ts");
+const { geminiCliUserAgent, GEMINI_CLI_VERSION, GEMINI_CLI_GOOGLE_API_NODE_CLIENT_VERSION } =
+  await import("../../open-sse/services/geminiCliHeaders.ts");
 
-test("T20: antigravity config has updated User-Agent and sandbox fallback URL", () => {
+test("T20: antigravity config has updated User-Agent and daily Cloud Code first URL", () => {
   const antigravity = REGISTRY.antigravity;
   assert.ok(Array.isArray(antigravity.baseUrls));
-  assert.ok(
-    antigravity.baseUrls.some((u) => u === "https://daily-cloudcode-pa.sandbox.googleapis.com")
-  );
+  assert.equal(antigravity.baseUrls[0], "https://daily-cloudcode-pa.googleapis.com");
   assert.equal(antigravity.headers["User-Agent"], antigravityUserAgent());
+  assert.match(antigravity.headers["User-Agent"], /^Antigravity\//);
 });
 
-test("T20: gemini CLI fingerprint uses 0.31.0 and preserves darwin platform name", () => {
-  assert.equal(GEMINI_CLI_VERSION, "0.31.0");
+test("T20: gemini CLI fingerprint uses the current CLI version and normalizes darwin to macos", () => {
+  assert.match(GEMINI_CLI_VERSION, /^\d+\.\d+\.\d+$/);
+  assert.match(GEMINI_CLI_GOOGLE_API_NODE_CLIENT_VERSION, /^\d+\.\d+\.\d+$/);
 
   const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
   Object.defineProperty(process, "platform", { value: "darwin" });
   try {
+    const escapedCliVersion = GEMINI_CLI_VERSION.replaceAll(".", "\\.");
+    const escapedClientVersion = GEMINI_CLI_GOOGLE_API_NODE_CLIENT_VERSION.replaceAll(".", "\\.");
     assert.match(
-      geminiCLIUserAgent("gemini-3-flash"),
-      /^GeminiCLI\/0\.31\.0\/gemini-3-flash \(darwin; /
+      geminiCliUserAgent("gemini-3-flash"),
+      new RegExp(
+        `^GeminiCLI/${escapedCliVersion}/gemini-3-flash \\(macos; .+; terminal\\) google-api-nodejs-client/${escapedClientVersion}$`
+      )
     );
   } finally {
     if (descriptor) {
@@ -41,9 +47,9 @@ test("T25: anthropic API-key config includes the full Anthropic beta header set"
 
 test("T22: github headers include updated editor/plugin versions and required fields", () => {
   const github = REGISTRY.github;
-  assert.equal(github.headers["editor-version"], "vscode/1.110.0");
-  assert.equal(github.headers["editor-plugin-version"], "copilot-chat/0.38.0");
-  assert.equal(github.headers["user-agent"], "GitHubCopilotChat/0.38.0");
+  assert.equal(github.headers["editor-version"], "vscode/1.117.0");
+  assert.equal(github.headers["editor-plugin-version"], "copilot-chat/0.45.1");
+  assert.equal(github.headers["user-agent"], "GitHubCopilotChat/0.45.1");
   assert.equal(github.headers["x-github-api-version"], "2025-04-01");
   assert.equal(github.headers["x-vscode-user-agent-library-version"], "electron-fetch");
   assert.equal(github.headers["X-Initiator"], "user");
@@ -55,10 +61,12 @@ test("T22: github config exposes dedicated responses endpoint", () => {
   assert.equal(github.baseUrl, "https://api.githubcopilot.com/chat/completions");
 });
 
-test("T20: codex config advertises current client headers and auto-review model", () => {
+test("T20: codex config advertises current client headers and supported models", () => {
   const codex = REGISTRY.codex;
-  assert.equal(codex.headers.Version, "0.125.0");
+  assert.equal(codex.headers.Version, getCodexClientVersion());
   assert.equal(codex.headers["Openai-Beta"], "responses=experimental");
-  assert.equal(codex.headers["User-Agent"], "codex-cli/0.125.0 (Windows 10.0.26100; x64)");
-  assert.ok(codex.models.some((model) => model.id === "codex-auto-review"));
+  assert.equal(codex.headers["X-Codex-Beta-Features"], "responses_websockets");
+  assert.equal(codex.headers["User-Agent"], "codex-cli/0.132.0 (Windows 10.0.26200; x64)");
+  assert.ok(codex.models.some((model) => model.id === "gpt-5.5-medium"));
+  assert.ok(!codex.models.some((model) => model.id === "codex-auto-review"));
 });

@@ -1,7 +1,13 @@
 /**
  * Vision Bridge helper functions for image processing.
  */
-
+import { fetchRemoteImage } from "@/shared/network/remoteImageFetch";
+import { getRuntimePorts } from "@/lib/runtime/ports";
+import {
+  getBestVisionModel,
+  getFallbackModels,
+  recordLatency,
+} from "./visionBridgeRouter";
 /**
  * Provider to environment variable mapping for API key resolution.
  */
@@ -12,16 +18,75 @@ const PROVIDER_API_KEY_MAP: Record<string, string> = {
 };
 
 /**
- * Resolve API key based on model provider.
+ * Resolve API key based on model provider (issue #2232).
+ *
+ * Priority:
+ *   1. `explicitKey` argument (caller override)
+ *   2. `VISION_BRIDGE_API_KEY` env var — operator-set, takes precedence over
+ *      per-provider env vars. Used when the operator wants every vision-bridge
+ *      call to go through a single OpenAI-compatible endpoint (e.g.,
+ *      OmniRoute itself, OpenRouter, a Gemini-OpenAI-compat URL).
+ *   3. Per-provider env var (`ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`,
+ *      `OPENAI_API_KEY`) based on the `provider/` prefix in the model id.
+ *   4. `OPENAI_API_KEY` as final fallback when the prefix is unrecognized.
+ *
  * @param model - Model identifier (e.g., "anthropic/claude-3-haiku", "openai/gpt-4o-mini")
  * @param explicitKey - Explicit API key passed as argument (takes precedence)
  * @returns Resolved API key string
  */
 export function resolveProviderApiKey(model: string, explicitKey?: string): string {
   if (explicitKey) return explicitKey;
+  const isAnthropic = model.startsWith("anthropic/");
+  // VISION_BRIDGE_API_KEY only applies to the OpenAI-compatible branch — the
+  // Anthropic branch keeps its dedicated key, since the wire format differs.
+  if (!isAnthropic) {
+    const bridgeKey = (process.env.VISION_BRIDGE_API_KEY || "").trim();
+    if (bridgeKey) return bridgeKey;
+  }
   const provider = model.includes("/") ? model.split("/")[0] : "";
   const envVar = PROVIDER_API_KEY_MAP[provider] || "OPENAI_API_KEY";
   return process.env[envVar] || "";
+}
+
+/**
+ * Resolve the OpenAI-compatible base URL for non-Anthropic vision bridge calls
+ * (issue #2232).
+ *
+ * Priority:
+ *   1. `VISION_BRIDGE_BASE_URL` env var — operator-set, e.g. point this at
+ *      OmniRoute's own `/v1` so the vision model can be any provider
+ *      registered in OmniRoute (`google/gemini-2.0-flash`,
+ *      `openrouter/...`, etc.) instead of being limited to OpenAI/Anthropic.
+ *   2. `OPENAI_API_URL` env var (legacy)
+ *   3. OmniRoute self-loop (`http://localhost:20128/v1`) — auto-detected when
+ *      the model uses a known OmniRoute-internal provider (e.g. `kr/`, `if/`,
+ *      `pol/`, `groq/`, etc.) instead of a direct OpenAI/Anthropic endpoint.
+ *   4. `https://api.openai.com/v1` (fallback when the model is `openai/*` or
+ *      unprefixed — works only when the operator actually has an OpenAI
+ *      account and OPENAI_API_KEY set)
+ *
+ * @param model - Optional model identifier used to detect non-standard providers
+ *                that require OmniRoute self-loop routing.
+ */
+export function resolveVisionBridgeBaseUrl(model?: string): string {
+  const explicit = (process.env.VISION_BRIDGE_BASE_URL || "").trim();
+  if (explicit) return explicit.replace(/\/+$/, "");
+  const legacy = (process.env.OPENAI_API_URL || "").trim();
+  if (legacy) return legacy.replace(/\/+$/, "");
+
+  // When the model has a non-standard provider prefix (not openai/ or
+  // anthropic/), it can only be resolved through OmniRoute's own router,
+  // not through a direct OpenAI/Anthropic endpoint. Use the operator-configured
+  // port via OMNIROUTE_PORT / PORT env vars, falling back to the default 20128.
+  if (model && model.includes("/")) {
+    const provider = model.split("/")[0].toLowerCase();
+    if (provider !== "openai" && provider !== "anthropic") {
+      const { port } = getRuntimePorts();
+      return `http://localhost:${port}/v1`;
+    }
+  }
+
+  return "https://api.openai.com/v1";
 }
 
 export interface ImagePart {
@@ -111,14 +176,9 @@ export function resolveImageAsDataUri(imageUrl: string): string {
 }
 
 async function fetchRemoteImageAsDataUri(imageUrl: string, signal: AbortSignal): Promise<string> {
-  const response = await fetch(imageUrl, { signal });
-  if (!response.ok) {
-    throw new Error(`Vision image fetch error ${response.status}`);
-  }
-
-  const mediaType = response.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
-  const bytes = Buffer.from(await response.arrayBuffer());
-  return `data:${mediaType};base64,${bytes.toString("base64")}`;
+  const remoteImage = await fetchRemoteImage(imageUrl, { signal });
+  const mediaType = remoteImage.contentType.split(";")[0]?.trim() || "image/png";
+  return `data:${mediaType};base64,${remoteImage.buffer.toString("base64")}`;
 }
 
 async function normalizeVisionImageInput(
@@ -148,8 +208,51 @@ export interface VisionModelConfig {
 /**
  * Call the vision model to get an image description.
  * Supports both OpenAI-compatible and Anthropic API formats.
+ * Uses auto-routing to select the fastest available model.
  */
 export async function callVisionModel(
+  imageDataUri: string,
+  config: VisionModelConfig,
+  apiKey?: string,
+  routerConfig?: Partial<import("./visionBridgeRouter").VisionBridgeRouterConfig>
+): Promise<string> {
+  // Auto-select the best vision model if not explicitly configured
+  const modelToUse = getBestVisionModel({
+    fixedModel: config.model,
+    ...routerConfig,
+  });
+  let lastError: Error | null = null;
+
+  // Try primary model + fallbacks
+  const modelsToTry = [modelToUse, ...getFallbackModels(modelToUse, routerConfig)];
+  const maxAttempts = Math.min(modelsToTry.length, routerConfig?.maxFallbackAttempts ?? 3);
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const currentModel = modelsToTry[attempt];
+    const attemptStart = Date.now();
+    try {
+      const result = await callVisionModelSingle(
+        imageDataUri,
+        { ...config, model: currentModel },
+        apiKey
+      );
+      recordLatency(currentModel, Date.now() - attemptStart, true);
+      return result;
+    } catch (error) {
+      recordLatency(currentModel, Date.now() - attemptStart, false);
+      lastError = error instanceof Error ? error : new Error(String(error));
+      // Continue to next model on failure
+    }
+  }
+
+  // All models failed
+  throw lastError || new Error("All vision models failed");
+}
+
+/**
+ * Internal function to call a single vision model.
+ */
+async function callVisionModelSingle(
   imageDataUri: string,
   config: VisionModelConfig,
   apiKey?: string
@@ -221,18 +324,40 @@ export async function callVisionModel(
         }),
       });
     } else {
-      // OpenAI-compatible path (default)
-      const baseUrl = process.env.OPENAI_API_URL || "https://api.openai.com/v1";
+      // OpenAI-compatible path (default) — issue #2232: honor
+      // VISION_BRIDGE_BASE_URL so the vision-bridge call can be routed through
+      // OmniRoute itself or any other OpenAI-compatible endpoint instead of
+      // hardcoded api.openai.com.
+      const baseUrl = resolveVisionBridgeBaseUrl(config.model);
+
+      // When routing through the OmniRoute self-loop (non-standard provider),
+      // keep the full provider-prefixed model ID so OmniRoute can resolve the
+      // correct provider backend. Only strip the prefix for direct OpenAI calls.
+      const useFullModelId =
+        baseUrl.startsWith("http://localhost") &&
+        config.model.includes("/") &&
+        !config.model.startsWith("openai/");
+      const requestModel = useFullModelId ? config.model : modelName;
+
+      // Build headers with optional recursion guard for self-loop calls.
+      // When routing through OmniRoute's own API, omit the vision-bridge
+      // guardrail on the sub-request to prevent infinite recursion.
+      // Use sk_omniroute as fallback for self-loop if no API key is resolved.
+      const selfLoopApiKey = resolvedApiKey || "sk_omniroute";
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${selfLoopApiKey}`,
+      };
+      if (useFullModelId) {
+        headers["x-omniroute-disabled-guardrails"] = "vision-bridge";
+      }
 
       response = await fetch(`${baseUrl}/chat/completions`, {
         method: "POST",
         signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${resolvedApiKey}`,
-        },
+        headers,
         body: JSON.stringify({
-          model: modelName,
+          model: requestModel,
           messages: [
             {
               role: "user",
@@ -323,7 +448,12 @@ export interface RequestBody {
  * Replace image content parts with text descriptions.
  * Concatenates descriptions with labels: "[Image 1]: ..."
  */
-export function replaceImageParts(body: RequestBody, descriptions: string[]): RequestBody {
+export function replaceImageParts(
+  body: RequestBody,
+  // #4012: a `null` entry means the describe call failed for that image — keep
+  // the original image part instead of dropping it / stubbing "(unavailable)".
+  descriptions: (string | null)[]
+): RequestBody {
   if (!descriptions || descriptions.length === 0) {
     return body;
   }
@@ -347,11 +477,15 @@ export function replaceImageParts(body: RequestBody, descriptions: string[]): Re
     for (const part of message.content) {
       if (part?.type === "image_url" || part?.type === "image") {
         if (descriptionIndex < descriptions.length) {
-          newContent.push({
-            type: "text",
-            text: descriptions[descriptionIndex],
-          });
+          const description = descriptions[descriptionIndex];
           descriptionIndex++;
+          if (description == null) {
+            // #4012: describe failed for this image — preserve the original
+            // image so a vision-capable upstream can still process it.
+            newContent.push(part as RequestContentPart);
+          } else {
+            newContent.push({ type: "text", text: description });
+          }
         }
       } else {
         newContent.push(part as RequestContentPart);
