@@ -2,23 +2,19 @@ name: Publish Fork Image to GHCR
 
 on:
   push:
-    branches: [main]
+    branches: [main, prod]
     tags:
       - "v*"
   workflow_dispatch:
 
-# Least-privilege default: read-only at the top level; the build job that pushes to
-# GHCR grants packages: write itself (Scorecard TokenPermissions).
 permissions:
   contents: read
 
-env:
-  IMAGE_NAME: ghcr.io/kang-heewon/omniroute
+# Removemos o IMAGE_NAME fixo aqui e colocamos dinamico nas steps.
 
 jobs:
   build:
     name: Build and Push Fork Image
-    if: github.repository == 'kang-heewon/OmniRoute'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,16 +42,17 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{is_default_branch}}
+            type=raw,value=prod,enable=${{ startsWith(github.ref, 'refs/heads/prod') }}
             type=sha,prefix=sha-
             type=ref,event=tag
           labels: |
             org.opencontainers.image.title=omniroute
-            org.opencontainers.image.description=Unified AI proxy/router — fork image
-            org.opencontainers.image.url=https://github.com/kang-heewon/OmniRoute
-            org.opencontainers.image.source=https://github.com/kang-heewon/OmniRoute
+            org.opencontainers.image.description=Unified AI proxy/router - fork image
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=MIT
 
       - name: Build and push
