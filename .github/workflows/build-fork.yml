@@ -44,7 +44,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=raw,value=latest,enable=${{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=prod,enable=${{ startsWith(github.ref, 'refs/heads/prod') }}
             type=sha,prefix=sha-
             type=ref,event=tag
@@ -66,4 +66,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
