@@ -8,6 +8,10 @@ lastUpdated: 2026-05-13
 
 > **Last updated:** 2026-05-13 — v3.8.0
 > Streamlined release flow that leverages Claude Code skills for automation.
+>
+> **Manter a fila/branch verdes entre releases:** veja [RELEASE_GREEN.md](./RELEASE_GREEN.md)
+> (família `/green-prs` + `npm run check:release-green` + `/babysit` + nightly). Rodar
+> periodicamente — e principalmente **antes** deste checklist — faz a release PR nascer verde.
 
 ## TL;DR
 
@@ -52,7 +56,7 @@ npm run test:e2e           # optional but recommended
 - [ ] Manually review CHANGELOG.md and clean up commit messages if needed
 - [ ] Ensure the latest semver section in `CHANGELOG.md` equals `package.json` version
 - [ ] Keep `## [Unreleased]` as the first changelog section for upcoming work
-- [ ] Update `docs/reference/openapi.yaml` → `info.version` must equal `package.json` version
+- [ ] Update `docs/openapi.yaml` → `info.version` must equal `package.json` version
 
 ### Code Quality
 
@@ -70,6 +74,9 @@ npm run test:e2e           # optional but recommended
 - [ ] `npm run test:vitest` — pass (MCP server, autoCombo, cache)
 - [ ] `npm run test:coverage` — gate 75/75/75/70 satisfied (statements/lines/functions/branches)
 - [ ] `npm run test:integration` — pass (if changes touch DB / handlers)
+- [ ] `npm run test:combo:matrix` — pass (combo strategy matrix: proves all 17 routing strategies' selection decisions deterministically; run when touching combo routing, strategy resolution, or fallback logic)
+- [ ] `RUN_COMBO_LIVE=1 npm run test:combo:live` — **optional/manual** (gated real-upstream smoke; sources a read-only DB snapshot from VPS `root@192.168.0.15`; hits real providers, costs credits; never runs in CI; skips cleanly without the gate)
+- [ ] `npm run test:combo:live:vps` — **optional/manual** (Phase-3 VPS live smoke: 7 HTTP scenarios against the live `.15` server via plain Node ESM; requires `ssh root@192.168.0.15`; creates/deletes only `__live_test__*` combos; hits real providers; never runs in CI)
 - [ ] `npm run test:e2e` — pass (UI changes)
 - [ ] `npm run test:protocols:e2e` — pass (MCP/A2A changes)
 - [ ] `npm run test:ecosystem` — pass
@@ -104,7 +111,7 @@ Breaking changes: add `BREAKING CHANGE:` footer or `!` after the scope (e.g. `fe
 - [ ] `docs/guides/TROUBLESHOOTING.md` reviewed for env var and operational drift
 - [ ] If `.env.example` changed: `docs/reference/ENVIRONMENT.md` updated
 - [ ] If new feature has a UI: `docs/guides/USER_GUIDE.md` mentions it
-- [ ] If new feature has API: `docs/reference/API_REFERENCE.md` + `docs/reference/openapi.yaml` updated
+- [ ] If new feature has API: `docs/reference/API_REFERENCE.md` + `docs/openapi.yaml` updated
 - [ ] If new feature is a module: dedicated `docs/<MODULE>.md` exists
 - [ ] If breaking change: `docs/guides/TROUBLESHOOTING.md` has migration note
 
@@ -269,14 +276,15 @@ Before shipping any v3.8.x release, verify these additional items:
 - [ ] Update path keeps optional deps: `omniroute update --apply` and the auto-updater
       run `npm install -g … --include=optional` so `optionalDependencies` (better-sqlite3,
       keytar, tls-client, and the llmlingua SLM stack: `@atjsh/llmlingua-2`,
-      `@tensorflow/tfjs`, `js-tiktoken`) survive an update. The ultra `modelPath` SLM tier
-      additionally needs `@huggingface/transformers@3.5.2` (pinned — llmlingua-2 uses the 3.x
-      tokenizer API) and the tinybert model, auto-downloaded to `${DATA_DIR}/models/llmlingua`
-      on first use. Postinstall (`scripts/build/colocateOptionals.mjs`) then co-locates the SLM
-      optional closure into `dist/node_modules` so the worker resolves a SINGLE
-      `@huggingface/transformers` 3.5.2 instance — the standalone trace bundles only transformers,
-      not the dynamically-imported optionals, so without this the worker would load llmlingua-2
-      against the root's transformers and the SLM tier would silently fail-open.
+      `@huggingface/transformers@3.5.2`, `@tensorflow/tfjs`, `js-tiktoken`) survive an update.
+      `@huggingface/transformers` stays optional so its `onnxruntime-node` CUDA provider postinstall
+      cannot abort installation on CUDA 11 hosts. The ultra `modelPath` SLM tier also needs the
+      tinybert model, auto-downloaded to `${DATA_DIR}/models/llmlingua` on first use. Postinstall
+      (`scripts/build/colocateOptionals.mjs`) then co-locates the SLM optional closure into
+      `dist/node_modules` so the worker resolves a SINGLE `@huggingface/transformers` 3.5.2
+      optional instance — the standalone trace bundles only transformers, not the dynamically-imported
+      optionals, so without this the worker would load llmlingua-2 against the root's transformers
+      and the SLM tier would silently fail-open.
 - [ ] `omniroute status` works with no `.env` (CLI token path, loopback only)
 - [ ] `curl http://localhost:20128/api/shutdown` returns 401 (always-protected route)
 - [ ] `curl -H "host: evil.com" http://localhost:20128/api/mcp/sse` returns 401 (loopback guard)

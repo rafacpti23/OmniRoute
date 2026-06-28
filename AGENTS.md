@@ -489,7 +489,7 @@ Request middleware including `promptInjectionGuard.ts`.
 
 ### Guardrails (`src/lib/guardrails/`)
 
-Hot-reloadable guardrails framework (3 built-in: pii-masker, prompt-injection, vision-bridge). Fail-open; per-request opt-out via header. See [`docs/security/GUARDRAILS.md`](docs/security/GUARDRAILS.md).
+Hot-reloadable guardrails framework (3 built-in: pii-masker, prompt-injection, vision-bridge). Fail-open. The `pii-masker` guardrail is registered and runs on every request, but its data-mutating logic is **opt-in** and OFF by default — it only redacts when `PII_REDACTION_ENABLED` (request) / `PII_RESPONSE_SANITIZATION` (response + streaming) are enabled (both `defaultValue: "false"`); with them off, payloads pass through untouched. A request can additionally opt OUT of any guardrail via header (`x-omniroute-disabled-guardrails`). Never make PII default-on (Hard Rule #20). See [`docs/security/GUARDRAILS.md`](docs/security/GUARDRAILS.md).
 
 ### Cloud Agents (`src/lib/cloudAgent/`)
 
@@ -554,7 +554,7 @@ For any non-trivial change, read the matching deep-dive first:
 | Agent protocols (A2A / ACP / Cloud)        | [`docs/frameworks/AGENT_PROTOCOLS_GUIDE.md`](docs/frameworks/AGENT_PROTOCOLS_GUIDE.md)                                              |
 | MCP server                                 | [`docs/frameworks/MCP-SERVER.md`](docs/frameworks/MCP-SERVER.md)                                                                    |
 | A2A server                                 | [`docs/frameworks/A2A-SERVER.md`](docs/frameworks/A2A-SERVER.md)                                                                    |
-| API reference                              | [`docs/reference/API_REFERENCE.md`](docs/reference/API_REFERENCE.md) + [`docs/reference/openapi.yaml`](docs/reference/openapi.yaml) |
+| API reference                              | [`docs/reference/API_REFERENCE.md`](docs/reference/API_REFERENCE.md) + [`docs/openapi.yaml`](docs/openapi.yaml) |
 | Provider catalog (auto-generated)          | [`docs/reference/PROVIDER_REFERENCE.md`](docs/reference/PROVIDER_REFERENCE.md)                                                      |
 | Tunnels                                    | [`docs/ops/TUNNELS_GUIDE.md`](docs/ops/TUNNELS_GUIDE.md)                                                                            |
 | Electron desktop                           | [`docs/guides/ELECTRON_GUIDE.md`](docs/guides/ELECTRON_GUIDE.md)                                                                    |

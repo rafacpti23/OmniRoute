@@ -28,10 +28,12 @@ const {
   CLAUDE_CONFIG,
   CLINE_CONFIG,
   CODEX_CONFIG,
+  CODEBUDDY_CN_CONFIG,
   CURSOR_CONFIG,
   GEMINI_CONFIG,
   GITHUB_CONFIG,
   GITLAB_DUO_CONFIG,
+  GROK_CLI_CONFIG,
   KILOCODE_CONFIG,
   KIMI_CODING_CONFIG,
   KIRO_CONFIG,
@@ -66,6 +68,8 @@ const EXPECTED_PROVIDER_KEYS = [
   "cline",
   "windsurf",
   "devin-cli",
+  "grok-cli",
+  "codebuddy-cn",
 ];
 
 const EXPECTED_CONFIG_BY_PROVIDER = {
@@ -87,6 +91,8 @@ const EXPECTED_CONFIG_BY_PROVIDER = {
   windsurf: WINDSURF_CONFIG,
   "devin-cli": WINDSURF_CONFIG,
   trae: TRAE_CONFIG,
+  "grok-cli": GROK_CLI_CONFIG,
+  "codebuddy-cn": CODEBUDDY_CN_CONFIG,
 };
 
 const REQUIRED_FIELDS_BY_PROVIDER = {
@@ -399,29 +405,21 @@ test("custom Google OAuth callbacks preserve the requested callback path and que
 });
 
 test("custom Google OAuth credentials switch IPv6 loopback callbacks to public base URL", () => {
-  const redirectUri = resolveBrowserOAuthRedirectUri(
-    "gemini-cli",
-    "http://[::1]:20128/callback",
-    {
-      OMNIROUTE_PUBLIC_BASE_URL: "https://omniroute.example.com",
-      GEMINI_OAUTH_CLIENT_ID: "custom-gemini.apps.googleusercontent.com",
-      GEMINI_OAUTH_CLIENT_SECRET: "custom-gemini-secret",
-    }
-  );
+  const redirectUri = resolveBrowserOAuthRedirectUri("gemini-cli", "http://[::1]:20128/callback", {
+    OMNIROUTE_PUBLIC_BASE_URL: "https://omniroute.example.com",
+    GEMINI_OAUTH_CLIENT_ID: "custom-gemini.apps.googleusercontent.com",
+    GEMINI_OAUTH_CLIENT_SECRET: "custom-gemini-secret",
+  });
 
   assert.equal(redirectUri, "https://omniroute.example.com/callback");
 });
 
 test("custom Google OAuth callbacks default root loopback paths to callback path", () => {
-  const redirectUri = resolveBrowserOAuthRedirectUri(
-    "antigravity",
-    "http://127.0.0.1:20128",
-    {
-      NEXT_PUBLIC_BASE_URL: "https://omniroute.example.com",
-      ANTIGRAVITY_OAUTH_CLIENT_ID: "custom-antigravity.apps.googleusercontent.com",
-      ANTIGRAVITY_OAUTH_CLIENT_SECRET: "custom-antigravity-secret",
-    }
-  );
+  const redirectUri = resolveBrowserOAuthRedirectUri("antigravity", "http://127.0.0.1:20128", {
+    NEXT_PUBLIC_BASE_URL: "https://omniroute.example.com",
+    ANTIGRAVITY_OAUTH_CLIENT_ID: "custom-antigravity.apps.googleusercontent.com",
+    ANTIGRAVITY_OAUTH_CLIENT_SECRET: "custom-antigravity-secret",
+  });
 
   assert.equal(redirectUri, "https://omniroute.example.com/callback");
 });
@@ -639,11 +637,19 @@ test("Gemini and Antigravity run mocked browser OAuth exchanges and post-exchang
   );
   const antigravityExtra = await PROVIDERS.antigravity.postExchange(antigravityTokens);
   const antigravityMapped = PROVIDERS.antigravity.mapTokens(antigravityTokens, antigravityExtra);
+  // postExchange runs onboarding fire-and-forget now (it must never block the OAuth
+  // login response); give the background onboard call a tick to consume its mocked
+  // fetch so the sequence drains deterministically.
+  await new Promise((r) => setTimeout(r, 50));
 
   assert.equal(geminiMapped.email, "gemini@example.com");
   assert.equal(geminiMapped.projectId, "gemini-project");
   assert.equal(antigravityMapped.email, "anti@example.com");
-  assert.equal(antigravityMapped.projectId, "anti-project-final");
+  // projectId comes from loadCodeAssist ("anti-project"), NOT the backgrounded
+  // onboardUser response ("anti-project-final"). Onboarding is fire-and-forget, so it
+  // no longer updates the returned projectId synchronously — matching the 9router web
+  // flow, which also returns the loadCodeAssist project id.
+  assert.equal(antigravityMapped.projectId, "anti-project");
 });
 
 test("Qoder enabled mode exchanges tokens and loads profile metadata through mocked endpoints", async () => {

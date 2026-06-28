@@ -5,11 +5,13 @@ import type {
   CompressionResult,
   CompressionStats,
 } from "./types.ts";
+import { type FidelityGateConfig } from "./fidelityGate.ts";
+import { gateAdvance } from "./fidelityGateStep.ts";
 import type { CompressionEngineApplyOptions } from "./engines/types.ts";
 import { applyLiteCompression } from "./lite.ts";
 import { cavemanCompress } from "./caveman.ts";
 import { compressAggressive } from "./aggressive.ts";
-import { ultraCompress } from "./ultra.ts";
+import { ultraCompress, ultraCompressHeuristic } from "./ultra.ts";
 import { createCompressionStats } from "./stats.ts";
 import { registerBuiltinCompressionEngines } from "./engines/index.ts";
 import { getCompressionEngine, getEngineEntry } from "./engines/registry.ts";
@@ -29,6 +31,8 @@ import {
   deriveDefaultPlanFromConfig,
   buildNamedComboLookup,
 } from "./planResolution.ts";
+import { resolveAdaptivePlan } from "./adaptiveCompression/resolveAdaptivePlan.ts";
+import type { AdaptiveTelemetry } from "./adaptiveCompression/types.ts";
 
 // Re-export so existing importers (resolver test + chatCore dynamic import) keep resolving.
 export { planFromHeader, formatCompressionMeta, buildNamedComboLookup };
@@ -68,6 +72,12 @@ export function shouldAutoTrigger(config: CompressionConfig, estimatedTokens: nu
  * `combos` defaults to `{}` so Phase-1 callers are unchanged; when supplied, chatCore passes
  * its DB-loaded named-combo map so the active profile can resolve here purely (no DB import).
  */
+/** True when the adaptive resolver owns automatic-by-size escalation (D-C4). */
+function adaptiveEnabled(config: CompressionConfig): boolean {
+  const mode = config.contextBudget?.mode;
+  return mode === "floor" || mode === "replace-autotrigger";
+}
+
 function resolveBasePlan(
   config: CompressionConfig,
   comboId: string | null,
@@ -101,7 +111,7 @@ function resolveBasePlan(
     );
   }
 
-  if (shouldAutoTrigger(config, estimatedTokens)) {
+  if (!adaptiveEnabled(config) && shouldAutoTrigger(config, estimatedTokens)) {
     const mode = config.autoTriggerMode ?? "lite";
     return withSource(
       mode === "stacked"
@@ -154,6 +164,13 @@ export function getEffectiveMode(
  * The caching-aware mode adjustment is applied to `mode` exactly as in
  * {@link selectCompressionStrategy}.
  */
+/** Adaptive (Sub-project C) inputs + telemetry sink for selectCompressionPlan. */
+export interface AdaptiveSelectOptions {
+  modelContextLimit?: number | null;
+  requestMaxTokens?: number | null;
+  onAdaptive?: (telemetry: AdaptiveTelemetry) => void;
+}
+
 export function selectCompressionPlan(
   config: CompressionConfig,
   comboId: string | null,
@@ -161,9 +178,24 @@ export function selectCompressionPlan(
   body?: Record<string, unknown>,
   context?: CachingDetectionContext,
   combos: NamedCombos = {},
-  header: string | null = null
+  header: string | null = null,
+  adaptiveOptions?: AdaptiveSelectOptions
 ): DerivedPlan {
-  const plan = resolveBasePlan(config, comboId, estimatedTokens, combos, header);
+  let plan = resolveBasePlan(config, comboId, estimatedTokens, combos, header);
+
+  // Adaptive context-budget floor/escalation (D-C4): after the base plan, replacing the
+  // (now-bypassed) auto-trigger branch. Pure resolver; chatCore supplies the model limit.
+  if (adaptiveEnabled(config) && config.contextBudget) {
+    const { plan: adaptivePlan, telemetry } = resolveAdaptivePlan({
+      basePlan: plan,
+      estimatedTokens,
+      modelContextLimit: adaptiveOptions?.modelContextLimit ?? null,
+      requestMaxTokens: adaptiveOptions?.requestMaxTokens ?? null,
+      config: config.contextBudget,
+    });
+    plan = adaptivePlan;
+    if (telemetry && adaptiveOptions?.onAdaptive) adaptiveOptions.onAdaptive(telemetry);
+  }
 
   // Apply caching-aware adjustments to the mode if body is provided
   if (body) {
@@ -325,19 +357,22 @@ export function applyCompression(
       ...(options?.config?.ultra ?? {}),
       preserveSystemPrompt: options?.config?.preserveSystemPrompt !== false,
     };
-    const result = ultraCompress(messages, ultraConfig);
+    const result = ultraCompressHeuristic(messages, ultraConfig);
     const compressedBody = { ...compressionBody, messages: result.messages };
     return {
       body: adapter.restore(compressedBody),
       compressed: result.stats.savingsPercent > 0,
-      stats: createCompressionStats(
-        compressionBody,
-        compressedBody,
-        mode,
-        ["ultra"],
-        result.stats.rulesApplied,
-        result.stats.durationMs
-      ),
+      stats: {
+        ...createCompressionStats(
+          compressionBody,
+          compressedBody,
+          mode,
+          ["ultra"],
+          result.stats.rulesApplied,
+          result.stats.durationMs
+        ),
+        ultraTier: result.stats.ultraTier,
+      },
     };
   }
   return { body, compressed: false, stats: null };
@@ -402,9 +437,41 @@ async function applyUltraAsync(
   const ultraConfig = options?.config?.ultra;
   const modelPath = typeof ultraConfig?.modelPath === "string" ? ultraConfig.modelPath.trim() : "";
 
-  // No model configured → heuristic ultra (unchanged default).
+  // No explicit modelPath → run the two-tier ultra resolver (heuristic, or SLM when
+  // config.ultraEngine === "slm" and the worker backend is available). This is the
+  // Phase-4 (B) path; it fail-opens to the heuristic and records the resolved tier.
   if (!modelPath) {
-    return applyCompression(body, "ultra", options);
+    const adapter = adaptBodyForCompression(body);
+    const messages = (adapter.body.messages ?? []) as Array<{
+      role: string;
+      content?: string | unknown[];
+      [key: string]: unknown;
+    }>;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return { body, compressed: false, stats: null };
+    }
+    const ultraConfig = {
+      ...(options?.config?.ultra ?? {}),
+      preserveSystemPrompt: options?.config?.preserveSystemPrompt !== false,
+      ultraEngine: options?.config?.ultraEngine,
+    };
+    const result = await ultraCompress(messages, ultraConfig);
+    const compressedBody = { ...adapter.body, messages: result.messages };
+    return {
+      body: adapter.restore(compressedBody),
+      compressed: result.stats.savingsPercent > 0,
+      stats: {
+        ...createCompressionStats(
+          adapter.body,
+          compressedBody,
+          "ultra",
+          result.stats.techniquesUsed,
+          result.stats.rulesApplied,
+          result.stats.durationMs
+        ),
+        ultraTier: result.stats.ultraTier,
+      },
+    };
   }
 
   registerBuiltinCompressionEngines();
@@ -487,6 +554,8 @@ interface StackOptions {
   compressionComboId?: string | null;
   /** TV1 bail-out discipline (opt-in, default disabled). */
   bailout?: BailoutConfig;
+  /** Opt-in per-step fidelity gate (default disabled). */
+  fidelityGate?: FidelityGateConfig;
   /** Authenticated principal id — threaded through to CCR engine for store scoping. */
   principalId?: string;
   /** F3.3: called once per engine as it completes (live per-engine streaming). */
@@ -516,7 +585,7 @@ function reportEngineStep(
 }
 
 /** Accumulates per-step telemetry across a stacked run (shared sync/async). */
-interface StackAccumulator {
+export interface StackAccumulator {
   techniques: Set<string>;
   rules: Set<string>;
   breakdown: NonNullable<CompressionStats["engineBreakdown"]>;
@@ -654,6 +723,7 @@ export function applyStackedCompression(
   const start = performance.now();
 
   const bailout = options?.bailout;
+  const fidelityGate = options?.fidelityGate ?? options?.config?.fidelityGate;
   const onStep = options?.onEngineStep;
   const totalSteps = steps.length;
   let stepIdx = 0;
@@ -681,14 +751,14 @@ export function applyStackedCompression(
         continue;
       }
       mergeStackStep(acc, step.engine, result);
-      if (decideStep(result, bailout).advance) {
+      if (decideStep(result, bailout).advance && gateAdvance(result, currentBody, fidelityGate, acc, step.engine)) {
         currentBody = result.body;
         compressed = true;
       }
     } else {
       const result = engine.apply(currentBody, buildStepOptions(step, options));
       mergeStackStep(acc, step.engine, result);
-      if (result.compressed) {
+      if (result.compressed && gateAdvance(result, currentBody, fidelityGate, acc, step.engine)) {
         currentBody = result.body;
         compressed = true;
       }
@@ -726,6 +796,7 @@ export async function applyStackedCompressionAsync(
   const start = performance.now();
 
   const bailout = options?.bailout;
+  const fidelityGate = options?.fidelityGate ?? options?.config?.fidelityGate;
   const onStep = options?.onEngineStep;
   const totalSteps = steps.length;
   let stepIdx = 0;
@@ -754,7 +825,7 @@ export async function applyStackedCompressionAsync(
         continue;
       }
       mergeStackStep(acc, step.engine, result);
-      if (decideStep(result, bailout).advance) {
+      if (decideStep(result, bailout).advance && gateAdvance(result, currentBody, fidelityGate, acc, step.engine)) {
         currentBody = result.body;
         compressed = true;
       }
@@ -763,7 +834,7 @@ export async function applyStackedCompressionAsync(
         ? await engine.applyAsync(currentBody, stepOptions)
         : engine.apply(currentBody, stepOptions);
       mergeStackStep(acc, step.engine, result);
-      if (result.compressed) {
+      if (result.compressed && gateAdvance(result, currentBody, fidelityGate, acc, step.engine)) {
         currentBody = result.body;
         compressed = true;
       }
