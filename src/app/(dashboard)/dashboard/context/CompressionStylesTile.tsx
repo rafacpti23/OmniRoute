@@ -51,10 +51,7 @@ export default function CompressionStylesTile() {
           <span className="text-xs text-text-muted">No styled runs yet.</span>
         ) : (
           styles.map(([id, count]) => (
-            <span
-              key={id}
-              className="rounded bg-border/30 px-2 py-0.5 text-xs text-text-main"
-            >
+            <span key={id} className="rounded bg-border/30 px-2 py-0.5 text-xs text-text-main">
               {id} · {count}
             </span>
           ))

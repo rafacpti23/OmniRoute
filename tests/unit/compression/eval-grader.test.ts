@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildGradePrompt, parseGradeVerdict } from "../../../open-sse/services/compression/eval/grader.ts";
+import {
+  buildGradePrompt,
+  parseGradeVerdict,
+} from "../../../open-sse/services/compression/eval/grader.ts";
 
 describe("gold grader", () => {
   it("buildGradePrompt embeds the answer and the gold", () => {

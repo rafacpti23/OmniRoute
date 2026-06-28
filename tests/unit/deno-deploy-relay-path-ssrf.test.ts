@@ -89,7 +89,7 @@ describe("buildRelayWorker — generated worker has no string-concat SSRF hole",
       "worker must not append relayPath to target by string concatenation"
     );
     assert.ok(
-      !worker.includes('+ relayPath'),
+      !worker.includes("+ relayPath"),
       "worker must not contain `+ relayPath` string concatenation"
     );
   });

@@ -7,8 +7,22 @@ const report: EvalReport = {
   stamps: { answerModel: "gpt-x", judgeModel: "judge-y", corpusHash: "deadbeef", sampleSize: 5 },
   partial: true,
   totalCostUsd: 0.42,
-  overall: { casesScored: 4, casesErrored: 1, fidelityPreservedPct: 75, goldAccuracyDeltaPct: -25, meanRatio: 0.5 },
-  perKind: [{ kind: "prose", casesScored: 2, fidelityPreservedPct: 50, goldAccuracyDeltaPct: -50, meanRatio: 0.45 }],
+  overall: {
+    casesScored: 4,
+    casesErrored: 1,
+    fidelityPreservedPct: 75,
+    goldAccuracyDeltaPct: -25,
+    meanRatio: 0.5,
+  },
+  perKind: [
+    {
+      kind: "prose",
+      casesScored: 2,
+      fidelityPreservedPct: 50,
+      goldAccuracyDeltaPct: -50,
+      meanRatio: 0.45,
+    },
+  ],
 };
 
 describe("eval report writer", () => {

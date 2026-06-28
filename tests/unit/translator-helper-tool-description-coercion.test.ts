@@ -8,9 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const openaiHelper = await import(
-  "../../open-sse/translator/helpers/openaiHelper.ts"
-);
+const openaiHelper = await import("../../open-sse/translator/helpers/openaiHelper.ts");
 
 test("filterToOpenAIFormat coerces non-string Claude-tool description to string", () => {
   const result = openaiHelper.filterToOpenAIFormat({

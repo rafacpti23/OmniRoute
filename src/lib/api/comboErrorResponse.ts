@@ -19,10 +19,7 @@
  */
 
 import { ERROR_CODES } from "@/shared/constants/errorCodes";
-import {
-  attachRequestIdToResponse,
-  getRequestId,
-} from "@/shared/utils/requestId";
+import { attachRequestIdToResponse, getRequestId } from "@/shared/utils/requestId";
 
 export type ComboErrorCode =
   | "COMBO_001" // request body is not valid JSON
@@ -46,10 +43,7 @@ export interface ComboErrorBody {
   };
 }
 
-export function buildComboErrorBody(
-  code: ComboErrorCode,
-  details?: unknown
-): ComboErrorBody {
+export function buildComboErrorBody(code: ComboErrorCode, details?: unknown): ComboErrorBody {
   const def = ERROR_CODES[code] ?? ERROR_CODES.INTERNAL_001;
   const requestId = getRequestId();
   return {

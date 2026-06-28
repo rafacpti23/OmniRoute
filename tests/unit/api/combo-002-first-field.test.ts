@@ -60,7 +60,10 @@ describe("COMBO_002 response — firstField / firstMessage surfacing (#5083 Bug 
 
   it("the generic message key is still present (backward compat)", () => {
     const details = {
-      issues: { message: "Invalid request", details: [{ field: "strategy", message: "Invalid enum value" }] },
+      issues: {
+        message: "Invalid request",
+        details: [{ field: "strategy", message: "Invalid enum value" }],
+      },
       firstField: "strategy",
       firstMessage: "Invalid enum value",
     };

@@ -332,7 +332,12 @@ function rewriteKiroEntry(
     let trChanged = false;
     const nextContent = content.map((part, partIdx) => {
       if (!isRecord(part) || typeof part.text !== "string") return part;
-      const key = kiroPathKey({ scope, historyIndex, toolResultIndex: trIdx, contentIndex: partIdx });
+      const key = kiroPathKey({
+        scope,
+        historyIndex,
+        toolResultIndex: trIdx,
+        contentIndex: partIdx,
+      });
       const rewritten = rewrites.get(key);
       if (rewritten === undefined || rewritten === part.text) return part;
       trChanged = true;

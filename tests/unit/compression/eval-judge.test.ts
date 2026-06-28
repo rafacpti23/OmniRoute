@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildJudgePrompt, parseJudgeVerdict } from "../../../open-sse/services/compression/eval/judge.ts";
+import {
+  buildJudgePrompt,
+  parseJudgeVerdict,
+} from "../../../open-sse/services/compression/eval/judge.ts";
 
 describe("fidelity judge", () => {
   it("buildJudgePrompt embeds both answers and asks for a SAME/DIFFERENT verdict", () => {
@@ -16,7 +19,10 @@ describe("fidelity judge", () => {
   });
 
   it("parseJudgeVerdict maps a MATERIALLY_DIFFERS verdict (case/format tolerant)", () => {
-    assert.equal(parseJudgeVerdict("VERDICT: materially_differs\nreason: omitted the error"), "materially-differs");
+    assert.equal(
+      parseJudgeVerdict("VERDICT: materially_differs\nreason: omitted the error"),
+      "materially-differs"
+    );
     assert.equal(parseJudgeVerdict("differs materially"), "materially-differs");
   });
 

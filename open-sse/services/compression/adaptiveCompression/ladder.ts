@@ -7,13 +7,13 @@ import type { LadderStage } from "./types.ts";
  * SLM tier wired through `ultra`); an operator can still add them via ladderOverride.
  */
 export const DEFAULT_LADDER: LadderStage[] = [
-  { engine: "session-dedup" },        // lossless cross-turn dedup (catalog pri 3)
+  { engine: "session-dedup" }, // lossless cross-turn dedup (catalog pri 3)
   { engine: "rtk", intensity: "standard" }, // command-output filtering (pri 10)
-  { engine: "headroom" },             // tabular JSON compaction (pri 15)
-  { engine: "lite" },                 // whitespace/format cleanup (pri 5, but cheap prose pass)
+  { engine: "headroom" }, // tabular JSON compaction (pri 15)
+  { engine: "lite" }, // whitespace/format cleanup (pri 5, but cheap prose pass)
   { engine: "caveman", intensity: "full" }, // rule-based prose (pri 20)
-  { engine: "aggressive" },           // summarize + age old turns (pri 30)
-  { engine: "ultra" },                // heuristic token pruning + optional SLM (pri 40)
+  { engine: "aggressive" }, // summarize + age old turns (pri 30)
+  { engine: "ultra" }, // heuristic token pruning + optional SLM (pri 40)
 ];
 
 /**
@@ -29,7 +29,7 @@ const AGGRESSIVENESS: Record<string, number> = {
   lite: 4,
   caveman: 5,
   standard: 5, // mode-name alias for caveman
-  stacked: 5,  // a derived/stacked base plan sits at the prose tier; floor escalates past it
+  stacked: 5, // a derived/stacked base plan sits at the prose tier; floor escalates past it
   aggressive: 6,
   ultra: 7,
 };

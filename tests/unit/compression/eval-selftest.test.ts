@@ -16,7 +16,11 @@ function correctJudge(): ModelClient {
 
 /** A broken judge that always says SAME — must FAIL self-test. */
 function brokenJudge(): ModelClient {
-  return { async complete() { return { text: "VERDICT: SAME" }; } };
+  return {
+    async complete() {
+      return { text: "VERDICT: SAME" };
+    },
+  };
 }
 
 describe("judge self-test gate (D-D3)", () => {

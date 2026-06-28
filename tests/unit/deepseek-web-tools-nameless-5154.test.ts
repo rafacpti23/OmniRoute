@@ -83,7 +83,10 @@ describe("deepseekWebTools — nameless <tool> blocks (#5154)", () => {
     const text = `<tool><parameter name="filePath">"x"</parameter><parameter name="offset">675</parameter></tool>`;
     const { toolCalls, content } = parseDeepSeekToolCalls(text, "call", TOOLS_WITH_SCHEMAS);
 
-    assert.ok(toolCalls && toolCalls.length === 1, "expected exactly one tool call, got null/empty");
+    assert.ok(
+      toolCalls && toolCalls.length === 1,
+      "expected exactly one tool call, got null/empty"
+    );
     assert.equal(toolCalls![0].function.name, "read", "tool name resolved via schema match");
     const args = JSON.parse(toolCalls![0].function.arguments);
     assert.ok("filePath" in args, "filePath argument present");
@@ -107,7 +110,10 @@ describe("deepseekWebTools — nameless <tool> blocks (#5154)", () => {
     const text = `<tool><parameter name="filePath">/etc/hosts</parameter><parameter name="offset">0</parameter></tool>`;
     const { toolCalls } = parseDeepSeekToolCalls(text, "call", AMBIGUOUS_TOOLS);
 
-    assert.ok(!toolCalls || toolCalls.length === 0, "must not emit a call when params are ambiguous");
+    assert.ok(
+      !toolCalls || toolCalls.length === 0,
+      "must not emit a call when params are ambiguous"
+    );
   });
 
   test("nameless <tool> is NOT resolved when no tool schema matches the extracted params", () => {

@@ -50,11 +50,17 @@ export function mergeClientAnthropicBeta(
   clientBeta: string | null | undefined,
   allow: readonly string[] = FORWARDABLE_CLIENT_BETAS
 ): string {
-  const baseList = base.split(",").map((s) => s.trim()).filter(Boolean);
+  const baseList = base
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
   if (typeof clientBeta !== "string" || !clientBeta.trim()) return baseList.join(",");
   const seen = new Set(baseList.map((s) => s.toLowerCase()));
   const allowSet = new Set(allow.map((s) => s.toLowerCase()));
-  for (const token of clientBeta.split(",").map((s) => s.trim()).filter(Boolean)) {
+  for (const token of clientBeta
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)) {
     const lower = token.toLowerCase();
     if (allowSet.has(lower) && !seen.has(lower)) {
       baseList.push(token);

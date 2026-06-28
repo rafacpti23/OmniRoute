@@ -26,10 +26,7 @@ test("#4602 isLocalStreamLifecycleError flags the WS controller-closed error and
     isLocalStreamLifecycleError(new Error("Invalid state: Controller is already closed")),
     true
   );
-  assert.equal(
-    isLocalStreamLifecycleError({ message: "Controller is already closed" }),
-    true
-  );
+  assert.equal(isLocalStreamLifecycleError({ message: "Controller is already closed" }), true);
   // Real upstream failures must still count.
   assert.equal(isLocalStreamLifecycleError(new Error("502 Bad Gateway")), false);
   assert.equal(isLocalStreamLifecycleError(new Error("upstream timed out")), false);
