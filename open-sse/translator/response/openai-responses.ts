@@ -517,7 +517,7 @@ function emitToolCall(state, emit, tc) {
   if (tc.function?.arguments) {
     const refCallId = state.funcCallIds[tcIdx] || newCallId;
     const existingArgs = state.funcArgsBuf[tcIdx] || "";
-    const sanitized = escapeJsonStringValues(tc.function.arguments);
+    const sanitized = escapeJsonStringValues(fixDoubleEscapedTabs(tc.function.arguments));
     const nextArgs = appendToolCallArgumentDelta(existingArgs, sanitized);
     const emittedDelta = nextArgs.slice(existingArgs.length);
     state.funcArgsBuf[tcIdx] = nextArgs;
