@@ -202,18 +202,20 @@ The prod stack runs in parallel with the dev compose (different container names,
 
 ## Dockerfile Stages
 
-The repository ships a multi-stage Dockerfile (`Dockerfile`). Three stages are exposed; pick the right `target` for your use case.
+The repository ships a multi-stage Dockerfile (`Dockerfile`). Four stages are exposed; pick the right `target` for your use case.
 
 | Stage         | Base image            | Purpose                                                                                                                                                            |
 | ------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `builder`     | `node:26-trixie-slim` | Installs deps (`npm ci --legacy-peer-deps`) and runs `npm run build` (Turbopack by default — see Build-time resources below)                                       |
 | `runner-base` | `node:26-trixie-slim` | Production runtime with the Next.js standalone output. **No provider CLIs bundled.**                                                                               |
+| `runner-web`  | `runner-base`         | Adds Playwright and Chromium dependencies for web-cookie providers (`gemini-web`, `claude-web`, `claude-turnstile`).                                               |
 | `runner-cli`  | `runner-base`         | Adds `git`, `docker.io`, `docker-compose` and global CLIs: `@openai/codex`, `@anthropic-ai/claude-code`, `droid`, `openclaw`. **Pick this for agentic workflows.** |
 
 Build a specific target manually:
 
 ```bash
 docker build --target runner-base -t omniroute:base .
+docker build --target runner-web  -t omniroute:web  .
 docker build --target runner-cli  -t omniroute:cli  .
 ```
 
@@ -464,6 +466,28 @@ OmniRoute publishes separate Docker channels for stable releases, active release
 | `:latest` / `:latest-web`       | Highest **published** stable SemVer | Mutable stable pointer      | Follows stable releases **after** a SemVer publish job — does **not** track `main` or unreleased `release/v*` commits |
 | `:next` / `:next-web`           | Current default `release/v*` branch | Mutable pre-release pointer | Testing fixes that have landed on the active release branch but are not yet in a stable release                       |
 | `:main` / `:main-web`           | `main` branch                       | Mutable development pointer | Development and integration testing only                                                                              |
+
+### The `-web` variant
+
+Every channel above is published twice: a default image and a `-web` image built from the same release. The `-web` image additionally bundles Playwright and a Chromium build, with `PLAYWRIGHT_BROWSERS_PATH` pointing at the preinstalled browsers, and is correspondingly larger.
+
+| Tag | Playwright + Chromium | Use it when |
+| --- | --- | --- |
+| `:<version>`, `:latest`, `:next`, `:main` | No | Default choice for API-key providers. |
+| `:<version>-web`, `:latest-web`, `:next-web`, `:main-web` | Yes | You enable a web-cookie provider that drives a real browser — `gemini-web`, `claude-web` or `claude-turnstile`. |
+
+Web-cookie providers are listed and appear connected on an image without the `-web` suffix, but their requests fail at runtime with:
+
+```
+[500]: Failed to load external module playwright: Error: Cannot find module
+'/app/node_modules/playwright/node_modules/playwright-core/browsers.json'
+```
+
+Switch to the matching `-web` tag and recreate the container. No other configuration change is required.
+
+```bash
+docker pull diegosouzapw/omniroute:latest-web
+```
 
 #### Using the pre-release channel
 
