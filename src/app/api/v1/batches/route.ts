@@ -3,6 +3,7 @@ import { createBatch, getFile, listBatches, countBatches } from "@/lib/localDb";
 import { v1BatchCreateSchema } from "@/shared/validation/schemas";
 import { NextResponse } from "next/server";
 import { getApiKeyRequestScope } from "@/app/api/v1/_helpers/apiKeyScope";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { formatBatchResponse } from "./formatBatchResponse";
 import { parseBatchListLimit } from "./parseListLimit";
 
@@ -55,7 +56,7 @@ export async function POST(request: Request) {
     return NextResponse.json(
       {
         error: {
-          message: error instanceof Error ? error.message : "Create failed",
+          message: sanitizeErrorMessage(error instanceof Error ? error.message : "Create failed"),
           type: "invalid_request_error",
         },
       },

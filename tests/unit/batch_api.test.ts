@@ -1321,3 +1321,25 @@ test("getTerminalBatches returns only terminal statuses ordered oldest first", a
     );
   }
 });
+
+test("POST /v1/batches sanitizes error messages and redacts file paths in error responses", async () => {
+  const req = {
+    url: "http://localhost/api/v1/batches",
+    headers: new Headers({ "Content-Type": "application/json" }),
+    json: async () => {
+      throw new Error("Internal error in /home/deploy/omniroute/src/data.ts\n at parseBatch");
+    },
+  } as unknown as Request;
+
+  const res = await batchesRoute.POST(req);
+  assert.strictEqual(res.status, 400);
+  const body = await res.json();
+  assert.strictEqual(body.error.type, "invalid_request_error");
+  assert.ok(
+    !body.error.message.includes("/home/deploy/omniroute/src/data.ts"),
+    "Must redact file path"
+  );
+  assert.ok(body.error.message.includes("<path>"), "Must replace path with <path>");
+  assert.ok(!body.error.message.includes("\n"), "Must not contain newlines");
+  assert.ok(!body.error.message.includes("at parseBatch"), "Must not contain stack frame");
+});
