@@ -1183,6 +1183,13 @@ same process on one port, so there is no separate CLI-only package today.
 <table>
   <tr>
     <td align="center" width="320">
+      <a href="https://www.youtube.com/watch?v=kKwOs95W7Vg">
+        <img src="https://img.youtube.com/vi/kKwOs95W7Vg/maxresdefault.jpg" alt="Official OmniRoute Start Video" width="300"/>
+      </a><br/>
+      <b>🎬 Official Start — OmniRoute Support</b><br/>
+      <sub>The official starting point for OmniRoute tutorials and support videos</sub>
+    </td>
+    <td align="center" width="320">
       <a href="https://www.instagram.com/reel/Da8ZthUPK98/">
         <img src="https://placehold.co/320x180/111827/FFFFFF?text=Instagram+Reel+%7C+nick_saraev&font=montserrat&bold=true" alt="Instagram Reel" width="300"/>
       </a><br/>
@@ -1221,6 +1228,7 @@ same process on one port, so there is no separate CLI-only package today.
 </table>
 
 </div>
+
 
 **Ranking completo (URLs canônicas deduplicadas, `v > 0`, maior alcance):**
 
