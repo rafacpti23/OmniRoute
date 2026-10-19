@@ -3331,7 +3331,7 @@
       }
     },
     "README.md": {
-      "source_hash": "de98b417e1deef2482c366c30e7653bda1d7c27a36fa3615b14561fe4fdca66f",
+      "source_hash": "94e339a2b690a90a5b6cbb52cd83eb5c3aad79931a338ffc795beb12a2fd16df",
       "locales": {
         "ar": {
           "source_hash": "ac9dd2dadf033818d837f02a550fc3d2eb994771be75b2b553994406d7897423",
@@ -11350,7 +11350,7 @@
       }
     },
     "docs/architecture/ARCHITECTURE.md": {
-      "source_hash": "f74f1f2897a2573c7f28d5db437eef478a5504c88b2bfdd660e304b78c593603",
+      "source_hash": "22686b2a98ea775b13ff206857e7f4a0c76d34eb59b553e2b30899be371a8ee5",
       "locales": {
         "ar": {
           "source_hash": "f74f1f2897a2573c7f28d5db437eef478a5504c88b2bfdd660e304b78c593603",
@@ -13010,7 +13010,7 @@
       }
     },
     "docs/architecture/CODEBASE_DOCUMENTATION.md": {
-      "source_hash": "974aac2e0936294e56987cb3145752e1caa19d10c743dfb99d4253ce48a5c2ef",
+      "source_hash": "55de3bcc22206815b4e2f4ac29974774c4e491f9296af102c113358183ed1a77",
       "locales": {
         "ar": {
           "source_hash": "974aac2e0936294e56987cb3145752e1caa19d10c743dfb99d4253ce48a5c2ef",
@@ -17711,7 +17711,7 @@
       }
     },
     "docs/architecture/REPOSITORY_MAP.md": {
-      "source_hash": "c4c42eda70dbf3e8bf15dcc95d829980d836a3664f98fd4990d8598e7bf885d0",
+      "source_hash": "d8a7d760188172602892ce409f200dbde39958fcbbb7ad5c043ff2688e375d54",
       "locales": {
         "pl": {
           "source_hash": "c4c42eda70dbf3e8bf15dcc95d829980d836a3664f98fd4990d8598e7bf885d0",
@@ -24878,7 +24878,7 @@
       }
     },
     "docs/comparison/OMNIROUTE_VS_ALTERNATIVES.md": {
-      "source_hash": "aae288a51e3df2b8a5386bb53711148e0e8783dfdf93ce4e105c87b282e10bc8",
+      "source_hash": "9c941f9c8cfe88b387b658e2dd489b8a164dd884d3ae4a214ee74f81245f0522",
       "locales": {
         "pl": {
           "source_hash": "aae288a51e3df2b8a5386bb53711148e0e8783dfdf93ce4e105c87b282e10bc8",
@@ -33336,7 +33336,7 @@
       }
     },
     "docs/frameworks/A2A-SERVER.md": {
-      "source_hash": "9c132a2f85f7d809acfc51d38efc7f5c077ad83f3b162f68e0d470c2fcff74c1",
+      "source_hash": "e48068952d634d9d7196b9a2f3b38ccade1a00e002a82884c14b244a313d7631",
       "locales": {
         "ar": {
           "source_hash": "9c132a2f85f7d809acfc51d38efc7f5c077ad83f3b162f68e0d470c2fcff74c1",
@@ -34595,7 +34595,7 @@
       }
     },
     "docs/frameworks/ACP.md": {
-      "source_hash": "80321c623aa3a53bf1afa487d7be94ff9b943694ad07a32550d423478caa3b40",
+      "source_hash": "509670fe23e6bfe923e93a8f65bb9983a8605ad091f1d767505aebec6313ebe3",
       "locales": {
         "pl": {
           "source_hash": "80321c623aa3a53bf1afa487d7be94ff9b943694ad07a32550d423478caa3b40",
@@ -37164,7 +37164,7 @@
       }
     },
     "docs/frameworks/AGENTBRIDGE.md": {
-      "source_hash": "15a5069bf3d7f2d3fc9a91e0b36497102d52c2dccf683dbed5cf74a381b6ac16",
+      "source_hash": "f1fd6dee98f295228be450efb164905f3c354c82b2fb568e96d4224c5d0f4117",
       "locales": {
         "pl": {
           "source_hash": "15a5069bf3d7f2d3fc9a91e0b36497102d52c2dccf683dbed5cf74a381b6ac16",
@@ -53676,7 +53676,7 @@
       }
     },
     "docs/frameworks/OPEN_SSE_ARCHITECTURE.md": {
-      "source_hash": "0eb0405cc3dac44f4cdab64763f46818f2ca159d6f9da1eb4e9f1a077a660cf1",
+      "source_hash": "ac9ee86eda81b6c4f21d179415821bf67147890087ad79fe973ea24d5cbab185",
       "locales": {
         "pl": {
           "source_hash": "0eb0405cc3dac44f4cdab64763f46818f2ca159d6f9da1eb4e9f1a077a660cf1",
@@ -67103,7 +67103,7 @@
       }
     },
     "docs/getting-started/FREE-TIERS-GUIDE.md": {
-      "source_hash": "f60be16d7b8a96d812a8286b0547323d57585c1dd8666ffd922dc3da967e7ca0",
+      "source_hash": "7192d2da75269ca3f838e5220c2e7f75ff87c255df4d336b0c37797ef7d048eb",
       "locales": {
         "pl": {
           "source_hash": "f60be16d7b8a96d812a8286b0547323d57585c1dd8666ffd922dc3da967e7ca0",
@@ -82352,7 +82352,7 @@
       }
     },
     "docs/guides/FREE_PROVIDER_RANKINGS.md": {
-      "source_hash": "b159542019e7188f4ef67bac0e1e16b00ea1842d9090fac72f41ba9f7163826c",
+      "source_hash": "6ef0e815346a0146e88822db42b20eaeae7b28abdcc805277f7f0a7d45737c01",
       "locales": {
         "pl": {
           "source_hash": "b159542019e7188f4ef67bac0e1e16b00ea1842d9090fac72f41ba9f7163826c",

@@ -135,7 +135,7 @@ jobs:
     # (run 33253576569). The same tree's arm64 webpack build on hosted ARM
     # succeeded (run 33264823398). Dockerfile already documents webpack as the
     # Docker escape hatch (OMNIROUTE_USE_TURBOPACK=0).
-    runs-on: ${{ matrix.arch == 'amd64' && (vars.USE_VPS_RUNNER == 'true' && fromJSON('["self-hosted","omni-build"]') || 'ubuntu-24.04') || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ matrix.arch == 'amd64' && (vars.USE_VPS_RUNNER == 'true' && vars.USE_VPS_BUILD_RUNNER == 'true' && fromJSON('["self-hosted","omni-build"]') || 'ubuntu-24.04') || 'ubuntu-24.04-arm' }}
     # Share the 1-slot omni-build ceiling (#12048) with ci.yml `Build` /
     # npm-publish. Same group as main's Build so a :next publish waits beside
     # the artefact instead of sitting next to it. arm64 is hosted — its own

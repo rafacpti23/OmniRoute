@@ -671,7 +671,7 @@ jobs:
     # back to ubuntu-latest unless the PR head repo is this repository (push /
     # dispatch events are own-origin by definition). Any failure path (VM down,
     # var unset/false) also falls back to ubuntu-latest.
-    runs-on: ${{ (vars.USE_VPS_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","omni-build"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.USE_VPS_RUNNER == 'true' && vars.USE_VPS_BUILD_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","omni-build"]') || 'ubuntu-latest' }}
     needs: changes
     # The .113 pool runs ONE next-build with room to spare and two at the edge: the
     # box has 31 GB and a single next-build peaks at 14–16 GB RSS. On 2026-08-28
